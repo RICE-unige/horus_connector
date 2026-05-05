@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Robot-side H.264 WebRTC sender with cmd_vel DataChannel receive."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+
+import gi
+
+from gst_webrtc_common import (
+    ClientSignaling,
+    Gst,
+    ServerSignaling,
+    configure_webrtcbin,
+    ensure_webrtc_runtime,
+    load_env_file,
+    make_session_description,
+)
+
+gi.require_version("GLib", "2.0")
+from gi.repository import GLib  # noqa: E402
+
+
+class RosCmdPublisher:
+    def __init__(self, topic: str):
+        self.topic = topic
+        self.node = None
+        self.publisher = None
+        self.rclpy = None
+        if not topic:
+            return
+        try:
+            import rclpy
+            from geometry_msgs.msg import Twist
+        except Exception as exc:
+            print(f"ROS cmd_vel publishing disabled: {exc}", flush=True)
+            return
+        try:
+            rclpy.init(args=None)
+            self.node = rclpy.create_node("horus_webrtc_cmd_vel")
+            self.publisher = self.node.create_publisher(Twist, topic, 10)
+            self.twist_type = Twist
+            self.rclpy = rclpy
+            print(f"Publishing WebRTC control messages to {topic}", flush=True)
+        except Exception as exc:
+            print(f"ROS cmd_vel publishing disabled: {exc}", flush=True)
+            self.close()
+
+    def publish(self, command: dict) -> bool:
+        if self.publisher is None:
+            return False
+        msg = self.twist_type()
+        msg.linear.x = float(command.get("linear_x", 0.0))
+        msg.linear.y = float(command.get("linear_y", 0.0))
+        msg.linear.z = float(command.get("linear_z", 0.0))
+        msg.angular.x = float(command.get("angular_x", 0.0))
+        msg.angular.y = float(command.get("angular_y", 0.0))
+        msg.angular.z = float(command.get("angular_z", 0.0))
+        self.publisher.publish(msg)
+        return True
+
+    def close(self):
+        if self.node is not None:
+            self.node.destroy_node()
+            self.node = None
+        if self.rclpy is not None:
+            try:
+                self.rclpy.shutdown()
+            except Exception:
+                pass
+            self.rclpy = None
+
+
+class H264RobotSender:
+    def __init__(self, args):
+        self.args = args
+        self.profile = load_env_file(args.profile)
+        self.loop = GLib.MainLoop()
+        self.webrtc = None
+        self.pipeline = None
+        self.control = RosCmdPublisher(args.ros_cmd_topic)
+        self.signaling = self._make_signaling()
+
+    def _make_signaling(self):
+        if self.args.signaling_url:
+            return ClientSignaling(self.args.signaling_url, "robot", self.args.room, self._handle_signaling_message)
+        return ServerSignaling(self.args.host, self.args.port, self._handle_signaling_message)
+
+    def _video_source(self) -> str:
+        if self.args.source_pipeline:
+            return self.args.source_pipeline
+        return (
+            f"videotestsrc is-live=true pattern=ball ! "
+            f"video/x-raw,width={self.args.width},height={self.args.height},framerate={self.args.fps}/1"
+        )
+
+    def _encoder(self) -> str:
+        name = self.profile.get("GST_H264_ENCODER_NAME", "")
+        props = self.profile.get("GST_H264_ENCODER_PROPS", "")
+        if not name:
+            raise RuntimeError("No H.264 encoder selected. Run ./horus bootstrap robot.")
+        return f"{name} {props}".strip()
+
+    def _media_bin_description(self) -> str:
+        return (
+            f"{self._video_source()} ! "
+            "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+            "videoconvert ! "
+            f"{self._encoder()} ! "
+            "h264parse config-interval=-1 ! "
+            "rtph264pay pt=96 config-interval=-1 aggregate-mode=zero-latency"
+        )
+
+    def _build_pipeline(self):
+        pipeline = Gst.Pipeline.new("horus-h264-robot")
+        self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
+        if self.webrtc is None:
+            raise RuntimeError("failed to create webrtcbin")
+        configure_webrtcbin(self.webrtc, self.args.ice_servers)
+        media = Gst.parse_bin_from_description(self._media_bin_description(), True)
+        pipeline.add(media)
+        pipeline.add(self.webrtc)
+        srcpad = media.get_static_pad("src")
+        sinkpad = self.webrtc.request_pad_simple("sink_%u")
+        if sinkpad is None:
+            sinkpad = self.webrtc.get_request_pad("sink_%u")
+        if sinkpad is None:
+            raise RuntimeError("failed to request webrtcbin sink pad; install gstreamer1.0-nice and rerun bootstrap")
+        result = srcpad.link(sinkpad)
+        if result != Gst.PadLinkReturn.OK:
+            raise RuntimeError(f"failed to link media to webrtcbin: {result}")
+        return pipeline
+
+    def start(self):
+        Gst.init(None)
+        ensure_webrtc_runtime()
+        self.signaling.start()
+        desc = self._media_bin_description()
+        print(f"Robot media pipeline: {desc}", flush=True)
+        self.pipeline = self._build_pipeline()
+        self.webrtc.connect("on-negotiation-needed", self._on_negotiation_needed)
+        self.webrtc.connect("on-ice-candidate", self._on_ice_candidate)
+        self.webrtc.connect("on-data-channel", self._on_data_channel)
+        control_channel = self.webrtc.emit("create-data-channel", "cmd-vel", None)
+        self._attach_control_channel(control_channel)
+        self.pipeline.set_state(Gst.State.PLAYING)
+        if self.args.duration > 0:
+            GLib.timeout_add_seconds(int(self.args.duration), self.stop)
+        try:
+            self.loop.run()
+        finally:
+            self.stop()
+
+    def stop(self):
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+        self.control.close()
+        if self.loop.is_running():
+            self.loop.quit()
+        return False
+
+    def _on_negotiation_needed(self, _element):
+        promise = Gst.Promise.new_with_change_func(self._on_offer_created, None)
+        self.webrtc.emit("create-offer", None, promise)
+
+    def _on_offer_created(self, promise, _user_data):
+        promise.wait()
+        offer = promise.get_reply().get_value("offer")
+        self.webrtc.emit("set-local-description", offer, Gst.Promise.new())
+        self.signaling.send({"type": "offer", "sdp": offer.sdp.as_text()})
+
+    def _on_ice_candidate(self, _element, mlineindex, candidate):
+        self.signaling.send({"type": "ice", "sdpMLineIndex": int(mlineindex), "candidate": candidate})
+
+    def _handle_signaling_message(self, message: dict):
+        GLib.idle_add(self._handle_signaling_message_in_loop, message)
+
+    def _handle_signaling_message_in_loop(self, message: dict):
+        kind = message.get("type")
+        if kind == "answer":
+            answer = make_session_description("answer", message["sdp"])
+            self.webrtc.emit("set-remote-description", answer, Gst.Promise.new())
+        elif kind == "ice":
+            self.webrtc.emit("add-ice-candidate", int(message["sdpMLineIndex"]), message["candidate"])
+        return False
+
+    def _on_data_channel(self, _webrtc, channel):
+        label = channel.props.label
+        print(f"DataChannel received: {label}", flush=True)
+        if label != "cmd-vel":
+            return
+        self._attach_control_channel(channel)
+
+    def _attach_control_channel(self, channel):
+        channel.connect("on-open", lambda _channel: print("cmd-vel DataChannel open", flush=True))
+        channel.connect("on-message-string", self._on_control_message)
+
+    def _on_control_message(self, channel, text):
+        receive_ns = time.time_ns()
+        try:
+            command = json.loads(text)
+        except Exception:
+            return
+        if command.get("type") != "cmd_vel":
+            return
+        published = self.control.publish(command)
+        ack = {
+            "type": "cmd_vel_ack",
+            "seq": command.get("seq"),
+            "sent_ns": command.get("sent_ns"),
+            "robot_receive_ns": receive_ns,
+            "robot_ack_ns": time.time_ns(),
+            "published_to_ros": published,
+        }
+        channel.emit("send-string", json.dumps(ack, separators=(",", ":")))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--signaling-url", default="")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--room", default="default")
+    parser.add_argument("--profile", default=".webrtc_profile.env")
+    parser.add_argument("--ice-servers", default="stun:stun.l.google.com:19302")
+    parser.add_argument("--ros-cmd-topic", default="/cmd_vel")
+    parser.add_argument("--source-pipeline", default="")
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--duration", type=float, default=0.0)
+    return parser.parse_args()
+
+
+def main():
+    H264RobotSender(parse_args()).start()
+
+
+if __name__ == "__main__":
+    main()
