@@ -1,0 +1,93 @@
+{
+  plugins: {
+    ros2dds: {
+      // WebRTC split profile: keep camera and robot-control data out of Zenoh.
+      // Use Zenoh for robot state, TF, LaserScan, and limited point clouds.
+      allow: {
+        publishers: [
+          "/tf",
+          "/tf_static",
+          ".*/odom$",
+          ".*/joint_states$",
+          ".*/scan$",
+          ".*/points$",
+        ],
+        subscribers: [
+          "/tf",
+          "/tf_static",
+          ".*/odom$",
+          ".*/joint_states$",
+          ".*/scan$",
+          ".*/points$",
+        ],
+        service_servers: [],
+        service_clients: [],
+        action_servers: [],
+        action_clients: [],
+      },
+
+      pub_max_frequencies: [
+        "/tf=20",
+        "/tf_static=1",
+        ".*/odom$=20",
+        ".*/joint_states$=20",
+        ".*/scan$=10",
+        ".*/points$=1",
+      ],
+
+      pub_priorities: [
+        "/tf=2:express",
+        "/tf_static=2:express",
+        ".*/odom$=3:express",
+        ".*/joint_states$=3",
+        ".*/scan$=4",
+        ".*/points$=6",
+      ],
+
+      reliable_routes_blocking: false,
+      transient_local_cache_multiplier: 1,
+
+      queries_timeout: {
+        default: 1.0,
+        transient_local_subscribers: 0.5,
+        services: 1.0,
+        actions: {
+          send_goal: 1.0,
+          cancel_goal: 1.0,
+          get_result: 30.0,
+        },
+      },
+    },
+  },
+
+  scouting: {
+    multicast: {
+      enabled: false,
+    },
+    gossip: {
+      enabled: false,
+    },
+  },
+
+  transport: {
+    unicast: {
+      qos: {
+        enabled: true,
+      },
+    },
+    link: {
+      tx: {
+        queue: {
+          batching: {
+            enabled: false,
+          },
+          congestion_control: {
+            drop: {
+              wait_before_drop: 0,
+            },
+          },
+        },
+      },
+    },
+  },
+}
