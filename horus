@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_DIR="${ROOT}/.run"
+ENV_FILE="${HORUS_ENV:-${ROOT}/.env}"
+mkdir -p "${RUN_DIR}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./horus init
+  ./horus bootstrap [robot|machine|cloud|auto]
+  ./horus launch [robot|machine|cloud]
+  ./horus stop
+  ./horus status
+  ./horus logs [zenoh|webrtc|signal]
+
+Roles:
+  robot    Robot-side system. Publishes camera over WebRTC and receives cmd_vel over WebRTC.
+  machine  Operator/local machine. Receives WebRTC cameras and connects to robot state.
+  cloud    Single shared relay/router for hub deployments.
+
+Topologies:
+  hub      robot(s) and machine(s) connect through one cloud Zenoh router.
+  direct   robot connects directly to machine over VPN/Tailscale/LAN; no cloud required.
+
+In hub mode the cloud runs Zenoh routing and WebRTC signaling relay only. Media
+encoding/decoding happens on robot and machine endpoints.
+USAGE
+}
+
+load_env() {
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "Missing ${ENV_FILE}. Run ./horus init first." >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck source=/dev/null
+  source "${ENV_FILE}"
+  set +a
+}
+
+source_ros() {
+  local distro="${ROS_DISTRO:-jazzy}"
+  if [[ -f "/opt/ros/${distro}/setup.bash" ]]; then
+    set +u
+    # shellcheck source=/dev/null
+    source "/opt/ros/${distro}/setup.bash"
+    set -u
+  elif [[ -f "/opt/ros/${distro}/local_setup.bash" ]]; then
+    set +u
+    # shellcheck source=/dev/null
+    source "/opt/ros/${distro}/local_setup.bash"
+    set -u
+  else
+    echo "ROS setup file not found for ${distro}: /opt/ros/${distro}/setup.bash or local_setup.bash" >&2
+  fi
+}
+
+python_bin() {
+  if [[ -x "${ROOT}/.venv-webrtc/bin/python" ]] \
+    && "${ROOT}/.venv-webrtc/bin/python" - <<'PY' >/dev/null 2>&1
+import websockets
+PY
+  then
+    echo "${ROOT}/.venv-webrtc/bin/python"
+  else
+    echo "python3"
+  fi
+}
+
+ice_args() {
+  local args=()
+  local ice="${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}"
+  IFS=',' read -ra servers <<< "${ice}"
+  for server in "${servers[@]}"; do
+    [[ -n "${server}" ]] && args+=(--ice-server "${server}")
+  done
+  printf '%q ' "${args[@]}"
+}
+
+required_value() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "${value}" ]]; then
+    echo "${name} is not set in ${ENV_FILE}" >&2
+    exit 1
+  fi
+}
+
+zenoh_config_path() {
+  echo "${ROOT}/${ZENOH_CONFIG:-config/zenoh_split.json5}"
+}
+
+zenoh_common_args() {
+  local config
+  config="$(zenoh_config_path)"
+  [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+  printf '%q ' -c "${config}"
+  if [[ -n "${ZENOH_NAMESPACE:-}" ]]; then
+    printf '%q ' -n "${ZENOH_NAMESPACE}"
+  fi
+}
+
+zenoh_connect_target() {
+  local role="$1"
+  local topology="${HORUS_TOPOLOGY:-hub}"
+  case "${role}:${topology}" in
+    robot:hub|machine:hub)
+      required_value HORUS_CLOUD_IP "${HORUS_CLOUD_IP:-}"
+      echo "${HORUS_CLOUD_IP}"
+      ;;
+    robot:direct)
+      required_value HORUS_MACHINE_IP "${HORUS_MACHINE_IP:-}"
+      echo "${HORUS_MACHINE_IP}"
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+webrtc_signal_target() {
+  if [[ -n "${HORUS_WEBRTC_SIGNAL_IP:-}" ]]; then
+    echo "${HORUS_WEBRTC_SIGNAL_IP}"
+  elif [[ -n "${HORUS_MACHINE_IP:-}" ]]; then
+    echo "${HORUS_MACHINE_IP}"
+  else
+    required_value HORUS_CLOUD_IP "${HORUS_CLOUD_IP:-}"
+    echo "${HORUS_CLOUD_IP}"
+  fi
+}
+
+start_bg() {
+  local name="$1"
+  shift
+  local log="${RUN_DIR}/${name}.log"
+  local pid="${RUN_DIR}/${name}.pid"
+
+  if [[ -f "${pid}" ]] && kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+    echo "${name} already running with pid $(cat "${pid}")"
+    return
+  fi
+
+  echo "Starting ${name}; log: ${log}"
+  nohup "$@" >"${log}" 2>&1 < /dev/null &
+  echo "$!" > "${pid}"
+}
+
+stop_one() {
+  local name="$1"
+  local pid="${RUN_DIR}/${name}.pid"
+  if [[ -f "${pid}" ]]; then
+    if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+      kill "$(cat "${pid}")" || true
+      echo "Stopped ${name}"
+    fi
+    rm -f "${pid}"
+  fi
+}
+
+status_one() {
+  local name="$1"
+  local pid="${RUN_DIR}/${name}.pid"
+  if [[ -f "${pid}" ]] && kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+    echo "${name}: running pid $(cat "${pid}")"
+  else
+    echo "${name}: stopped"
+  fi
+}
+
+launch_zenoh_client() {
+  local role="$1"
+  local target="$2"
+  local bridge="${ROOT}/zenoh-bridge-ros2dds"
+  [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
+  source_ros
+  # shellcheck disable=SC2086
+  start_bg zenoh "${bridge}" $(zenoh_common_args) --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
+}
+
+launch_zenoh_router() {
+  local role="$1"
+  local bridge="${ROOT}/zenoh-bridge-ros2dds"
+  [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
+  source_ros
+  # shellcheck disable=SC2086
+  start_bg zenoh "${bridge}" $(zenoh_common_args) -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
+}
+
+launch_webrtc_robot() {
+  local py
+  local target
+  py="$(python_bin)"
+  target="$(webrtc_signal_target)"
+  source_ros
+  if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
+    # shellcheck disable=SC2086
+    start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_sender.py" \
+      --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
+      --duration "${WEBRTC_DURATION:-86400}" \
+      --camera-fps-scale "${CAMERA_FPS_SCALE:-1.0}" \
+      --quality-scale "${CAMERA_QUALITY_SCALE:-1.0}" \
+      --max-buffer-bytes "${WEBRTC_MAX_BUFFER_BYTES:-2000000}" \
+      --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
+      $(ice_args) \
+      --json "${RUN_DIR}/webrtc_robot_summary.json"
+  else
+    "${ROOT}/scripts/detect_video_stack.sh" --role robot --out "${ROOT}/.webrtc_profile.env" >/dev/null
+    # shellcheck disable=SC2086
+    start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
+      --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
+      --room "${HORUS_ROOM:-default}" \
+      --profile "${ROOT}/.webrtc_profile.env" \
+      --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+      --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
+      --source-pipeline "${WEBRTC_GST_VIDEO_SOURCE:-}" \
+      --width "${WEBRTC_VIDEO_WIDTH:-1280}" \
+      --height "${WEBRTC_VIDEO_HEIGHT:-720}" \
+      --fps "${WEBRTC_VIDEO_FPS:-30}" \
+      --duration "${WEBRTC_DURATION:-86400}"
+  fi
+}
+
+launch_webrtc_receiver() {
+  local role="$1"
+  local py
+  py="$(python_bin)"
+  if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
+    # shellcheck disable=SC2086
+    start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_receiver.py" \
+      --host 0.0.0.0 \
+      --port "${WEBRTC_SIGNAL_PORT:-8765}" \
+      --duration "${WEBRTC_DURATION:-86400}" \
+      --cmd-rate "${CMD_RATE:-0}" \
+      --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
+      --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+      $(ice_args) \
+      --json "${RUN_DIR}/webrtc_${role}_summary.json" \
+      --csv "${RUN_DIR}/webrtc_${role}_latency.csv"
+  else
+    "${ROOT}/scripts/detect_video_stack.sh" --role "${role}" --out "${ROOT}/.webrtc_profile.env" >/dev/null
+    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
+      required_value HORUS_CLOUD_IP "${HORUS_CLOUD_IP:-}"
+      # shellcheck disable=SC2086
+      start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
+        --signaling-url "ws://${HORUS_CLOUD_IP}:${WEBRTC_SIGNAL_PORT:-8765}" \
+        --room "${HORUS_ROOM:-default}" \
+        --profile "${ROOT}/.webrtc_profile.env" \
+        --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
+        --cmd-rate "${CMD_RATE:-0}" \
+        --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
+        --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+        --duration "${WEBRTC_DURATION:-86400}"
+    else
+      # shellcheck disable=SC2086
+      start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
+        --host 0.0.0.0 \
+        --port "${WEBRTC_SIGNAL_PORT:-8765}" \
+        --room "${HORUS_ROOM:-default}" \
+        --profile "${ROOT}/.webrtc_profile.env" \
+        --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
+        --cmd-rate "${CMD_RATE:-0}" \
+        --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
+        --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+        --duration "${WEBRTC_DURATION:-86400}"
+    fi
+  fi
+}
+
+launch_signal_relay() {
+  local py
+  py="$(python_bin)"
+  start_bg signal "${py}" "${ROOT}/scripts/webrtc_signal_relay.py" \
+    --host 0.0.0.0 \
+    --port "${WEBRTC_SIGNAL_PORT:-8765}"
+}
+
+cmd="${1:-help}"
+case "${cmd}" in
+  init)
+    if [[ -f "${ENV_FILE}" ]]; then
+      echo "${ENV_FILE} already exists"
+    else
+      cp "${ROOT}/.env.example" "${ENV_FILE}"
+      echo "Created ${ENV_FILE}"
+    fi
+    ;;
+  bootstrap)
+    "${ROOT}/scripts/bootstrap.sh" "${2:-}"
+    ;;
+  launch)
+    load_env
+    role="${2:-${HORUS_ROLE:-robot}}"
+    case "${role}" in
+      robot)
+        launch_zenoh_client robot "$(zenoh_connect_target robot)"
+        launch_webrtc_robot
+        ;;
+      machine)
+        if [[ "${HORUS_TOPOLOGY:-hub}" == "direct" ]]; then
+          launch_zenoh_router machine
+        else
+          launch_zenoh_client machine "$(zenoh_connect_target machine)"
+        fi
+        launch_webrtc_receiver machine
+        ;;
+      cloud)
+        launch_zenoh_router cloud
+        if [[ "${HORUS_CLOUD_RUN_SIGNALING:-1}" == "1" ]]; then
+          launch_signal_relay
+        fi
+        ;;
+      *)
+        echo "Unknown launch role: ${role}" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  stop)
+    stop_one webrtc
+    stop_one signal
+    stop_one zenoh
+    ;;
+  status)
+    status_one zenoh
+    status_one signal
+    status_one webrtc
+    ;;
+  logs)
+    service="${2:-}"
+    case "${service}" in
+      zenoh|webrtc|signal) tail -f "${RUN_DIR}/${service}.log" ;;
+      *) echo "Choose a log: zenoh, webrtc, or signal" >&2; exit 2 ;;
+    esac
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
