@@ -21,6 +21,12 @@
 
 `config/zenoh_split.json5` intentionally keeps cameras and `/cmd_vel` out of Zenoh.
 
+## Benchmark
+
+![Camera transport benchmark](docs/transport_benchmark.svg)
+
+Mode B 1080p30/720p30 camera benchmark. Freshness uses a 150 ms clock-normalized deadline.
+
 ## Roles
 
 | Role | Responsibility |
