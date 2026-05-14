@@ -69,7 +69,9 @@ GST_H264_ENCODER_NAME=""
 GST_H264_ENCODER_PROPS=""
 GST_H264_DECODER_NAME=""
 GST_H264_DECODER_PROPS=""
-VIDEO_BITRATE_KBIT="${VIDEO_BITRATE_KBIT:-8000}"
+VIDEO_BITRATE_KBIT="${VIDEO_BITRATE_KBIT:-6000}"
+WEBRTC_ENCODER_PREFERENCE="${WEBRTC_ENCODER_PREFERENCE:-x264}"
+WEBRTC_DECODER_PREFERENCE="${WEBRTC_DECODER_PREFERENCE:-software}"
 NOTES=()
 
 if [[ "${ROLE}" == "cloud" ]]; then
@@ -162,14 +164,29 @@ try_encoder() {
   return 1
 }
 
-if ! try_encoder "nvidia-nvenc" "nvh264enc" "rc-mode=cbr zerolatency=true bframes=0 gop-size=30 bitrate=${VIDEO_BITRATE_KBIT} aud=false" \
-  && ! try_encoder "nvidia-nvenc" "nvautogpuh264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false" \
-  && ! try_encoder "nvidia-nvenc" "nvcudah264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false" \
-  && ! try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 insert-sps-pps=true" \
-  && ! try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" \
-  && ! try_encoder "vaapi" "vaapih264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" \
-  && ! try_encoder "v4l2-m2m" "v4l2h264enc" "extra-controls=controls,video_bitrate=$((VIDEO_BITRATE_KBIT * 1000)),h264_i_frame_period=30" \
-  && ! try_encoder "cpu-x264" "x264enc" "tune=zerolatency speed-preset=ultrafast key-int-max=30 bitrate=${VIDEO_BITRATE_KBIT} byte-stream=true bframes=0" \
+try_x264_encoder() {
+  try_encoder "cpu-x264" "x264enc" "bitrate=${VIDEO_BITRATE_KBIT} speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=true aud=false"
+}
+
+try_hardware_encoder() {
+  try_encoder "nvidia-nvenc" "nvh264enc" "rc-mode=cbr zerolatency=true bframes=0 gop-size=30 bitrate=${VIDEO_BITRATE_KBIT} aud=false" \
+    || try_encoder "nvidia-nvenc" "nvautogpuh264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false tune=ultra-low-latency preset=p1 zero-reorder-delay=true repeat-sequence-header=true" \
+    || try_encoder "nvidia-nvenc" "nvcudah264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false" \
+    || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 insert-sps-pps=true" \
+    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" \
+    || try_encoder "vaapi" "vaapih264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" \
+    || try_encoder "v4l2-m2m" "v4l2h264enc" "extra-controls=controls,video_bitrate=$((VIDEO_BITRATE_KBIT * 1000)),h264_i_frame_period=30"
+}
+
+if [[ "${WEBRTC_ENCODER_PREFERENCE}" == "hardware" ]]; then
+  encoder_selected=false
+  try_hardware_encoder && encoder_selected=true
+  [[ "${encoder_selected}" == "true" ]] || try_x264_encoder && encoder_selected=true
+  [[ "${encoder_selected}" == "true" ]] || try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30" || {
+    NOTES+=("No H.264 encoder element found; install NVIDIA, VAAPI, V4L2, x264, or OpenH264 GStreamer plugins.")
+  }
+elif ! try_x264_encoder \
+  && ! try_hardware_encoder \
   && ! try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then
   NOTES+=("No H.264 encoder element found; install NVIDIA, VAAPI, V4L2, x264, or OpenH264 GStreamer plugins.")
 fi
@@ -215,14 +232,27 @@ try_decoder() {
   return 1
 }
 
-if ! try_decoder "nvidia-nvdec" "nvh264dec" "" \
-  && ! try_decoder "nvidia-v4l2" "nvv4l2decoder" "" \
-  && ! try_decoder "vaapi" "vah264dec" "" \
-  && ! try_decoder "vaapi" "vaapih264dec" "" \
-  && ! try_decoder "v4l2-m2m" "v4l2slh264dec" "" \
-  && ! try_decoder "v4l2-m2m" "v4l2h264dec" "" \
-  && ! try_decoder "cpu-libav" "avdec_h264" "" \
-  && ! try_decoder "cpu-openh264" "openh264dec" ""; then
+try_software_decoder() {
+  try_decoder "cpu-libav" "avdec_h264" "" || try_decoder "cpu-openh264" "openh264dec" ""
+}
+
+try_hardware_decoder() {
+  try_decoder "nvidia-nvdec" "nvh264dec" "" \
+    || try_decoder "nvidia-v4l2" "nvv4l2decoder" "" \
+    || try_decoder "vaapi" "vah264dec" "" \
+    || try_decoder "vaapi" "vaapih264dec" "" \
+    || try_decoder "v4l2-m2m" "v4l2slh264dec" "" \
+    || try_decoder "v4l2-m2m" "v4l2h264dec" ""
+}
+
+if [[ "${WEBRTC_DECODER_PREFERENCE}" == "hardware" ]]; then
+  decoder_selected=false
+  try_hardware_decoder && decoder_selected=true
+  [[ "${decoder_selected}" == "true" ]] || try_software_decoder && decoder_selected=true
+  [[ "${decoder_selected}" == "true" ]] || {
+    NOTES+=("No H.264 decoder element found; install NVIDIA, VAAPI, V4L2, libav, or OpenH264 GStreamer plugins.")
+  }
+elif ! try_software_decoder && ! try_hardware_decoder; then
   NOTES+=("No H.264 decoder element found; install NVIDIA, VAAPI, V4L2, libav, or OpenH264 GStreamer plugins.")
 fi
 

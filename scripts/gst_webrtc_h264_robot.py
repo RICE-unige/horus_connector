@@ -81,6 +81,10 @@ class H264RobotSender:
         self.webrtc = None
         self.pipeline = None
         self.control = RosCmdPublisher(args.ros_cmd_topic)
+        self.frame_clock_channel = None
+        self.frame_clock_open = False
+        self.frame_clock_seq = 0
+        self.frame_clock_last_sec = 0.0
         self.signaling = self._make_signaling()
 
     def _make_signaling(self):
@@ -108,6 +112,7 @@ class H264RobotSender:
             f"{self._video_source()} ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
             "videoconvert ! "
+            f"{'identity name=frameclock signal-handoffs=true silent=true ! ' if self.args.latency_probe else ''}"
             f"{self._encoder()} ! "
             "h264parse config-interval=-1 ! "
             "rtph264pay pt=96 config-interval=-1 aggregate-mode=zero-latency"
@@ -120,6 +125,11 @@ class H264RobotSender:
             raise RuntimeError("failed to create webrtcbin")
         configure_webrtcbin(self.webrtc, self.args.ice_servers)
         media = Gst.parse_bin_from_description(self._media_bin_description(), True)
+        if self.args.latency_probe:
+            frameclock = media.get_by_name("frameclock")
+            if frameclock is None:
+                raise RuntimeError("failed to create WebRTC frame latency probe")
+            frameclock.connect("handoff", self._on_frame_clock_handoff)
         pipeline.add(media)
         pipeline.add(self.webrtc)
         srcpad = media.get_static_pad("src")
@@ -140,12 +150,25 @@ class H264RobotSender:
         desc = self._media_bin_description()
         print(f"Robot media pipeline: {desc}", flush=True)
         self.pipeline = self._build_pipeline()
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
         self.webrtc.connect("on-negotiation-needed", self._on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self._on_ice_candidate)
         self.webrtc.connect("on-data-channel", self._on_data_channel)
-        control_channel = self.webrtc.emit("create-data-channel", "cmd-vel", None)
-        self._attach_control_channel(control_channel)
         self.pipeline.set_state(Gst.State.PLAYING)
+        if self.args.latency_probe:
+            self.frame_clock_channel = self.webrtc.emit("create-data-channel", "frame-clock", None)
+            if self.frame_clock_channel is not None:
+                self.frame_clock_channel.connect("on-open", self._on_frame_clock_open)
+            else:
+                print("frame latency DataChannel unavailable; continuing without latency samples", flush=True)
+        if self.args.ros_cmd_topic:
+            control_channel = self.webrtc.emit("create-data-channel", "cmd-vel", None)
+            if control_channel is not None:
+                self._attach_control_channel(control_channel)
+            else:
+                print("cmd-vel DataChannel unavailable; continuing with video only", flush=True)
         if self.args.duration > 0:
             GLib.timeout_add_seconds(int(self.args.duration), self.stop)
         try:
@@ -167,9 +190,24 @@ class H264RobotSender:
 
     def _on_offer_created(self, promise, _user_data):
         promise.wait()
-        offer = promise.get_reply().get_value("offer")
+        reply = promise.get_reply()
+        offer = reply.get_value("offer") if reply is not None else None
+        if offer is None:
+            detail = reply.to_string() if reply is not None else "no promise reply"
+            print(f"failed to create WebRTC offer: {detail}", flush=True)
+            self.stop()
+            return
         self.webrtc.emit("set-local-description", offer, Gst.Promise.new())
         self.signaling.send({"type": "offer", "sdp": offer.sdp.as_text()})
+
+    def _on_bus_message(self, _bus, message):
+        if message.type == Gst.MessageType.ERROR:
+            error, debug = message.parse_error()
+            print(f"GStreamer error from {message.src.get_name()}: {error}; {debug}", flush=True)
+            self.stop()
+        elif message.type == Gst.MessageType.WARNING:
+            warning, debug = message.parse_warning()
+            print(f"GStreamer warning from {message.src.get_name()}: {warning}; {debug}", flush=True)
 
     def _on_ice_candidate(self, _element, mlineindex, candidate):
         self.signaling.send({"type": "ice", "sdpMLineIndex": int(mlineindex), "candidate": candidate})
@@ -194,6 +232,8 @@ class H264RobotSender:
         self._attach_control_channel(channel)
 
     def _attach_control_channel(self, channel):
+        if channel is None:
+            return
         channel.connect("on-open", lambda _channel: print("cmd-vel DataChannel open", flush=True))
         channel.connect("on-message-string", self._on_control_message)
 
@@ -216,6 +256,25 @@ class H264RobotSender:
         }
         channel.emit("send-string", json.dumps(ack, separators=(",", ":")))
 
+    def _on_frame_clock_open(self, _channel):
+        self.frame_clock_open = True
+        print("frame latency DataChannel open", flush=True)
+
+    def _on_frame_clock_handoff(self, _identity, _buffer):
+        if not self.frame_clock_open or self.frame_clock_channel is None:
+            return
+        now = time.monotonic()
+        if self.args.latency_probe_rate > 0 and now - self.frame_clock_last_sec < 1.0 / self.args.latency_probe_rate:
+            return
+        self.frame_clock_last_sec = now
+        payload = {
+            "type": "frame_clock",
+            "seq": self.frame_clock_seq,
+            "sent_ns": time.time_ns(),
+        }
+        self.frame_clock_channel.emit("send-string", json.dumps(payload, separators=(",", ":")))
+        self.frame_clock_seq += 1
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -231,6 +290,8 @@ def parse_args():
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--duration", type=float, default=0.0)
+    parser.add_argument("--latency-probe", action="store_true")
+    parser.add_argument("--latency-probe-rate", type=float, default=60.0)
     return parser.parse_args()
 
 
