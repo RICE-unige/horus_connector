@@ -1,0 +1,79 @@
+{
+  plugins: {
+    ros2dds: {
+      // Benchmark-only profile: route cameras and all ROS graph traffic.
+      // This profile is intentionally throughput-oriented so Zenoh is not
+      // punished by a state-topic profile that drops fragmented image frames.
+      reliable_routes_blocking: false,
+      transient_local_cache_multiplier: 1,
+      queries_timeout: {
+        default: 1.0,
+        transient_local_subscribers: 0.5,
+        services: 1.0,
+        actions: {
+          send_goal: 1.0,
+          cancel_goal: 1.0,
+          get_result: 30.0,
+        },
+      },
+    },
+  },
+
+  scouting: {
+    multicast: {
+      enabled: false,
+    },
+    gossip: {
+      enabled: false,
+    },
+  },
+
+  transport: {
+    unicast: {
+      qos: {
+        enabled: true,
+      },
+      compression: {
+        enabled: false,
+      },
+    },
+    link: {
+      tx: {
+        threads: 2,
+        batch_size: 65535,
+        queue: {
+          size: {
+            control: 16,
+            real_time: 16,
+            interactive_high: 16,
+            interactive_low: 16,
+            data_high: 16,
+            data: 16,
+            data_low: 16,
+            background: 16,
+          },
+          batching: {
+            enabled: true,
+            time_limit: 1000,
+          },
+          congestion_control: {
+            drop: {
+              wait_before_drop: 100000,
+            },
+            block: {
+              wait_before_close: 5000000,
+            },
+          },
+        },
+      },
+      rx: {
+        buffer_size: 1048576,
+        max_message_size: 1073741824,
+      },
+      tcp: {
+        so_sndbuf: 8388608,
+        so_rcvbuf: 8388608,
+      },
+    },
+  },
+}

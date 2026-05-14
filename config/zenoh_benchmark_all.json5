@@ -1,0 +1,51 @@
+{
+  plugins: {
+    ros2dds: {
+      // Benchmark-only profile: route cameras and all ROS graph traffic.
+      // This intentionally contrasts with config/zenoh_split.json5.
+      reliable_routes_blocking: false,
+      transient_local_cache_multiplier: 1,
+      queries_timeout: {
+        default: 1.0,
+        transient_local_subscribers: 0.5,
+        services: 1.0,
+        actions: {
+          send_goal: 1.0,
+          cancel_goal: 1.0,
+          get_result: 30.0,
+        },
+      },
+    },
+  },
+
+  scouting: {
+    multicast: {
+      enabled: false,
+    },
+    gossip: {
+      enabled: false,
+    },
+  },
+
+  transport: {
+    unicast: {
+      qos: {
+        enabled: true,
+      },
+    },
+    link: {
+      tx: {
+        queue: {
+          batching: {
+            enabled: false,
+          },
+          congestion_control: {
+            drop: {
+              wait_before_drop: 0,
+            },
+          },
+        },
+      },
+    },
+  },
+}
