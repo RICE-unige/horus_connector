@@ -3,6 +3,13 @@
     ros2dds: {
       // WebRTC split profile: keep camera and robot-control data out of Zenoh.
       // Use Zenoh for robot state, TF, LaserScan, and limited point clouds.
+      //
+      // Keep DDS discovery local to this host. In multi-robot LAN/VPN tests this
+      // prevents robot bridges from rediscovering each other directly and
+      // repeatedly re-exporting already-namespaced remote topics.
+      ros_localhost_only: true,
+      ros_automatic_discovery_range: "LOCALHOST",
+
       allow: {
         publishers: [
           "/tf",
