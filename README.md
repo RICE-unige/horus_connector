@@ -55,7 +55,7 @@ nano .env
 ./horus bootstrap robot     # or machine/cloud
 ```
 
-Bootstrap installs/probes Zenoh, GStreamer WebRTC, `gstreamer1.0-nice`, and the best available H.264 encoder/decoder on `robot` and `machine`. The `cloud` role installs only Zenoh plus signaling dependencies and skips media packages/hardware probing.
+Bootstrap installs/probes Zenoh, GStreamer WebRTC, `gstreamer1.0-nice`, and a stable H.264 encoder/decoder profile on `robot` and `machine`. The `cloud` role installs only Zenoh plus signaling dependencies and skips media packages/hardware probing.
 
 The default `WEBRTC_MEDIA_MODE=h264` path uses native GStreamer WebRTC and does not install `aiortc`. `aiortc` is only needed for the legacy JPEG fallback mode.
 
@@ -70,7 +70,14 @@ nano .env
 ./horus bootstrap machine   # operator-side system
 ```
 
+Install ROS 2 first on `robot` and `machine` roles, then set `ROS_DISTRO` in `.env` to that distro. The `cloud` role does not need ROS 2 nodes.
+
 Bootstrap asks for sudo when system packages are needed. If the machine has no interactive sudo, it prints the exact apt command to run once.
+
+Video profile:
+
+- `WEBRTC_ENCODER_PREFERENCE=stable` and `WEBRTC_DECODER_PREFERENCE=stable` are the defaults. Normal Linux/NUC/WSL systems prefer x264/libav because that path has been the most reliable end-to-end WebRTC/ROS profile; Jetson systems use the NVIDIA V4L2 path when available.
+- Set either preference to `hardware` to try hardware codecs first, or `software` to force software codecs.
 
 Supported hardware paths:
 
@@ -92,9 +99,12 @@ HORUS_CLOUD_IP=34.6.77.21   # hub mode
 HORUS_MACHINE_IP=           # direct mode or direct WebRTC target
 ZENOH_NAMESPACE=/robot1     # unique per robot
 ROS_DISTRO=jazzy
+ROS_LOCALHOST_ONLY=1
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 ROS_CMD_TOPIC=/cmd_vel
 WEBRTC_ROS_IMAGE_INPUT_TOPIC=/camera/image_raw
 WEBRTC_ROS_IMAGE_OUTPUT_TOPIC=/camera/webrtc/image_raw
+WEBRTC_H264_KEY_INT_MAX=10
 ```
 
 Set `ROS_DISTRO` to the ROS 2 distro actually installed on the machine, for example `humble` or `jazzy`.

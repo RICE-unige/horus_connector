@@ -1,7 +1,9 @@
 .env
+.env.before_*
 .run/
 .venv-webrtc/
 .webrtc_profile.env
+.zenoh_profile.env
 __pycache__/
 *.pyc
 *.log

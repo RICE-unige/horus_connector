@@ -161,6 +161,22 @@ run_apt() {
   fi
 }
 
+check_ros2_runtime() {
+  if [[ "${ROLE}" == "cloud" ]]; then
+    return
+  fi
+
+  local distro="${ROS_DISTRO:-jazzy}"
+  if [[ -f "/opt/ros/${distro}/setup.bash" || -f "/opt/ros/${distro}/local_setup.bash" ]]; then
+    return
+  fi
+
+  echo "ROS 2 setup file not found for ROS_DISTRO=${distro}." >&2
+  echo "Install ROS 2 on this robot/machine, or set ROS_DISTRO to the installed ROS 2 distro before bootstrap." >&2
+  echo "Expected: /opt/ros/${distro}/setup.bash" >&2
+  return 1
+}
+
 latest_zenoh_version() {
   if [[ -n "${ZENOH_VERSION:-}" ]]; then
     echo "${ZENOH_VERSION}"
@@ -189,6 +205,7 @@ rust_target() {
 
 install_zenoh() {
   local version target zip url
+  local check_log="${TMPDIR:-/tmp}/horus_connector_${UID}_zenoh_bridge_check.log"
   version="$(latest_zenoh_version)"
   target="$(rust_target)"
   zip="${ROOT}/zenoh-plugin-ros2dds-${version}-${target}-standalone.zip"
@@ -210,14 +227,14 @@ install_zenoh() {
   mv "${zip}.tmp" "${zip}"
   unzip -o "${zip}" -d "${ROOT}"
   chmod +x "${ROOT}/zenoh-bridge-ros2dds" "${ROOT}/libzenoh_plugin_ros2dds.so" 2>/dev/null || true
-  if "${ROOT}/zenoh-bridge-ros2dds" --version >/tmp/horus_zenoh_bridge_check.log 2>&1; then
+  if "${ROOT}/zenoh-bridge-ros2dds" --version >"${check_log}" 2>&1; then
     write_zenoh_profile "binary" "" "eclipse/zenoh-bridge-ros2dds:${version}" ""
     "${ROOT}/zenoh-bridge-ros2dds" --version || true
     return
   fi
 
   local error
-  error="$(cat /tmp/horus_zenoh_bridge_check.log)"
+  error="$(cat "${check_log}")"
   if configure_zenoh_docker_fallback "${version}" "${error}"; then
     return
   fi
@@ -333,6 +350,7 @@ esac
 echo "Bootstrap role: ${ROLE}"
 echo "Machine: $(machine_kind) $(uname -m) $(hardware_kind)"
 
+check_ros2_runtime
 run_apt
 install_zenoh
 "${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}"

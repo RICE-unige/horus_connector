@@ -7,6 +7,7 @@ REQ_FILE="${REPO_ROOT}/requirements.txt"
 VENV_DIR="${WEBRTC_VENV:-${REPO_ROOT}/.venv-webrtc}"
 ROLE="${1:-${HORUS_ROLE:-}}"
 MEDIA_MODE="${WEBRTC_MEDIA_MODE:-h264}"
+VENV_LOG="${TMPDIR:-/tmp}/horus_connector_${UID}_webrtc_venv_create.log"
 
 if [[ ! -f "${REQ_FILE}" ]]; then
   echo "Missing ${REQ_FILE}" >&2
@@ -106,7 +107,7 @@ if [[ "${MEDIA_MODE}" != "jpeg" && "${ROLE}" != "cloud" ]]; then
   echo "Using native GStreamer WebRTC dependencies; aiortc is only installed for WEBRTC_MEDIA_MODE=jpeg."
 fi
 
-if python3 -m venv --system-site-packages "${VENV_DIR}" >/tmp/webrtc_venv_create.log 2>&1; then
+if python3 -m venv --system-site-packages "${VENV_DIR}" >"${VENV_LOG}" 2>&1; then
   if deps_available "${VENV_DIR}/bin/python"; then
     echo "WebRTC Python dependencies already available from the virtualenv/system site-packages."
   else
