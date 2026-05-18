@@ -7,6 +7,11 @@ import struct
 import time
 from array import array
 
+try:
+    import numpy as np
+except Exception:
+    np = None
+
 import rclpy
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Quaternion, TransformStamped
@@ -41,8 +46,14 @@ class FakeRobotPublisher(Node):
         self.image_seq = 0
         self.state_seq = 0
         self.points_seq = 0
+        self.image_x = None
+        self.image_y = None
+        if np is not None:
+            self.image_x = np.linspace(0, 255, args.width, dtype=np.uint16)[None, :]
+            self.image_y = np.linspace(0, 255, args.height, dtype=np.uint16)[:, None]
 
-        self.image_pub = self.create_publisher(Image, args.image_topic, qos_profile_sensor_data)
+        image_qos = qos_profile_sensor_data if args.image_qos == "sensor_data" else 10
+        self.image_pub = self.create_publisher(Image, args.image_topic, image_qos)
         self.tf_pub = self.create_publisher(TFMessage, "/tf", 10)
         self.odom_pub = self.create_publisher(Odometry, args.odom_topic, 10)
         self.scan_pub = self.create_publisher(LaserScan, args.scan_topic, qos_profile_sensor_data)
@@ -67,17 +78,23 @@ class FakeRobotPublisher(Node):
         width = self.args.width
         height = self.args.height
         phase = (self.image_seq * 5 + self.args.color_seed) % 256
-        data = bytearray(width * height * 3)
-        stride = width * 3
-        for y in range(height):
-            row_base = y * stride
-            gy = (y * 255) // max(1, height - 1)
-            for x in range(width):
-                gx = (x * 255) // max(1, width - 1)
-                index = row_base + x * 3
-                data[index] = (gx + phase) & 0xFF
-                data[index + 1] = (gy + self.args.color_seed) & 0xFF
-                data[index + 2] = ((gx ^ gy) + phase * 2) & 0xFF
+        if np is not None and self.image_x is not None and self.image_y is not None:
+            red = np.broadcast_to((self.image_x + phase) & 0xFF, (height, width)).astype(np.uint8)
+            green = np.broadcast_to((self.image_y + self.args.color_seed) & 0xFF, (height, width)).astype(np.uint8)
+            blue = (((self.image_x ^ self.image_y) + phase * 2) & 0xFF).astype(np.uint8)
+            data = np.dstack((red, green, blue)).ravel().tobytes()
+        else:
+            data = bytearray(width * height * 3)
+            stride = width * 3
+            for y in range(height):
+                row_base = y * stride
+                gy = (y * 255) // max(1, height - 1)
+                for x in range(width):
+                    gx = (x * 255) // max(1, width - 1)
+                    index = row_base + x * 3
+                    data[index] = (gx + phase) & 0xFF
+                    data[index + 1] = (gy + self.args.color_seed) & 0xFF
+                    data[index + 2] = ((gx ^ gy) + phase * 2) & 0xFF
 
         msg = Image()
         msg.header.stamp = self.now_msg()
@@ -176,6 +193,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--robot-id", default="robot1")
     parser.add_argument("--image-topic", default="/camera/image_raw")
+    parser.add_argument("--image-qos", choices=["sensor_data", "default"], default="sensor_data")
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--scan-topic", default="/scan")
     parser.add_argument("--joint-topic", default="/joint_states")
