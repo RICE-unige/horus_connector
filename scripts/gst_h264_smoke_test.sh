@@ -55,7 +55,7 @@ fi
 source "${PROFILE}"
 
 if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
-  echo "gst-launch-1.0 is missing. Run scripts/bootstrap_stack.sh or install GStreamer packages." >&2
+  echo "gst-launch-1.0 is missing. Run ./horus bootstrap or install GStreamer packages." >&2
   exit 1
 fi
 
@@ -66,7 +66,9 @@ fi
 
 FRAMES=$((FPS * DURATION))
 read -r -a ENCODER_PROPS <<< "${GST_H264_ENCODER_PROPS:-}"
+read -r -a ENCODER_PREPROCESS <<< "${GST_H264_ENCODER_PREPROCESS:-videoconvert}"
 read -r -a DECODER_PROPS <<< "${GST_H264_DECODER_PROPS:-}"
+read -r -a DECODER_POSTPROCESS <<< "${GST_H264_DECODER_POSTPROCESS:-}"
 
 cmd=(
   gst-launch-1.0 -q
@@ -75,11 +77,16 @@ cmd=(
   "video/x-raw,width=${WIDTH},height=${HEIGHT},framerate=${FPS}/1"
   '!'
   queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream
-  '!'
-  videoconvert
-  '!'
-  "${GST_H264_ENCODER_NAME}"
 )
+
+if [[ -n "${GST_H264_ENCODER_PREPROCESS:-videoconvert}" ]]; then
+  cmd+=('!')
+  for part in "${ENCODER_PREPROCESS[@]}"; do
+    [[ -n "${part}" ]] && cmd+=("${part}")
+  done
+fi
+
+cmd+=('!' "${GST_H264_ENCODER_NAME}")
 
 for prop in "${ENCODER_PROPS[@]}"; do
   [[ -n "${prop}" ]] && cmd+=("${prop}")
@@ -95,14 +102,22 @@ if [[ -n "${GST_H264_DECODER_NAME:-}" ]]; then
   for prop in "${DECODER_PROPS[@]}"; do
     [[ -n "${prop}" ]] && cmd+=("${prop}")
   done
+  if [[ -n "${GST_H264_DECODER_POSTPROCESS:-}" ]]; then
+    cmd+=('!')
+    for part in "${DECODER_POSTPROCESS[@]}"; do
+      [[ -n "${part}" ]] && cmd+=("${part}")
+    done
+  fi
   cmd+=('!' videoconvert)
 fi
 
 cmd+=('!' fakesink sync=false)
 
 echo "Encoder: ${GST_H264_ENCODER_NAME} (${VIDEO_ACCEL:-unknown})"
+echo "Encoder preprocess: ${GST_H264_ENCODER_PREPROCESS:-none}"
 if [[ -n "${GST_H264_DECODER_NAME:-}" ]]; then
   echo "Decoder: ${GST_H264_DECODER_NAME} (${VIDEO_DECODER_ACCEL:-unknown})"
+  echo "Decoder postprocess: ${GST_H264_DECODER_POSTPROCESS:-none}"
 else
   echo "Decoder: none selected; running encode-only smoke test"
 fi

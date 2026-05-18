@@ -50,6 +50,25 @@ detect_machine_kind() {
   fi
 }
 
+is_jetson() {
+  [[ -f /etc/nv_tegra_release ]] && return 0
+  grep -qi 'nvidia,tegra\|jetson' /proc/device-tree/compatible 2>/dev/null
+}
+
+detect_video_platform() {
+  if is_jetson; then
+    echo "jetson"
+  elif [[ -d /dev/dri ]] && command -v vainfo >/dev/null 2>&1 && vainfo 2>/dev/null | grep -qi 'intel'; then
+    echo "intel-vaapi"
+  elif [[ -d /dev/dri ]]; then
+    echo "drm-vaapi"
+  elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo "nvidia-nvenc"
+  else
+    echo "generic"
+  fi
+}
+
 quote_env() {
   local value="$1"
   value="${value//\'/\'\\\'\'}"
@@ -58,6 +77,7 @@ quote_env() {
 
 MACHINE_KIND="$(detect_machine_kind)"
 ARCH="$(uname -m)"
+VIDEO_PLATFORM="$(detect_video_platform)"
 HAS_GSTREAMER=0
 HAS_WEBRTCBIN=0
 HAS_NICE=0
@@ -65,13 +85,16 @@ HAS_NVIDIA=0
 HAS_DRI=0
 VIDEO_ACCEL="none"
 VIDEO_DECODER_ACCEL="none"
+GST_H264_ENCODER_PREPROCESS=""
 GST_H264_ENCODER_NAME=""
 GST_H264_ENCODER_PROPS=""
+GST_H264_DECODER_POSTPROCESS=""
 GST_H264_DECODER_NAME=""
 GST_H264_DECODER_PROPS=""
 VIDEO_BITRATE_KBIT="${VIDEO_BITRATE_KBIT:-6000}"
-WEBRTC_ENCODER_PREFERENCE="${WEBRTC_ENCODER_PREFERENCE:-x264}"
-WEBRTC_DECODER_PREFERENCE="${WEBRTC_DECODER_PREFERENCE:-software}"
+WEBRTC_ENCODER_PREFERENCE="${WEBRTC_ENCODER_PREFERENCE:-hardware}"
+WEBRTC_DECODER_PREFERENCE="${WEBRTC_DECODER_PREFERENCE:-hardware}"
+GST_PROBE_TIMEOUT_SEC="${GST_PROBE_TIMEOUT_SEC:-20}"
 NOTES=()
 
 if [[ "${ROLE}" == "cloud" ]]; then
@@ -81,6 +104,7 @@ if [[ "${ROLE}" == "cloud" ]]; then
     echo "ROLE=$(quote_env "${ROLE}")"
     echo "MACHINE_KIND=$(quote_env "${MACHINE_KIND}")"
     echo "ARCH=$(quote_env "${ARCH}")"
+    echo "VIDEO_PLATFORM=$(quote_env "${VIDEO_PLATFORM}")"
     echo "HAS_GSTREAMER=0"
     echo "HAS_WEBRTCBIN=0"
     echo "HAS_NICE=0"
@@ -88,8 +112,10 @@ if [[ "${ROLE}" == "cloud" ]]; then
     echo "HAS_DRI=0"
     echo "VIDEO_ACCEL='none'"
     echo "VIDEO_DECODER_ACCEL='none'"
+    echo "GST_H264_ENCODER_PREPROCESS=''"
     echo "GST_H264_ENCODER_NAME=''"
     echo "GST_H264_ENCODER_PROPS=''"
+    echo "GST_H264_DECODER_POSTPROCESS=''"
     echo "GST_H264_DECODER_NAME=''"
     echo "GST_H264_DECODER_PROPS=''"
     echo "VIDEO_BITRATE_KBIT=${VIDEO_BITRATE_KBIT}"
@@ -115,7 +141,7 @@ else
   NOTES+=("GStreamer libnice plugin is missing; install gstreamer1.0-nice for WebRTC ICE/media transport.")
 fi
 
-if have nvidia-smi && nvidia-smi >/dev/null 2>&1; then
+if is_jetson || { have nvidia-smi && nvidia-smi >/dev/null 2>&1; }; then
   HAS_NVIDIA=1
 fi
 
@@ -123,11 +149,21 @@ if [[ -d /dev/dri ]]; then
   HAS_DRI=1
 fi
 
+run_probe_command() {
+  if have timeout; then
+    timeout "${GST_PROBE_TIMEOUT_SEC}s" "$@"
+  else
+    "$@"
+  fi
+}
+
 probe_encoder() {
   local name="$1"
   local props="$2"
+  local preprocess="$3"
   local log="/tmp/horus_connector_${name}_probe.log"
   read -r -a prop_array <<< "${props}"
+  read -r -a preprocess_array <<< "${preprocess}"
   local cmd=(
     gst-launch-1.0 -q
     videotestsrc is-live=true num-buffers=8 pattern=smpte
@@ -135,8 +171,14 @@ probe_encoder() {
     'video/x-raw,width=640,height=360,framerate=30/1'
     '!'
     queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream
-    '!'
-    videoconvert
+  )
+  if [[ -n "${preprocess}" ]]; then
+    cmd+=('!')
+    for part in "${preprocess_array[@]}"; do
+      [[ -n "${part}" ]] && cmd+=("${part}")
+    done
+  fi
+  cmd+=(
     '!'
     "${name}"
   )
@@ -144,18 +186,20 @@ probe_encoder() {
     [[ -n "${prop}" ]] && cmd+=("${prop}")
   done
   cmd+=('!' h264parse config-interval=-1 '!' fakesink sync=false)
-  "${cmd[@]}" >"${log}" 2>&1
+  run_probe_command "${cmd[@]}" >"${log}" 2>&1
 }
 
 try_encoder() {
   local accel="$1"
   local name="$2"
   local props="$3"
+  local preprocess="${4:-videoconvert}"
   if ! gst_has "${name}"; then
     return 1
   fi
-  if probe_encoder "${name}" "${props}"; then
+  if probe_encoder "${name}" "${props}" "${preprocess}"; then
     VIDEO_ACCEL="${accel}"
+    GST_H264_ENCODER_PREPROCESS="${preprocess}"
     GST_H264_ENCODER_NAME="${name}"
     GST_H264_ENCODER_PROPS="${props}"
     return 0
@@ -169,13 +213,22 @@ try_x264_encoder() {
 }
 
 try_hardware_encoder() {
-  try_encoder "nvidia-nvenc" "nvh264enc" "rc-mode=cbr zerolatency=true bframes=0 gop-size=30 bitrate=${VIDEO_BITRATE_KBIT} aud=false" \
-    || try_encoder "nvidia-nvenc" "nvautogpuh264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false tune=ultra-low-latency preset=p1 zero-reorder-delay=true repeat-sequence-header=true" \
-    || try_encoder "nvidia-nvenc" "nvcudah264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false" \
-    || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 insert-sps-pps=true" \
-    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" \
-    || try_encoder "vaapi" "vaapih264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" \
-    || try_encoder "v4l2-m2m" "v4l2h264enc" "extra-controls=controls,video_bitrate=$((VIDEO_BITRATE_KBIT * 1000)),h264_i_frame_period=30"
+  if [[ "${VIDEO_PLATFORM}" == "jetson" ]]; then
+    try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 idrinterval=30 insert-sps-pps=true maxperf-enable=true" "nvvidconv ! video/x-raw(memory:NVMM),format=NV12" \
+      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 idrinterval=30 insert-sps-pps=true maxperf-enable=true" "nvvideoconvert ! video/x-raw(memory:NVMM),format=NV12" \
+      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 insert-sps-pps=true" "nvvidconv ! video/x-raw(memory:NVMM),format=NV12" \
+      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 insert-sps-pps=true" "nvvideoconvert ! video/x-raw(memory:NVMM),format=NV12" \
+      || return 1
+    return 0
+  fi
+
+  try_encoder "nvidia-nvenc" "nvh264enc" "rc-mode=cbr zerolatency=true bframes=0 gop-size=30 bitrate=${VIDEO_BITRATE_KBIT} aud=false" "videoconvert" \
+    || try_encoder "nvidia-nvenc" "nvautogpuh264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false tune=ultra-low-latency preset=p1 zero-reorder-delay=true repeat-sequence-header=true" "videoconvert" \
+    || try_encoder "nvidia-nvenc" "nvcudah264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false" "videoconvert" \
+    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" "videoconvert ! video/x-raw,format=NV12" \
+    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30" "videoconvert ! video/x-raw,format=NV12" \
+    || try_encoder "vaapi" "vaapih264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" "videoconvert ! video/x-raw,format=NV12" \
+    || try_encoder "v4l2-m2m" "v4l2h264enc" "extra-controls=controls,video_bitrate=$((VIDEO_BITRATE_KBIT * 1000)),h264_i_frame_period=30" "videoconvert ! video/x-raw,format=NV12"
 }
 
 if [[ "${WEBRTC_ENCODER_PREFERENCE}" == "hardware" ]]; then
@@ -194,8 +247,10 @@ fi
 probe_decoder() {
   local name="$1"
   local props="$2"
+  local postprocess="$3"
   local log="/tmp/horus_connector_${name}_decode_probe.log"
   read -r -a prop_array <<< "${props}"
+  read -r -a postprocess_array <<< "${postprocess}"
   local cmd=(
     gst-launch-1.0 -q
     videotestsrc num-buffers=8 pattern=smpte
@@ -211,19 +266,27 @@ probe_decoder() {
   for prop in "${prop_array[@]}"; do
     [[ -n "${prop}" ]] && cmd+=("${prop}")
   done
+  if [[ -n "${postprocess}" ]]; then
+    cmd+=('!')
+    for part in "${postprocess_array[@]}"; do
+      [[ -n "${part}" ]] && cmd+=("${part}")
+    done
+  fi
   cmd+=('!' videoconvert '!' fakesink sync=false)
-  "${cmd[@]}" >"${log}" 2>&1
+  run_probe_command "${cmd[@]}" >"${log}" 2>&1
 }
 
 try_decoder() {
   local accel="$1"
   local name="$2"
   local props="$3"
+  local postprocess="${4:-}"
   if ! gst_has "${name}"; then
     return 1
   fi
-  if probe_decoder "${name}" "${props}"; then
+  if probe_decoder "${name}" "${props}" "${postprocess}"; then
     VIDEO_DECODER_ACCEL="${accel}"
+    GST_H264_DECODER_POSTPROCESS="${postprocess}"
     GST_H264_DECODER_NAME="${name}"
     GST_H264_DECODER_PROPS="${props}"
     return 0
@@ -237,15 +300,24 @@ try_software_decoder() {
 }
 
 try_hardware_decoder() {
-  try_decoder "nvidia-nvdec" "nvh264dec" "" \
-    || try_decoder "nvidia-v4l2" "nvv4l2decoder" "" \
-    || try_decoder "vaapi" "vah264dec" "" \
-    || try_decoder "vaapi" "vaapih264dec" "" \
-    || try_decoder "v4l2-m2m" "v4l2slh264dec" "" \
-    || try_decoder "v4l2-m2m" "v4l2h264dec" ""
+  if [[ "${VIDEO_PLATFORM}" == "jetson" ]]; then
+    try_decoder "nvidia-v4l2" "nvv4l2decoder" "" "nvvidconv ! video/x-raw" \
+      || try_decoder "nvidia-v4l2" "nvv4l2decoder" "" "nvvideoconvert ! video/x-raw" \
+      || return 1
+    return 0
+  fi
+
+  try_decoder "nvidia-nvdec" "nvh264dec" "" "" \
+    || try_decoder "vaapi" "vah264dec" "" "vapostproc ! video/x-raw" \
+    || try_decoder "vaapi" "vah264dec" "" "" \
+    || try_decoder "vaapi" "vaapih264dec" "" "vaapipostproc ! video/x-raw" \
+    || try_decoder "v4l2-m2m" "v4l2slh264dec" "" "" \
+    || try_decoder "v4l2-m2m" "v4l2h264dec" "" ""
 }
 
-if [[ "${WEBRTC_DECODER_PREFERENCE}" == "hardware" ]]; then
+if [[ "${ROLE}" == "robot" ]]; then
+  NOTES+=("Decoder detection skipped for robot role; only H.264 encoding is required.")
+elif [[ "${WEBRTC_DECODER_PREFERENCE}" == "hardware" ]]; then
   decoder_selected=false
   try_hardware_decoder && decoder_selected=true
   [[ "${decoder_selected}" == "true" ]] || try_software_decoder && decoder_selected=true
@@ -262,6 +334,7 @@ mkdir -p "$(dirname "${OUT}")"
   echo "ROLE=$(quote_env "${ROLE}")"
   echo "MACHINE_KIND=$(quote_env "${MACHINE_KIND}")"
   echo "ARCH=$(quote_env "${ARCH}")"
+  echo "VIDEO_PLATFORM=$(quote_env "${VIDEO_PLATFORM}")"
   echo "HAS_GSTREAMER=${HAS_GSTREAMER}"
   echo "HAS_WEBRTCBIN=${HAS_WEBRTCBIN}"
   echo "HAS_NICE=${HAS_NICE}"
@@ -269,24 +342,28 @@ mkdir -p "$(dirname "${OUT}")"
   echo "HAS_DRI=${HAS_DRI}"
   echo "VIDEO_ACCEL=$(quote_env "${VIDEO_ACCEL}")"
   echo "VIDEO_DECODER_ACCEL=$(quote_env "${VIDEO_DECODER_ACCEL}")"
+  echo "GST_H264_ENCODER_PREPROCESS=$(quote_env "${GST_H264_ENCODER_PREPROCESS}")"
   echo "GST_H264_ENCODER_NAME=$(quote_env "${GST_H264_ENCODER_NAME}")"
   echo "GST_H264_ENCODER_PROPS=$(quote_env "${GST_H264_ENCODER_PROPS}")"
+  echo "GST_H264_DECODER_POSTPROCESS=$(quote_env "${GST_H264_DECODER_POSTPROCESS}")"
   echo "GST_H264_DECODER_NAME=$(quote_env "${GST_H264_DECODER_NAME}")"
   echo "GST_H264_DECODER_PROPS=$(quote_env "${GST_H264_DECODER_PROPS}")"
   echo "VIDEO_BITRATE_KBIT=${VIDEO_BITRATE_KBIT}"
 } > "${OUT}"
 
 echo "Wrote ${OUT}"
-echo "Machine: ${MACHINE_KIND} ${ARCH}"
+echo "Machine: ${MACHINE_KIND} ${ARCH} ${VIDEO_PLATFORM}"
 echo "GStreamer: ${HAS_GSTREAMER}, webrtcbin: ${HAS_WEBRTCBIN}, nice: ${HAS_NICE}, NVIDIA: ${HAS_NVIDIA}, /dev/dri: ${HAS_DRI}"
 if [[ -n "${GST_H264_ENCODER_NAME}" ]]; then
   echo "Selected H.264 encoder: ${GST_H264_ENCODER_NAME} (${VIDEO_ACCEL})"
+  echo "Encoder preprocess: ${GST_H264_ENCODER_PREPROCESS}"
   echo "Encoder properties: ${GST_H264_ENCODER_PROPS}"
 else
   echo "Selected H.264 encoder: none"
 fi
 if [[ -n "${GST_H264_DECODER_NAME}" ]]; then
   echo "Selected H.264 decoder: ${GST_H264_DECODER_NAME} (${VIDEO_DECODER_ACCEL})"
+  echo "Decoder postprocess: ${GST_H264_DECODER_POSTPROCESS}"
   echo "Decoder properties: ${GST_H264_DECODER_PROPS}"
 else
   echo "Selected H.264 decoder: none"
