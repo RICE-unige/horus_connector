@@ -36,6 +36,16 @@ def quaternion_from_yaw(yaw: float) -> Quaternion:
     return quat
 
 
+def assign_uint8_sequence(msg, field_name: str, payload: bytearray):
+    for value in (payload, bytes(payload), array("B", payload), list(payload)):
+        try:
+            setattr(msg, field_name, value)
+            return
+        except Exception:
+            continue
+    setattr(msg, field_name, payload)
+
+
 class FakeRobotPublisher(Node):
     def __init__(self, args):
         super().__init__(f"horus_fake_robot_{args.robot_id}")
@@ -79,10 +89,18 @@ class FakeRobotPublisher(Node):
         height = self.args.height
         phase = (self.image_seq * 5 + self.args.color_seed) % 256
         if np is not None and self.image_x is not None and self.image_y is not None:
-            red = np.broadcast_to((self.image_x + phase) & 0xFF, (height, width)).astype(np.uint8)
-            green = np.broadcast_to((self.image_y + self.args.color_seed) & 0xFF, (height, width)).astype(np.uint8)
-            blue = (((self.image_x ^ self.image_y) + phase * 2) & 0xFF).astype(np.uint8)
-            data = np.dstack((red, green, blue)).ravel().tobytes()
+            frame = np.empty((height, width, 3), dtype=np.uint8)
+            frame[:, :, 0] = np.broadcast_to((self.image_x + self.args.color_seed) & 0xFF, (height, width))
+            frame[:, :, 1] = np.broadcast_to((self.image_y + phase) & 0xFF, (height, width))
+            frame[:, :, 2] = ((self.image_x // 2 + self.image_y // 2 + phase) & 0xFF).astype(np.uint8)
+
+            box = max(24, min(width, height) // 6)
+            x0 = int(((math.sin(self.image_seq * 0.09) + 1.0) * 0.5) * max(1, width - box))
+            y0 = int(((math.cos(self.image_seq * 0.07) + 1.0) * 0.5) * max(1, height - box))
+            frame[y0 : y0 + box, x0 : x0 + box, 0] = (220 + self.args.color_seed) & 0xFF
+            frame[y0 : y0 + box, x0 : x0 + box, 1] = (80 + phase) & 0xFF
+            frame[y0 : y0 + box, x0 : x0 + box, 2] = 40
+            data = frame.ravel().tobytes()
         else:
             data = bytearray(width * height * 3)
             stride = width * 3
@@ -92,9 +110,9 @@ class FakeRobotPublisher(Node):
                 for x in range(width):
                     gx = (x * 255) // max(1, width - 1)
                     index = row_base + x * 3
-                    data[index] = (gx + phase) & 0xFF
-                    data[index + 1] = (gy + self.args.color_seed) & 0xFF
-                    data[index + 2] = ((gx ^ gy) + phase * 2) & 0xFF
+                    data[index] = (gx + self.args.color_seed) & 0xFF
+                    data[index + 1] = (gy + phase) & 0xFF
+                    data[index + 2] = ((gx // 2 + gy // 2) + phase) & 0xFF
 
         msg = Image()
         msg.header.stamp = self.now_msg()
@@ -184,7 +202,7 @@ class FakeRobotPublisher(Node):
         msg.point_step = 16
         msg.row_step = msg.point_step * width
         msg.is_dense = True
-        msg.data = array("B", points)
+        assign_uint8_sequence(msg, "data", points)
         self.points_pub.publish(msg)
         self.points_seq += 1
 

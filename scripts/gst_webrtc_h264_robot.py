@@ -112,8 +112,8 @@ class H264RobotSender:
         if self.args.video_source != "ros2":
             return ""
         return (
-            "videoconvert ! videoscale ! videorate drop-only=true ! "
-            f"video/x-raw,width={self.args.width},height={self.args.height},framerate={self.args.fps}/1 ! "
+            "videoconvert ! videoscale ! "
+            f"video/x-raw,width={self.args.width},height={self.args.height} ! "
         )
 
     def _media_bin_description(self) -> str:
@@ -124,8 +124,9 @@ class H264RobotSender:
             f"{self._encoder_preprocess()} ! "
             f"{'identity name=frameclock signal-handoffs=true silent=true ! ' if self.args.latency_probe else ''}"
             f"{self._encoder()} ! "
-            "h264parse config-interval=-1 ! "
-            "rtph264pay pt=96 config-interval=-1"
+            "h264parse config-interval=1 ! "
+            "video/x-h264,stream-format=byte-stream,alignment=au ! "
+            "rtph264pay pt=96 config-interval=1 mtu=1200 aggregate-mode=zero-latency"
         )
 
     def _build_pipeline(self):

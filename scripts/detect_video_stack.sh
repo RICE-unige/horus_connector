@@ -92,8 +92,9 @@ GST_H264_DECODER_POSTPROCESS=""
 GST_H264_DECODER_NAME=""
 GST_H264_DECODER_PROPS=""
 VIDEO_BITRATE_KBIT="${VIDEO_BITRATE_KBIT:-6000}"
-WEBRTC_ENCODER_PREFERENCE="${WEBRTC_ENCODER_PREFERENCE:-hardware}"
-WEBRTC_DECODER_PREFERENCE="${WEBRTC_DECODER_PREFERENCE:-hardware}"
+WEBRTC_H264_KEY_INT_MAX="${WEBRTC_H264_KEY_INT_MAX:-10}"
+WEBRTC_ENCODER_PREFERENCE="${WEBRTC_ENCODER_PREFERENCE:-stable}"
+WEBRTC_DECODER_PREFERENCE="${WEBRTC_DECODER_PREFERENCE:-stable}"
 GST_PROBE_TIMEOUT_SEC="${GST_PROBE_TIMEOUT_SEC:-20}"
 NOTES=()
 
@@ -161,7 +162,7 @@ probe_encoder() {
   local name="$1"
   local props="$2"
   local preprocess="$3"
-  local log="/tmp/horus_connector_${name}_probe.log"
+  local log="${TMPDIR:-/tmp}/horus_connector_${UID}_${name}_probe.log"
   read -r -a prop_array <<< "${props}"
   read -r -a preprocess_array <<< "${preprocess}"
   local cmd=(
@@ -209,7 +210,7 @@ try_encoder() {
 }
 
 try_x264_encoder() {
-  try_encoder "cpu-x264" "x264enc" "bitrate=${VIDEO_BITRATE_KBIT} speed-preset=ultrafast tune=zerolatency key-int-max=30 bframes=0 byte-stream=true aud=false"
+  try_encoder "cpu-x264" "x264enc" "bitrate=${VIDEO_BITRATE_KBIT} speed-preset=ultrafast tune=zerolatency key-int-max=${WEBRTC_H264_KEY_INT_MAX} bframes=0 byte-stream=true aud=false threads=1 sliced-threads=true option-string=slice-max-size=1100" "videoconvert ! video/x-raw,format=I420"
 }
 
 try_hardware_encoder() {
@@ -231,24 +232,46 @@ try_hardware_encoder() {
     || try_encoder "v4l2-m2m" "v4l2h264enc" "extra-controls=controls,video_bitrate=$((VIDEO_BITRATE_KBIT * 1000)),h264_i_frame_period=30" "videoconvert ! video/x-raw,format=NV12"
 }
 
-if [[ "${WEBRTC_ENCODER_PREFERENCE}" == "hardware" ]]; then
-  encoder_selected=false
-  try_hardware_encoder && encoder_selected=true
-  [[ "${encoder_selected}" == "true" ]] || try_x264_encoder && encoder_selected=true
-  [[ "${encoder_selected}" == "true" ]] || try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30" || {
+select_h264_encoder() {
+  local encoder_selected=false
+  case "${WEBRTC_ENCODER_PREFERENCE}" in
+    hardware)
+      if try_hardware_encoder; then encoder_selected=true; fi
+      if [[ "${encoder_selected}" != "true" ]] && try_x264_encoder; then encoder_selected=true; fi
+      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then encoder_selected=true; fi
+      ;;
+    stable)
+      if [[ "${VIDEO_PLATFORM}" == "jetson" ]]; then
+        if try_hardware_encoder; then encoder_selected=true; fi
+        if [[ "${encoder_selected}" != "true" ]] && try_x264_encoder; then encoder_selected=true; fi
+      else
+        if try_x264_encoder; then encoder_selected=true; fi
+        if [[ "${encoder_selected}" != "true" ]] && try_hardware_encoder; then encoder_selected=true; fi
+      fi
+      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then encoder_selected=true; fi
+      ;;
+    software)
+      if try_x264_encoder; then encoder_selected=true; fi
+      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then encoder_selected=true; fi
+      ;;
+    *)
+      echo "Unknown WEBRTC_ENCODER_PREFERENCE=${WEBRTC_ENCODER_PREFERENCE}. Use stable, hardware, or software." >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ "${encoder_selected}" != "true" ]]; then
     NOTES+=("No H.264 encoder element found; install NVIDIA, VAAPI, V4L2, x264, or OpenH264 GStreamer plugins.")
-  }
-elif ! try_x264_encoder \
-  && ! try_hardware_encoder \
-  && ! try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then
-  NOTES+=("No H.264 encoder element found; install NVIDIA, VAAPI, V4L2, x264, or OpenH264 GStreamer plugins.")
-fi
+  fi
+}
+
+select_h264_encoder
 
 probe_decoder() {
   local name="$1"
   local props="$2"
   local postprocess="$3"
-  local log="/tmp/horus_connector_${name}_decode_probe.log"
+  local log="${TMPDIR:-/tmp}/horus_connector_${UID}_${name}_decode_probe.log"
   read -r -a prop_array <<< "${props}"
   read -r -a postprocess_array <<< "${postprocess}"
   local cmd=(
@@ -315,17 +338,40 @@ try_hardware_decoder() {
     || try_decoder "v4l2-m2m" "v4l2h264dec" "" ""
 }
 
+select_h264_decoder() {
+  local decoder_selected=false
+  case "${WEBRTC_DECODER_PREFERENCE}" in
+    hardware)
+      if try_hardware_decoder; then decoder_selected=true; fi
+      if [[ "${decoder_selected}" != "true" ]] && try_software_decoder; then decoder_selected=true; fi
+      ;;
+    stable)
+      if [[ "${VIDEO_PLATFORM}" == "jetson" ]]; then
+        if try_hardware_decoder; then decoder_selected=true; fi
+        if [[ "${decoder_selected}" != "true" ]] && try_software_decoder; then decoder_selected=true; fi
+      else
+        if try_software_decoder; then decoder_selected=true; fi
+        if [[ "${decoder_selected}" != "true" ]] && try_hardware_decoder; then decoder_selected=true; fi
+      fi
+      ;;
+    software)
+      if try_software_decoder; then decoder_selected=true; fi
+      ;;
+    *)
+      echo "Unknown WEBRTC_DECODER_PREFERENCE=${WEBRTC_DECODER_PREFERENCE}. Use stable, hardware, or software." >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ "${decoder_selected}" != "true" ]]; then
+    NOTES+=("No H.264 decoder element found; install NVIDIA, VAAPI, V4L2, libav, or OpenH264 GStreamer plugins.")
+  fi
+}
+
 if [[ "${ROLE}" == "robot" ]]; then
   NOTES+=("Decoder detection skipped for robot role; only H.264 encoding is required.")
-elif [[ "${WEBRTC_DECODER_PREFERENCE}" == "hardware" ]]; then
-  decoder_selected=false
-  try_hardware_decoder && decoder_selected=true
-  [[ "${decoder_selected}" == "true" ]] || try_software_decoder && decoder_selected=true
-  [[ "${decoder_selected}" == "true" ]] || {
-    NOTES+=("No H.264 decoder element found; install NVIDIA, VAAPI, V4L2, libav, or OpenH264 GStreamer plugins.")
-  }
-elif ! try_software_decoder && ! try_hardware_decoder; then
-  NOTES+=("No H.264 decoder element found; install NVIDIA, VAAPI, V4L2, libav, or OpenH264 GStreamer plugins.")
+else
+  select_h264_decoder
 fi
 
 mkdir -p "$(dirname "${OUT}")"

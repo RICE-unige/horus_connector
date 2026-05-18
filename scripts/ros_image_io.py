@@ -2,6 +2,7 @@
 """ROS 2 Image helpers for the GStreamer WebRTC path."""
 
 import threading
+import time
 from array import array
 from typing import Optional, Tuple
 
@@ -89,6 +90,9 @@ class RosImageAppSrc:
         self.thread = None
         self.image_type = None
         self.seq = 0
+        self.received_count = 0
+        self.pushed_count = 0
+        self.last_report = time.monotonic()
         self.caps_string = ""
         self.unsupported_encoding = ""
 
@@ -107,7 +111,23 @@ class RosImageAppSrc:
         self.executor.add_node(self.node)
         self.thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.thread.start()
+        self._configure_live_appsrc()
         print(f"Subscribing ROS images from {self.topic}", flush=True)
+
+    def _configure_live_appsrc(self):
+        properties = {
+            "block": False,
+            "max-buffers": 1,
+            "max-bytes": 0,
+            "max-time": 0,
+            "leaky-type": 2,
+        }
+        for name, value in properties.items():
+            if self.appsrc.find_property(name):
+                try:
+                    self.appsrc.set_property(name, value)
+                except Exception:
+                    pass
 
     def close(self):
         if self.executor is not None:
@@ -121,6 +141,7 @@ class RosImageAppSrc:
             self.thread = None
 
     def _on_image(self, msg):
+        self.received_count += 1
         try:
             gst_format, bytes_per_pixel = ros_encoding_to_gst(msg.encoding)
         except ValueError as exc:
@@ -148,11 +169,28 @@ class RosImageAppSrc:
         buffer.fill(0, payload)
         duration = Gst.util_uint64_scale_int(1, Gst.SECOND, self.fps)
         buffer.duration = duration
-        buffer.pts = self.seq * duration
         self.seq += 1
         result = self.appsrc.emit("push-buffer", buffer)
-        if result not in (Gst.FlowReturn.OK, Gst.FlowReturn.FLUSHING):
+        if result == Gst.FlowReturn.OK:
+            self.pushed_count += 1
+        elif result not in (Gst.FlowReturn.FLUSHING,):
             print(f"appsrc push-buffer returned {result}", flush=True)
+        self._maybe_report_rate()
+
+    def _maybe_report_rate(self):
+        now = time.monotonic()
+        elapsed = now - self.last_report
+        if elapsed < 5.0:
+            return
+        print(
+            "ROS image appsrc rate: "
+            f"received={self.received_count / elapsed:.2f}fps "
+            f"pushed={self.pushed_count / elapsed:.2f}fps",
+            flush=True,
+        )
+        self.received_count = 0
+        self.pushed_count = 0
+        self.last_report = now
 
 
 class RosImagePublisher:
