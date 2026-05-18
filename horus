@@ -38,6 +38,10 @@ load_env() {
   set -a
   # shellcheck source=/dev/null
   source "${ENV_FILE}"
+  if [[ -f "${ROOT}/.zenoh_profile.env" ]]; then
+    # shellcheck source=/dev/null
+    source "${ROOT}/.zenoh_profile.env"
+  fi
   set +a
 }
 
@@ -61,7 +65,10 @@ source_ros() {
 python_bin() {
   if [[ -x "${ROOT}/.venv-webrtc/bin/python" ]] \
     && "${ROOT}/.venv-webrtc/bin/python" - <<'PY' >/dev/null 2>&1
-import websockets
+try:
+    import websockets
+except Exception:
+    import websocket
 PY
   then
     echo "${ROOT}/.venv-webrtc/bin/python"
@@ -100,6 +107,41 @@ zenoh_common_args() {
   printf '%q ' -c "${config}"
   if [[ -n "${ZENOH_NAMESPACE:-}" ]]; then
     printf '%q ' -n "${ZENOH_NAMESPACE}"
+  fi
+}
+
+zenoh_docker_cmd() {
+  if [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]]; then
+    printf '%q ' sudo -n docker
+  else
+    printf '%q ' docker
+  fi
+}
+
+zenoh_docker_name() {
+  local role="$1"
+  local room="${HORUS_ROOM:-default}"
+  room="${room//[^A-Za-z0-9_.-]/_}"
+  echo "horus-zenoh-${role}-${room}"
+}
+
+zenoh_uses_docker() {
+  [[ "${ZENOH_BRIDGE_RUNTIME:-binary}" == "docker" ]]
+}
+
+check_zenoh_docker_access() {
+  local docker_cmd=(docker)
+  if [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]]; then
+    docker_cmd=(sudo -n docker)
+  fi
+
+  if ! "${docker_cmd[@]}" ps >/dev/null 2>&1; then
+    if [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]]; then
+      echo "Zenoh Docker fallback needs sudo Docker access. Run 'sudo -v' before launch, or add this user to the docker group and log out/in." >&2
+    else
+      echo "Zenoh Docker fallback is configured, but Docker is not available to this user." >&2
+    fi
+    exit 1
   fi
 }
 
@@ -160,6 +202,15 @@ stop_one() {
   fi
 }
 
+stop_zenoh() {
+  if [[ "${ZENOH_BRIDGE_RUNTIME:-binary}" == "docker" ]]; then
+    local docker_cmd=(docker)
+    [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
+    "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${HORUS_ROLE:-robot}")" >/dev/null 2>&1 || true
+  fi
+  stop_one zenoh
+}
+
 status_one() {
   local name="$1"
   local pid="${RUN_DIR}/${name}.pid"
@@ -170,23 +221,81 @@ status_one() {
   fi
 }
 
+status_zenoh() {
+  if [[ "${ZENOH_BRIDGE_RUNTIME:-binary}" == "docker" ]]; then
+    local docker_cmd=(docker)
+    local status
+    [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
+    status="$("${docker_cmd[@]}" ps --filter "name=$(zenoh_docker_name "${HORUS_ROLE:-robot}")" --format '{{.Status}}' 2>/dev/null || true)"
+    if [[ -n "${status}" ]]; then
+      echo "zenoh: running container $(zenoh_docker_name "${HORUS_ROLE:-robot}") (${status})"
+    else
+      echo "zenoh: stopped"
+    fi
+    return
+  fi
+  status_one zenoh
+}
+
 launch_zenoh_client() {
   local role="$1"
   local target="$2"
   local bridge="${ROOT}/zenoh-bridge-ros2dds"
-  [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
-  source_ros
-  # shellcheck disable=SC2086
-  start_bg zenoh "${bridge}" $(zenoh_common_args) --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
+  local config
+  local docker_cmd=(docker)
+  local namespace_args=()
+  if zenoh_uses_docker; then
+    check_zenoh_docker_access
+    [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
+    [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
+    config="$(zenoh_config_path)"
+    [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+    "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${role}")" >/dev/null 2>&1 || true
+    start_bg zenoh "${docker_cmd[@]}" run --rm \
+      --name "$(zenoh_docker_name "${role}")" \
+      --network host \
+      -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
+      -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
+      -v "${config}:/horus_zenoh.json5:ro" \
+      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-latest}}" \
+      -c /horus_zenoh.json5 "${namespace_args[@]}" \
+      --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
+  else
+    [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
+    source_ros
+    # shellcheck disable=SC2086
+    start_bg zenoh "${bridge}" $(zenoh_common_args) --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
+  fi
 }
 
 launch_zenoh_router() {
   local role="$1"
   local bridge="${ROOT}/zenoh-bridge-ros2dds"
-  [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
-  source_ros
-  # shellcheck disable=SC2086
-  start_bg zenoh "${bridge}" $(zenoh_common_args) -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
+  local config
+  local docker_cmd=(docker)
+  local namespace_args=()
+  if zenoh_uses_docker; then
+    check_zenoh_docker_access
+    [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
+    [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
+    config="$(zenoh_config_path)"
+    [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+    "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${role}")" >/dev/null 2>&1 || true
+    start_bg zenoh "${docker_cmd[@]}" run --rm \
+      --name "$(zenoh_docker_name "${role}")" \
+      --network host \
+      -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
+      -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
+      -v "${config}:/horus_zenoh.json5:ro" \
+      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-latest}}" \
+      -c /horus_zenoh.json5 "${namespace_args[@]}" \
+      -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
+  else
+    [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
+    source_ros
+    # shellcheck disable=SC2086
+    start_bg zenoh "${bridge}" $(zenoh_common_args) -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
+  fi
 }
 
 launch_webrtc_robot() {
@@ -215,6 +324,9 @@ launch_webrtc_robot() {
       --profile "${ROOT}/.webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
       --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
+      --video-source "${WEBRTC_VIDEO_SOURCE:-ros2}" \
+      --ros-image-topic "${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/image_raw}}" \
+      --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-sensor_data}" \
       --source-pipeline "${WEBRTC_GST_VIDEO_SOURCE:-}" \
       --width "${WEBRTC_VIDEO_WIDTH:-1280}" \
       --height "${WEBRTC_VIDEO_HEIGHT:-720}" \
@@ -227,6 +339,7 @@ launch_webrtc_receiver() {
   local role="$1"
   local py
   py="$(python_bin)"
+  source_ros
   if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
     # shellcheck disable=SC2086
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_receiver.py" \
@@ -250,6 +363,11 @@ launch_webrtc_receiver() {
         --profile "${ROOT}/.webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
+        --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
+        --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
+        --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
+        --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
+        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-sensor_data}" \
         --cmd-rate "${CMD_RATE:-0}" \
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
@@ -263,6 +381,11 @@ launch_webrtc_receiver() {
         --profile "${ROOT}/.webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
+        --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
+        --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
+        --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
+        --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
+        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-sensor_data}" \
         --cmd-rate "${CMD_RATE:-0}" \
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
@@ -321,12 +444,14 @@ case "${cmd}" in
     esac
     ;;
   stop)
+    load_env
     stop_one webrtc
     stop_one signal
-    stop_one zenoh
+    stop_zenoh
     ;;
   status)
-    status_one zenoh
+    load_env
+    status_zenoh
     status_one signal
     status_one webrtc
     ;;
