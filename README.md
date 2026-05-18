@@ -57,6 +57,8 @@ nano .env
 
 Bootstrap installs/probes Zenoh, GStreamer WebRTC, `gstreamer1.0-nice`, and the best available H.264 encoder/decoder on `robot` and `machine`. The `cloud` role installs only Zenoh plus signaling dependencies and skips media packages/hardware probing.
 
+The default `WEBRTC_MEDIA_MODE=h264` path uses native GStreamer WebRTC and does not install `aiortc`. `aiortc` is only needed for the legacy JPEG fallback mode.
+
 Each machine normally only needs:
 
 ```bash

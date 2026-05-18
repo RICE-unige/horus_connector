@@ -1,3 +1,6 @@
+# Legacy JPEG WebRTC mode only.
+# The default H.264/GStreamer path installs minimal signaling dependencies
+# from scripts/setup_webrtc.sh and does not require aiortc.
 aiortc>=1.9,<2
 numpy>=1.26
 Pillow>=10

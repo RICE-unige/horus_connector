@@ -60,6 +60,11 @@ APT_BASE_PACKAGES=(
   python3-venv
 )
 
+APT_SIGNALING_PACKAGES=(
+  python3-websocket
+  python3-websockets
+)
+
 APT_MEDIA_COMMON_PACKAGES=(
   gstreamer1.0-tools
   gstreamer1.0-plugins-base
@@ -111,6 +116,7 @@ append_available_packages() {
 build_apt_packages() {
   local -n output_ref="$1"
   output_ref=("${APT_BASE_PACKAGES[@]}")
+  append_available_packages output_ref "${APT_SIGNALING_PACKAGES[@]}"
 
   if [[ "${ROLE}" == "cloud" ]]; then
     return
