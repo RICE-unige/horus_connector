@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Shared helpers for GStreamer WebRTC media scripts."""
 
-from __future__ import annotations
-
 import json
 import queue
 import threading
 import time
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import gi
-from websockets.sync.client import connect
-from websockets.sync.server import serve
+
+try:
+    from websockets.sync.client import connect
+    from websockets.sync.server import serve
+except Exception:
+    connect = None
+    serve = None
+
+try:
+    import websocket
+except Exception:
+    websocket = None
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstSdp", "1.0")
@@ -19,13 +28,13 @@ gi.require_version("GstWebRTC", "1.0")
 from gi.repository import Gst, GstSdp, GstWebRTC  # noqa: E402
 
 
-def load_env_file(path: str | None) -> dict[str, str]:
+def load_env_file(path: Optional[str]) -> Dict[str, str]:
     if not path:
         return {}
     env_path = Path(path)
     if not env_path.exists():
         return {}
-    values: dict[str, str] = {}
+    values = {}
     for raw in env_path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -48,7 +57,7 @@ def stun_property(servers: str) -> str:
         return ""
     if server.startswith("stun://"):
         return server
-    return "stun://" + server.removeprefix("stun:")
+    return "stun://" + server[len("stun:") :]
 
 
 def turn_property(servers: str) -> str:
@@ -57,7 +66,7 @@ def turn_property(servers: str) -> str:
         return ""
     if server.startswith("turn://") or server.startswith("turns://"):
         return server
-    return "turn://" + server.removeprefix("turn:")
+    return "turn://" + server[len("turn:") :]
 
 
 def webrtcbin_properties(ice_servers: str) -> str:
@@ -72,17 +81,18 @@ def webrtcbin_properties(ice_servers: str) -> str:
 
 
 def configure_webrtcbin(element, ice_servers: str):
-    element.set_property("bundle-policy", "max-bundle")
+    if element.find_property("bundle-policy"):
+        element.set_property("bundle-policy", "max-bundle")
     stun = stun_property(ice_servers)
     turn = turn_property(ice_servers)
-    if stun:
+    if stun and element.find_property("stun-server"):
         element.set_property("stun-server", stun)
-    if turn:
+    if turn and element.find_property("turn-server"):
         element.set_property("turn-server", turn)
 
 
 def ensure_webrtc_runtime():
-    missing: list[str] = []
+    missing: List[str] = []
     if Gst.ElementFactory.find("webrtcbin") is None:
         missing.append("gstreamer1.0-plugins-bad (webrtcbin)")
     if Gst.Registry.get().find_plugin("nice") is None:
@@ -152,17 +162,41 @@ class ClientSignaling(JsonSignaling):
         self.room = room
 
     def start(self):
+        if connect is None and websocket is None:
+            raise RuntimeError("Install websockets>=12 or websocket-client for WebRTC signaling.")
+
         def run():
             while not self.closed.is_set():
                 try:
-                    self.ws = connect(self.url, open_timeout=10)
-                    self.ws.send(json.dumps({"type": "register", "role": self.role, "room": self.room}))
-                    self._read_loop()
+                    if connect is not None:
+                        self.ws = connect(self.url, open_timeout=10)
+                        self.ws.send(json.dumps({"type": "register", "role": self.role, "room": self.room}))
+                        self._read_loop()
+                    else:
+                        self.ws = websocket.create_connection(self.url, timeout=10)
+                        self.ws.settimeout(None)
+                        self.ws.send(json.dumps({"type": "register", "role": self.role, "room": self.room}))
+                        self._legacy_read_loop()
                 except Exception as exc:
                     print(f"signaling reconnect after error: {exc}", flush=True)
                     time.sleep(1)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _legacy_read_loop(self):
+        self.connected.set()
+        self._flush_pending()
+        try:
+            while not self.closed.is_set():
+                text = self.ws.recv()
+                if not text:
+                    break
+                try:
+                    self.on_message(json.loads(text))
+                except Exception as exc:
+                    print(f"ignoring signaling message: {exc}", flush=True)
+        finally:
+            self.closed.set()
 
 
 class ServerSignaling(JsonSignaling):
@@ -173,6 +207,9 @@ class ServerSignaling(JsonSignaling):
         self.server = None
 
     def start(self):
+        if serve is None:
+            raise RuntimeError("Install websockets>=12 to run the local WebRTC signaling server.")
+
         def handler(ws):
             self.ws = ws
             self._read_loop()
