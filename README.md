@@ -16,10 +16,10 @@
 ## Purpose
 
 - Zenoh carries ROS 2 state topics: TF, odometry, joint states, LaserScan, and limited point clouds.
-- WebRTC carries H.264 camera traffic; robot encodes and machine decodes when hardware support is available.
+- WebRTC carries camera traffic as H.264. The robot subscribes to a ROS 2 raw image topic, encodes it, and the machine decodes it back into a ROS 2 image topic.
 - WebRTC `cmd-vel` DataChannel carries robot control commands such as `/cmd_vel`.
 
-`config/zenoh_split.json5` intentionally keeps cameras and `/cmd_vel` out of Zenoh.
+`config/zenoh_split.json5` intentionally keeps cameras and `/cmd_vel` out of Zenoh. The decoded WebRTC image is published only on the machine-side ROS 2 graph unless you explicitly bridge that topic elsewhere.
 
 ## Benchmark
 
@@ -55,7 +55,30 @@ nano .env
 ./horus bootstrap robot     # or machine/cloud
 ```
 
-Bootstrap installs/probes Zenoh, GStreamer WebRTC, `gstreamer1.0-nice`, and the best available H.264 encoder/decoder on `robot` and `machine`. The `cloud` role installs only Zenoh plus signaling dependencies and skips media packages/hardware probing. If passwordless sudo is unavailable, bootstrap prints the apt command to run once.
+Bootstrap installs/probes Zenoh, GStreamer WebRTC, `gstreamer1.0-nice`, and the best available H.264 encoder/decoder on `robot` and `machine`. The `cloud` role installs only Zenoh plus signaling dependencies and skips media packages/hardware probing.
+
+Each machine normally only needs:
+
+```bash
+git clone <repo-url>
+cd horus_connector
+./horus init
+nano .env
+./horus bootstrap robot     # robot-side system
+./horus bootstrap machine   # operator-side system
+```
+
+Bootstrap asks for sudo when system packages are needed. If the machine has no interactive sudo, it prints the exact apt command to run once.
+
+Supported hardware paths:
+
+- NVIDIA Jetson/ARM64: Zenoh `aarch64`, `nvv4l2h264enc`, `nvv4l2decoder`, and NVMM conversion when JetPack/L4T GStreamer packages are available.
+- Jetson Orin NX / recent JetPack: native Zenoh plus NVIDIA V4L2 H.264 should work after bootstrap.
+- JetPack 4 / L4T R32: uses Docker fallback for Zenoh because the upstream ARM64 binary needs newer glibc than Ubuntu 18.04 provides.
+- Intel NUC/Linux: VAAPI packages, `/dev/dri` probing, `vah264enc`/`vaapih264enc`, and hardware decode are used where available.
+- Generic Linux: exposed hardware acceleration when available, otherwise x264/libav fallback.
+
+Older JetPack 4 systems may not expose WebRTC DataChannel support in GStreamer 1.14. In that case H.264 camera streaming still works, but `/cmd_vel` over WebRTC requires a newer JetPack/GStreamer stack or a ROS/Zenoh fallback.
 
 Required `.env` values:
 
@@ -68,7 +91,19 @@ HORUS_MACHINE_IP=           # direct mode or direct WebRTC target
 ZENOH_NAMESPACE=/robot1     # unique per robot
 ROS_DISTRO=jazzy
 ROS_CMD_TOPIC=/cmd_vel
+WEBRTC_ROS_IMAGE_INPUT_TOPIC=/camera/image_raw
+WEBRTC_ROS_IMAGE_OUTPUT_TOPIC=/camera/webrtc/image_raw
 ```
+
+Set `ROS_DISTRO` to the ROS 2 distro actually installed on the machine, for example `humble` or `jazzy`.
+
+Camera path:
+
+```text
+robot ROS 2 Image -> WebRTC H.264 -> machine ROS 2 Image
+```
+
+Set `WEBRTC_VIDEO_SOURCE=ros2` on the robot and `WEBRTC_VIDEO_OUTPUT=ros2` on the machine. Use `WEBRTC_VIDEO_OUTPUT=both` if the machine should also open a local GStreamer video sink.
 
 ## Launch
 
