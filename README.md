@@ -75,7 +75,7 @@ Bootstrap asks for sudo when system packages are needed. If the machine has no i
 Supported hardware paths:
 
 - NVIDIA Jetson/ARM64: Zenoh `aarch64`, `nvv4l2h264enc`, `nvv4l2decoder`, and NVMM conversion when JetPack/L4T GStreamer packages are available.
-- Jetson Orin NX / recent JetPack: native Zenoh plus NVIDIA V4L2 H.264 should work after bootstrap.
+- Recent JetPack/L4T: native Zenoh plus NVIDIA V4L2 H.264 should work after bootstrap.
 - JetPack 4 / L4T R32: uses Docker fallback for Zenoh because the upstream ARM64 binary needs newer glibc than Ubuntu 18.04 provides.
 - Intel NUC/Linux: VAAPI packages, `/dev/dri` probing, `vah264enc`/`vaapih264enc`, and hardware decode are used where available.
 - Generic Linux: exposed hardware acceleration when available, otherwise x264/libav fallback.

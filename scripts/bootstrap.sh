@@ -251,6 +251,10 @@ docker_command_mode() {
     echo "sudo"
     return 0
   fi
+  if have docker && have sudo && [[ ! -t 0 ]]; then
+    echo "sudo-unverified"
+    return 0
+  fi
   if [[ -t 0 ]] && have sudo; then
     echo "Zenoh Docker fallback needs sudo Docker access."
     sudo -v
@@ -280,6 +284,11 @@ configure_zenoh_docker_fallback() {
       sudo -n docker pull "${image}" || return 1
     fi
     write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using Docker fallback. Add the user to the docker group for passwordless launches."
+  elif [[ "${mode}" == "sudo-unverified" ]]; then
+    write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using sudo Docker fallback. Run sudo -v before launch, or add the user to the docker group."
+    echo "Docker is installed but needs sudo. Configured sudo Docker fallback."
+    echo "Before launch, run: sudo -v"
+    echo "If the image is not cached yet, run: sudo docker pull ${image}"
   else
     if ! docker pull "${image}"; then
       image="eclipse/zenoh-bridge-ros2dds:latest"

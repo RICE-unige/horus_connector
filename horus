@@ -136,6 +136,11 @@ check_zenoh_docker_access() {
   fi
 
   if ! "${docker_cmd[@]}" ps >/dev/null 2>&1; then
+    if [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" && -t 0 ]]; then
+      echo "Zenoh Docker fallback needs sudo; refreshing sudo credentials."
+      sudo -v
+      sudo docker ps >/dev/null 2>&1 && return
+    fi
     if [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]]; then
       echo "Zenoh Docker fallback needs sudo Docker access. Run 'sudo -v' before launch, or add this user to the docker group and log out/in." >&2
     else
