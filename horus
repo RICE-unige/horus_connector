@@ -201,10 +201,41 @@ stop_one() {
   if [[ -f "${pid}" ]]; then
     if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
       kill "$(cat "${pid}")" || true
+      sleep 1
+      if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+        kill -KILL "$(cat "${pid}")" || true
+      fi
       echo "Stopped ${name}"
     fi
     rm -f "${pid}"
   fi
+}
+
+stop_stale_project_processes() {
+  local patterns=(
+    "${ROOT}/zenoh-bridge-ros2dds"
+    "${ROOT}/scripts/gst_webrtc_h264_robot.py"
+    "${ROOT}/scripts/gst_webrtc_h264_machine.py"
+    "${ROOT}/scripts/webrtc_camera_sender.py"
+    "${ROOT}/scripts/webrtc_camera_receiver.py"
+    "${ROOT}/scripts/webrtc_signal_relay.py"
+    "${ROOT}/scripts/fake_robot_ros2_data.py"
+    "scripts/gst_webrtc_h264_robot.py"
+    "scripts/gst_webrtc_h264_machine.py"
+    "scripts/webrtc_camera_sender.py"
+    "scripts/webrtc_camera_receiver.py"
+    "scripts/webrtc_signal_relay.py"
+    "scripts/fake_robot_ros2_data.py"
+  )
+
+  local pattern
+  for pattern in "${patterns[@]}"; do
+    pkill -f "${pattern}" >/dev/null 2>&1 || true
+  done
+  sleep 1
+  for pattern in "${patterns[@]}"; do
+    pkill -KILL -f "${pattern}" >/dev/null 2>&1 || true
+  done
 }
 
 stop_zenoh() {
@@ -214,6 +245,9 @@ stop_zenoh() {
     "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${HORUS_ROLE:-robot}")" >/dev/null 2>&1 || true
   fi
   stop_one zenoh
+  pkill -TERM -x zenoh-bridge-ros2dds >/dev/null 2>&1 || true
+  sleep 1
+  pkill -KILL -x zenoh-bridge-ros2dds >/dev/null 2>&1 || true
 }
 
 status_one() {
@@ -453,6 +487,7 @@ case "${cmd}" in
     stop_one webrtc
     stop_one signal
     stop_zenoh
+    stop_stale_project_processes
     ;;
   status)
     load_env

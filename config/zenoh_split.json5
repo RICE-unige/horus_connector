@@ -12,16 +12,18 @@
 
       allow: {
         publishers: [
-          "/tf",
-          "/tf_static",
-          ".*/odom$",
-          ".*/joint_states$",
-          ".*/scan$",
-          ".*/points$",
+          "^/tf$",
+          "^/tf_static$",
+          "^/odom$",
+          "^/joint_states$",
+          "^/scan$",
+          "^/points$",
         ],
         subscribers: [
-          "/tf",
-          "/tf_static",
+          "^/tf$",
+          "^/tf_static$",
+          ".*/tf$",
+          ".*/tf_static$",
           ".*/odom$",
           ".*/joint_states$",
           ".*/scan$",
