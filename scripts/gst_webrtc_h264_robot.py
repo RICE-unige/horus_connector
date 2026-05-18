@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Robot-side H.264 WebRTC sender with cmd_vel DataChannel receive."""
 
-from __future__ import annotations
-
 import argparse
 import json
 import time
@@ -18,6 +16,7 @@ from gst_webrtc_common import (
     load_env_file,
     make_session_description,
 )
+from ros_image_io import RosImageAppSrc, ensure_rclpy
 
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
@@ -32,13 +31,12 @@ class RosCmdPublisher:
         if not topic:
             return
         try:
-            import rclpy
             from geometry_msgs.msg import Twist
         except Exception as exc:
             print(f"ROS cmd_vel publishing disabled: {exc}", flush=True)
             return
         try:
-            rclpy.init(args=None)
+            rclpy = ensure_rclpy()
             self.node = rclpy.create_node("horus_webrtc_cmd_vel")
             self.publisher = self.node.create_publisher(Twist, topic, 10)
             self.twist_type = Twist
@@ -66,10 +64,6 @@ class RosCmdPublisher:
             self.node.destroy_node()
             self.node = None
         if self.rclpy is not None:
-            try:
-                self.rclpy.shutdown()
-            except Exception:
-                pass
             self.rclpy = None
 
 
@@ -81,10 +75,12 @@ class H264RobotSender:
         self.webrtc = None
         self.pipeline = None
         self.control = RosCmdPublisher(args.ros_cmd_topic)
+        self.ros_image_source = None
         self.frame_clock_channel = None
         self.frame_clock_open = False
         self.frame_clock_seq = 0
         self.frame_clock_last_sec = 0.0
+        self.data_channels_supported = True
         self.signaling = self._make_signaling()
 
     def _make_signaling(self):
@@ -93,6 +89,8 @@ class H264RobotSender:
         return ServerSignaling(self.args.host, self.args.port, self._handle_signaling_message)
 
     def _video_source(self) -> str:
+        if self.args.video_source == "ros2":
+            return "appsrc name=ros_image_src is-live=true format=time do-timestamp=true block=false"
         if self.args.source_pipeline:
             return self.args.source_pipeline
         return (
@@ -107,15 +105,27 @@ class H264RobotSender:
             raise RuntimeError("No H.264 encoder selected. Run ./horus bootstrap robot.")
         return f"{name} {props}".strip()
 
+    def _encoder_preprocess(self) -> str:
+        return self.profile.get("GST_H264_ENCODER_PREPROCESS", "") or "videoconvert"
+
+    def _source_transform(self) -> str:
+        if self.args.video_source != "ros2":
+            return ""
+        return (
+            "videoconvert ! videoscale ! videorate drop-only=true ! "
+            f"video/x-raw,width={self.args.width},height={self.args.height},framerate={self.args.fps}/1 ! "
+        )
+
     def _media_bin_description(self) -> str:
         return (
             f"{self._video_source()} ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
-            "videoconvert ! "
+            f"{self._source_transform()}"
+            f"{self._encoder_preprocess()} ! "
             f"{'identity name=frameclock signal-handoffs=true silent=true ! ' if self.args.latency_probe else ''}"
             f"{self._encoder()} ! "
             "h264parse config-interval=-1 ! "
-            "rtph264pay pt=96 config-interval=-1 aggregate-mode=zero-latency"
+            "rtph264pay pt=96 config-interval=-1"
         )
 
     def _build_pipeline(self):
@@ -125,6 +135,16 @@ class H264RobotSender:
             raise RuntimeError("failed to create webrtcbin")
         configure_webrtcbin(self.webrtc, self.args.ice_servers)
         media = Gst.parse_bin_from_description(self._media_bin_description(), True)
+        if self.args.video_source == "ros2":
+            appsrc = media.get_by_name("ros_image_src")
+            if appsrc is None:
+                raise RuntimeError("failed to create ROS image appsrc")
+            self.ros_image_source = RosImageAppSrc(
+                appsrc,
+                self.args.ros_image_topic,
+                self.args.fps,
+                self.args.ros_image_qos,
+            )
         if self.args.latency_probe:
             frameclock = media.get_by_name("frameclock")
             if frameclock is None:
@@ -133,7 +153,8 @@ class H264RobotSender:
         pipeline.add(media)
         pipeline.add(self.webrtc)
         srcpad = media.get_static_pad("src")
-        sinkpad = self.webrtc.request_pad_simple("sink_%u")
+        request_pad_simple = getattr(self.webrtc, "request_pad_simple", None)
+        sinkpad = request_pad_simple("sink_%u") if request_pad_simple is not None else None
         if sinkpad is None:
             sinkpad = self.webrtc.get_request_pad("sink_%u")
         if sinkpad is None:
@@ -155,15 +176,21 @@ class H264RobotSender:
         bus.connect("message", self._on_bus_message)
         self.webrtc.connect("on-negotiation-needed", self._on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self._on_ice_candidate)
-        self.webrtc.connect("on-data-channel", self._on_data_channel)
+        try:
+            self.webrtc.connect("on-data-channel", self._on_data_channel)
+        except TypeError:
+            self.data_channels_supported = False
+            print("WebRTC DataChannel unavailable in this GStreamer runtime; cmd_vel over WebRTC disabled", flush=True)
         self.pipeline.set_state(Gst.State.PLAYING)
-        if self.args.latency_probe:
+        if self.ros_image_source is not None:
+            self.ros_image_source.start()
+        if self.args.latency_probe and self.data_channels_supported:
             self.frame_clock_channel = self.webrtc.emit("create-data-channel", "frame-clock", None)
             if self.frame_clock_channel is not None:
                 self.frame_clock_channel.connect("on-open", self._on_frame_clock_open)
             else:
                 print("frame latency DataChannel unavailable; continuing without latency samples", flush=True)
-        if self.args.ros_cmd_topic:
+        if self.args.ros_cmd_topic and self.data_channels_supported:
             control_channel = self.webrtc.emit("create-data-channel", "cmd-vel", None)
             if control_channel is not None:
                 self._attach_control_channel(control_channel)
@@ -177,6 +204,9 @@ class H264RobotSender:
             self.stop()
 
     def stop(self):
+        if self.ros_image_source is not None:
+            self.ros_image_source.close()
+            self.ros_image_source = None
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
         self.control.close()
@@ -285,6 +315,9 @@ def parse_args():
     parser.add_argument("--profile", default=".webrtc_profile.env")
     parser.add_argument("--ice-servers", default="stun:stun.l.google.com:19302")
     parser.add_argument("--ros-cmd-topic", default="/cmd_vel")
+    parser.add_argument("--video-source", choices=["ros2", "gst", "testsrc"], default="testsrc")
+    parser.add_argument("--ros-image-topic", default="/camera/image_raw")
+    parser.add_argument("--ros-image-qos", choices=["sensor_data", "default"], default="sensor_data")
     parser.add_argument("--source-pipeline", default="")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)

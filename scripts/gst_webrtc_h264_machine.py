@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Machine-side H.264 WebRTC receiver with cmd_vel DataChannel send."""
 
-from __future__ import annotations
-
 import argparse
 from collections import deque
 import json
@@ -21,6 +19,7 @@ from gst_webrtc_common import (
     load_env_file,
     make_session_description,
 )
+from ros_image_io import RosImagePublisher
 
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
@@ -42,6 +41,15 @@ class H264MachineReceiver:
         self.video_last_sec = None
         self.frame_clock = deque()
         self.frame_latency_samples = []
+        self.ros_image_publisher = None
+        if self.args.video_output in {"ros2", "both"}:
+            self.ros_image_publisher = RosImagePublisher(
+                self.args.ros_image_topic,
+                self.args.ros_image_encoding,
+                self.args.ros_image_frame_id,
+                self.args.ros_image_qos,
+            )
+            self.ros_image_publisher.start()
         self.signaling = self._make_signaling()
 
     def _make_signaling(self):
@@ -53,6 +61,9 @@ class H264MachineReceiver:
         name = self.profile.get("GST_H264_DECODER_NAME", "") or "avdec_h264"
         props = self.profile.get("GST_H264_DECODER_PROPS", "")
         return name, props
+
+    def _decoder_postprocess(self) -> str:
+        return self.profile.get("GST_H264_DECODER_POSTPROCESS", "")
 
     def _build_pipeline(self):
         pipeline = Gst.Pipeline.new("horus-h264-machine")
@@ -74,7 +85,10 @@ class H264MachineReceiver:
         bus.connect("message", self._on_bus_message)
         self.webrtc.connect("on-ice-candidate", self._on_ice_candidate)
         self.webrtc.connect("pad-added", self._on_incoming_stream)
-        self.webrtc.connect("on-data-channel", self._on_data_channel)
+        try:
+            self.webrtc.connect("on-data-channel", self._on_data_channel)
+        except TypeError:
+            print("WebRTC DataChannel unavailable in this GStreamer runtime; cmd_vel over WebRTC disabled", flush=True)
         self.pipeline.set_state(Gst.State.PLAYING)
         if self.args.duration > 0:
             GLib.timeout_add_seconds(int(self.args.duration), self.stop)
@@ -144,6 +158,9 @@ class H264MachineReceiver:
             )
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
+        if self.ros_image_publisher is not None:
+            self.ros_image_publisher.close()
+            self.ros_image_publisher = None
         if self.loop.is_running():
             self.loop.quit()
         return False
@@ -191,51 +208,65 @@ class H264MachineReceiver:
         if not caps or not caps.to_string().startswith("application/x-rtp"):
             return
         name, props = self._decoder()
-        print(f"Incoming RTP video; decoder={name}", flush=True)
-        elements = [
-            Gst.ElementFactory.make("queue"),
-            Gst.ElementFactory.make("rtph264depay"),
-            Gst.ElementFactory.make("h264parse"),
-            Gst.ElementFactory.make(name),
-            Gst.ElementFactory.make("capsfilter"),
-            Gst.ElementFactory.make("videoconvert"),
-            Gst.ElementFactory.make(self.args.video_sink),
-        ]
-        if any(element is None for element in elements):
-            missing = [str(index) for index, element in enumerate(elements) if element is None]
-            raise RuntimeError(f"failed to create decode elements: {missing}")
-        queue, depay, parse, decoder, raw_caps, convert, sink = elements
-        queue.set_property("max-size-buffers", 1)
-        queue.set_property("max-size-bytes", 0)
-        queue.set_property("max-size-time", 0)
-        queue.set_property("leaky", 2)
-        raw_caps.set_property("caps", Gst.Caps.from_string("video/x-raw"))
-        for assignment in [item for item in props.split() if "=" in item]:
-            key, value = assignment.split("=", 1)
-            decoder.set_property(key, value)
-        if self.args.video_sink == "fakesink":
-            sink.set_property("sync", False)
-            sink.set_property("signal-handoffs", True)
-            sink.connect("handoff", self._on_video_frame)
-        else:
-            if sink.find_property("sync"):
+        postprocess = self._decoder_postprocess()
+        decoder = f"{name} {props}".strip()
+        tail = f"{postprocess} ! " if postprocess else ""
+        description = self._media_description(decoder, tail)
+        print(f"Incoming RTP video; decoder={decoder}; postprocess={postprocess or 'none'}", flush=True)
+        media = Gst.parse_bin_from_description(description, True)
+        sink = media.get_by_name("video_sink")
+        ros_sink = media.get_by_name("ros_image_sink")
+        if self.args.video_output in {"display", "both"} and sink is None:
+            raise RuntimeError("failed to create video sink")
+        if ros_sink is not None:
+            ros_sink.set_property("emit-signals", True)
+            ros_sink.connect("new-sample", self._on_ros_image_sample)
+        if sink is not None:
+            if self.args.video_sink.split()[0] == "fakesink":
                 sink.set_property("sync", False)
-        for element in elements:
-            self.pipeline.add(element)
-            element.sync_state_with_parent()
-        for left, right in [
-            (queue, depay),
-            (depay, parse),
-            (parse, decoder),
-            (decoder, raw_caps),
-            (raw_caps, convert),
-            (convert, sink),
-        ]:
-            if not left.link(right):
-                raise RuntimeError(f"failed to link {left.get_name()} -> {right.get_name()}")
-        result = pad.link(queue.get_static_pad("sink"))
+                if self.args.video_output == "display":
+                    sink.set_property("signal-handoffs", True)
+                    sink.connect("handoff", self._on_video_frame)
+            else:
+                if sink.find_property("sync"):
+                    sink.set_property("sync", False)
+        self.pipeline.add(media)
+        media.sync_state_with_parent()
+        result = pad.link(media.get_static_pad("sink"))
         if result != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"failed to link WebRTC pad: {result}")
+
+    def _media_description(self, decoder: str, tail: str) -> str:
+        base = (
+            "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+            "rtph264depay ! h264parse ! "
+            f"{decoder} ! "
+            f"{tail}"
+        )
+
+        if self.args.video_output == "ros2":
+            caps = self.ros_image_publisher.caps_filter()
+            return (
+                base
+                + "videoconvert ! "
+                + caps
+                + " ! appsink name=ros_image_sink emit-signals=true sync=false max-buffers=1 drop=true"
+            )
+
+        if self.args.video_output == "both":
+            caps = self.ros_image_publisher.caps_filter()
+            return (
+                base
+                + "videoconvert ! "
+                + caps
+                + " ! tee name=video_tee "
+                + "video_tee. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
+                + "! appsink name=ros_image_sink emit-signals=true sync=false max-buffers=1 drop=true "
+                + "video_tee. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
+                + f"! videoconvert ! {self.args.video_sink} name=video_sink"
+            )
+
+        return base + f"videoconvert ! {self.args.video_sink} name=video_sink"
 
     def _on_video_frame(self, _sink, _buffer, _pad):
         now = time.monotonic()
@@ -255,6 +286,31 @@ class H264MachineReceiver:
                     "raw_latency_ms": raw_latency_ms,
                 }
             )
+
+    def _on_ros_image_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.ERROR
+        now = time.monotonic()
+        if self.video_first_sec is None:
+            self.video_first_sec = now
+        self.video_last_sec = now
+        self.video_frames += 1
+        if self.ros_image_publisher is not None:
+            self.ros_image_publisher.publish_sample(sample)
+        if self.frame_clock:
+            sent = self.frame_clock.pop()
+            self.frame_clock.clear()
+            raw_latency_ms = (time.time_ns() - int(sent["sent_ns"])) / 1_000_000.0
+            self.frame_latency_samples.append(
+                {
+                    "seq": sent.get("seq"),
+                    "t_sec": now - (self.video_first_sec or now),
+                    "latency_ms": raw_latency_ms - self.args.clock_offset_ms,
+                    "raw_latency_ms": raw_latency_ms,
+                }
+            )
+        return Gst.FlowReturn.OK
 
     def _on_data_channel(self, _webrtc, channel):
         print(f"DataChannel received: {channel.props.label}", flush=True)
@@ -324,6 +380,11 @@ def parse_args():
     parser.add_argument("--profile", default=".webrtc_profile.env")
     parser.add_argument("--ice-servers", default="stun:stun.l.google.com:19302")
     parser.add_argument("--video-sink", default="fakesink")
+    parser.add_argument("--video-output", choices=["ros2", "display", "both"], default="display")
+    parser.add_argument("--ros-image-topic", default="/camera/webrtc/image_raw")
+    parser.add_argument("--ros-image-encoding", choices=["rgb8", "bgr8", "rgba8", "bgra8", "mono8"], default="rgb8")
+    parser.add_argument("--ros-image-frame-id", default="webrtc_camera")
+    parser.add_argument("--ros-image-qos", choices=["sensor_data", "default"], default="sensor_data")
     parser.add_argument("--cmd-rate", type=float, default=0.0)
     parser.add_argument("--cmd-linear-x", type=float, default=0.0)
     parser.add_argument("--cmd-angular-z", type=float, default=0.0)
