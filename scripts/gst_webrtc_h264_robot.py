@@ -90,7 +90,10 @@ class H264RobotSender:
 
     def _video_source(self) -> str:
         if self.args.video_source == "ros2":
-            return "appsrc name=ros_image_src is-live=true format=time do-timestamp=true block=false"
+            return (
+                "appsrc name=ros_image_src is-live=true format=time do-timestamp=true block=false "
+                f"caps=video/x-raw,format=RGB,width={self.args.width},height={self.args.height},framerate={self.args.fps}/1"
+            )
         if self.args.source_pipeline:
             return self.args.source_pipeline
         return (
