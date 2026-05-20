@@ -39,6 +39,13 @@ PY
   fi
 }
 
+pip_user_install_flags() {
+  PIP_USER_FLAGS=(--user)
+  if python3 -m pip install --help 2>/dev/null | grep -q -- "--break-system-packages"; then
+    PIP_USER_FLAGS+=(--break-system-packages)
+  fi
+}
+
 select_pip_args() {
   if [[ "${ROLE}" == "cloud" ]]; then
     if python_lt_38; then
@@ -135,9 +142,10 @@ else
         echo "Need curl or wget to bootstrap pip without sudo." >&2
         exit 1
       fi
-      python3 /tmp/get-pip.py --user --break-system-packages
+      python3 /tmp/get-pip.py --user
     fi
-    install_python_deps python3 --user --break-system-packages "${PIP_ARGS[@]}"
+    pip_user_install_flags
+    install_python_deps python3 "${PIP_USER_FLAGS[@]}" "${PIP_ARGS[@]}"
   fi
   echo "Installed WebRTC dependencies into the current user's Python site-packages."
 fi

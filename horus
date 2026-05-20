@@ -59,22 +59,57 @@ source_ros() {
     set -u
   else
     echo "ROS setup file not found for ${distro}: /opt/ros/${distro}/setup.bash or local_setup.bash" >&2
+    return 1
   fi
 }
 
+source_ros_required() {
+  source_ros || exit 1
+}
+
 python_bin() {
-  if [[ -x "${ROOT}/.venv-webrtc/bin/python" ]] \
-    && "${ROOT}/.venv-webrtc/bin/python" - <<'PY' >/dev/null 2>&1
+  local py="${ROOT}/.venv-webrtc/bin/python"
+  if [[ ! -x "${py}" ]]; then
+    echo "python3"
+    return
+  fi
+
+  if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
+    if "${py}" - <<'PY' >/dev/null 2>&1
+import aiortc
+import numpy
+import PIL
+import websockets
+PY
+    then
+      echo "${py}"
+      return
+    fi
+  elif "${py}" - <<'PY' >/dev/null 2>&1
 try:
     import websockets
 except Exception:
     import websocket
 PY
   then
-    echo "${ROOT}/.venv-webrtc/bin/python"
-  else
-    echo "python3"
+    echo "${py}"
+    return
   fi
+
+  echo "python3"
+}
+
+signal_python_bin() {
+  local py="${ROOT}/.venv-webrtc/bin/python"
+  if [[ -x "${py}" ]] && "${py}" - <<'PY' >/dev/null 2>&1
+import websockets
+PY
+  then
+    echo "${py}"
+    return
+  fi
+
+  echo "python3"
 }
 
 ice_args() {
@@ -179,6 +214,14 @@ webrtc_signal_target() {
   fi
 }
 
+ensure_webrtc_media_supported() {
+  if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" && "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
+    echo "WEBRTC_MEDIA_MODE=jpeg is the legacy direct-mode fallback and does not use the cloud signaling relay." >&2
+    echo "Use WEBRTC_MEDIA_MODE=h264 for hub deployments, or HORUS_TOPOLOGY=direct for JPEG fallback tests." >&2
+    exit 2
+  fi
+}
+
 start_bg() {
   local name="$1"
   shift
@@ -211,6 +254,41 @@ stop_one() {
   fi
 }
 
+project_pid_matches() {
+  local pid="$1"
+  local cwd cmdline
+  [[ "${pid}" == "$$" ]] && return 1
+  cwd="$(readlink -f "/proc/${pid}/cwd" 2>/dev/null || true)"
+  cmdline="$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+  [[ "${cwd}" == "${ROOT}" || "${cmdline}" == *"${ROOT}/"* ]]
+}
+
+terminate_project_pids_by_pattern() {
+  local signal="$1"
+  shift
+  local pattern pid
+  for pattern in "$@"; do
+    while IFS= read -r pid; do
+      if project_pid_matches "${pid}"; then
+        kill "-${signal}" "${pid}" >/dev/null 2>&1 || true
+      fi
+    done < <(pgrep -f "${pattern}" 2>/dev/null || true)
+  done
+}
+
+terminate_project_pids_by_name() {
+  local signal="$1"
+  shift
+  local name pid
+  for name in "$@"; do
+    while IFS= read -r pid; do
+      if project_pid_matches "${pid}"; then
+        kill "-${signal}" "${pid}" >/dev/null 2>&1 || true
+      fi
+    done < <(pgrep -x "${name}" 2>/dev/null || true)
+  done
+}
+
 stop_stale_project_processes() {
   local patterns=(
     "${ROOT}/zenoh-bridge-ros2dds"
@@ -228,14 +306,9 @@ stop_stale_project_processes() {
     "scripts/fake_robot_ros2_data.py"
   )
 
-  local pattern
-  for pattern in "${patterns[@]}"; do
-    pkill -f "${pattern}" >/dev/null 2>&1 || true
-  done
+  terminate_project_pids_by_pattern TERM "${patterns[@]}"
   sleep 1
-  for pattern in "${patterns[@]}"; do
-    pkill -KILL -f "${pattern}" >/dev/null 2>&1 || true
-  done
+  terminate_project_pids_by_pattern KILL "${patterns[@]}"
 }
 
 stop_zenoh() {
@@ -245,9 +318,9 @@ stop_zenoh() {
     "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${HORUS_ROLE:-robot}")" >/dev/null 2>&1 || true
   fi
   stop_one zenoh
-  pkill -TERM -x zenoh-bridge-ros2dds >/dev/null 2>&1 || true
+  terminate_project_pids_by_name TERM zenoh-bridge-ros2dds
   sleep 1
-  pkill -KILL -x zenoh-bridge-ros2dds >/dev/null 2>&1 || true
+  terminate_project_pids_by_name KILL zenoh-bridge-ros2dds
 }
 
 status_one() {
@@ -301,7 +374,7 @@ launch_zenoh_client() {
       --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
   else
     [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
-    source_ros
+    source_ros_required
     # shellcheck disable=SC2086
     start_bg zenoh "${bridge}" $(zenoh_common_args) --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
   fi
@@ -331,7 +404,11 @@ launch_zenoh_router() {
       -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
   else
     [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
-    source_ros
+    if [[ "${role}" == "cloud" ]]; then
+      source_ros || true
+    else
+      source_ros_required
+    fi
     # shellcheck disable=SC2086
     start_bg zenoh "${bridge}" $(zenoh_common_args) -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
   fi
@@ -340,9 +417,10 @@ launch_zenoh_router() {
 launch_webrtc_robot() {
   local py
   local target
+  ensure_webrtc_media_supported
   py="$(python_bin)"
   target="$(webrtc_signal_target)"
-  source_ros
+  source_ros_required
   if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
     # shellcheck disable=SC2086
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_sender.py" \
@@ -377,8 +455,9 @@ launch_webrtc_robot() {
 launch_webrtc_receiver() {
   local role="$1"
   local py
+  ensure_webrtc_media_supported
   py="$(python_bin)"
-  source_ros
+  source_ros_required
   if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
     # shellcheck disable=SC2086
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_receiver.py" \
@@ -435,7 +514,7 @@ launch_webrtc_receiver() {
 
 launch_signal_relay() {
   local py
-  py="$(python_bin)"
+  py="$(signal_python_bin)"
   start_bg signal "${py}" "${ROOT}/scripts/webrtc_signal_relay.py" \
     --host 0.0.0.0 \
     --port "${WEBRTC_SIGNAL_PORT:-8765}"
@@ -461,6 +540,11 @@ case "${cmd}" in
   launch)
     load_env
     role="${2:-${HORUS_ROLE:-robot}}"
+    case "${role}" in
+      robot|machine)
+        ensure_webrtc_media_supported
+        ;;
+    esac
     case "${role}" in
       robot)
         launch_zenoh_client robot "$(zenoh_connect_target robot)"

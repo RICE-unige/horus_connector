@@ -162,7 +162,7 @@ build_apt_packages() {
     return
   fi
 
-  output_ref+=("${APT_MEDIA_COMMON_PACKAGES[@]}")
+  append_available_packages output_ref "${APT_MEDIA_COMMON_PACKAGES[@]}"
 
   if is_jetson; then
     append_available_packages output_ref "${APT_JETSON_MEDIA_PACKAGES[@]}"
@@ -180,21 +180,24 @@ run_apt() {
   fi
 
   local packages=()
-  build_apt_packages packages
 
   if [[ "$(id -u)" -eq 0 ]]; then
     apt-get update
+    build_apt_packages packages
     apt-get install -y "${packages[@]}"
   elif sudo -n true >/dev/null 2>&1; then
     sudo apt-get update
+    build_apt_packages packages
     sudo apt-get install -y "${packages[@]}"
   elif [[ -t 0 ]] && have sudo; then
     echo "Bootstrap needs sudo to install system packages."
     sudo -v
     sudo apt-get update
+    build_apt_packages packages
     sudo apt-get install -y "${packages[@]}"
   else
     local install_cmd
+    build_apt_packages packages
     printf -v install_cmd ' %q' "${packages[@]}"
     install_cmd="sudo apt-get update && sudo apt-get install -y${install_cmd}"
     echo "No passwordless sudo. Run this once if packages are missing:"
