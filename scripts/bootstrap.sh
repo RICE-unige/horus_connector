@@ -87,9 +87,12 @@ APT_DRM_MEDIA_PACKAGES=(
 )
 
 APT_INTEL_MEDIA_PACKAGES=(
+  gstreamer1.0-vaapi
+)
+
+APT_INTEL_DRIVER_PACKAGES=(
   intel-media-va-driver
   intel-media-va-driver-non-free
-  gstreamer1.0-vaapi
 )
 
 APT_JETSON_MEDIA_PACKAGES=(
@@ -102,6 +105,10 @@ apt_package_available() {
   apt-cache show "$1" >/dev/null 2>&1
 }
 
+apt_package_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
 append_available_packages() {
   local -n packages_ref="$1"
   shift
@@ -111,6 +118,39 @@ append_available_packages() {
       packages_ref+=("${package}")
     fi
   done
+}
+
+append_intel_media_driver() {
+  local -n packages_ref="$1"
+  local package
+
+  for package in "${APT_INTEL_DRIVER_PACKAGES[@]}"; do
+    if apt_package_installed "${package}"; then
+      packages_ref+=("${package}")
+      return
+    fi
+  done
+
+  case "${HORUS_INTEL_MEDIA_DRIVER:-free}" in
+    free)
+      if apt_package_available intel-media-va-driver; then
+        packages_ref+=(intel-media-va-driver)
+      elif apt_package_available intel-media-va-driver-non-free; then
+        packages_ref+=(intel-media-va-driver-non-free)
+      fi
+      ;;
+    non-free)
+      if apt_package_available intel-media-va-driver-non-free; then
+        packages_ref+=(intel-media-va-driver-non-free)
+      elif apt_package_available intel-media-va-driver; then
+        packages_ref+=(intel-media-va-driver)
+      fi
+      ;;
+    *)
+      echo "Unknown HORUS_INTEL_MEDIA_DRIVER=${HORUS_INTEL_MEDIA_DRIVER}. Use free or non-free." >&2
+      exit 2
+      ;;
+  esac
 }
 
 build_apt_packages() {
@@ -128,6 +168,7 @@ build_apt_packages() {
     append_available_packages output_ref "${APT_JETSON_MEDIA_PACKAGES[@]}"
   elif [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]]; then
     append_available_packages output_ref "${APT_DRM_MEDIA_PACKAGES[@]}" "${APT_INTEL_MEDIA_PACKAGES[@]}"
+    append_intel_media_driver output_ref
   else
     append_available_packages output_ref "${APT_DRM_MEDIA_PACKAGES[@]}"
   fi

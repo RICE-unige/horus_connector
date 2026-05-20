@@ -78,6 +78,7 @@ Video profile:
 
 - `WEBRTC_ENCODER_PREFERENCE=stable` and `WEBRTC_DECODER_PREFERENCE=stable` are the defaults. Normal Linux/NUC/WSL systems prefer x264/libav because that path has been the most reliable end-to-end WebRTC/ROS profile; Jetson systems use the NVIDIA V4L2 path when available.
 - Set either preference to `hardware` to try hardware codecs first, or `software` to force software codecs.
+- Intel systems install the free VA driver by default. Set `HORUS_INTEL_MEDIA_DRIVER=non-free` only if that specific driver is required.
 
 Supported hardware paths:
 

@@ -454,6 +454,10 @@ case "${cmd}" in
   bootstrap)
     "${ROOT}/scripts/bootstrap.sh" "${2:-}"
     ;;
+  boostrap|bootsrap)
+    echo "Interpreting '${cmd}' as 'bootstrap'."
+    "${ROOT}/scripts/bootstrap.sh" "${2:-}"
+    ;;
   launch)
     load_env
     role="${2:-${HORUS_ROLE:-robot}}"
