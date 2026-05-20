@@ -14,6 +14,7 @@ Usage:
   ./horus launch [robot|machine|cloud]
   ./horus stop
   ./horus status
+  ./horus doctor [robot|machine|cloud]
   ./horus logs [zenoh|webrtc|signal]
 
 Roles:
@@ -220,6 +221,60 @@ ensure_webrtc_media_supported() {
     echo "Use WEBRTC_MEDIA_MODE=h264 for hub deployments, or HORUS_TOPOLOGY=direct for JPEG fallback tests." >&2
     exit 2
   fi
+}
+
+warn_runtime_config() {
+  local duration="${WEBRTC_DURATION:-86400}"
+  local duration_int="${duration%%.*}"
+  if [[ "${duration_int}" =~ ^[0-9]+$ && "${duration_int}" -gt 0 && "${duration_int}" -lt 300 ]]; then
+    echo "Warning: WEBRTC_DURATION=${duration} starts a short test session. Use 0 or 86400 for normal runs." >&2
+  fi
+}
+
+tcp_probe() {
+  local host="$1"
+  local port="$2"
+  if timeout 4 bash -c ":</dev/tcp/${host}/${port}" >/dev/null 2>&1; then
+    echo "open  tcp/${host}:${port}"
+    return 0
+  fi
+  echo "closed tcp/${host}:${port}"
+  return 1
+}
+
+doctor() {
+  local role="$1"
+  local target=""
+  echo "Role: ${role}"
+  echo "Topology: ${HORUS_TOPOLOGY:-hub}"
+  echo "Room: ${HORUS_ROOM:-default}"
+  warn_runtime_config
+
+  case "${role}:${HORUS_TOPOLOGY:-hub}" in
+    robot:direct)
+      target="$(zenoh_connect_target robot)"
+      echo "Direct target: ${target}"
+      tcp_probe "${target}" "${ZENOH_PORT:-7447}" || true
+      tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
+      ;;
+    machine:direct)
+      echo "Machine direct mode listens for robot connections."
+      echo "Local addresses:"
+      hostname -I 2>/dev/null || true
+      echo "Expected listeners after launch: tcp/0.0.0.0:${ZENOH_PORT:-7447} and tcp/0.0.0.0:${WEBRTC_SIGNAL_PORT:-8765}"
+      ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true
+      ;;
+    robot:hub|machine:hub)
+      target="$(zenoh_connect_target "${role}")"
+      echo "Cloud target: ${target}"
+      tcp_probe "${target}" "${ZENOH_PORT:-7447}" || true
+      tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
+      ;;
+    cloud:*)
+      echo "Cloud mode listens for robot and machine connections."
+      ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true
+      ;;
+  esac
 }
 
 start_bg() {
@@ -543,6 +598,7 @@ case "${cmd}" in
     case "${role}" in
       robot|machine)
         ensure_webrtc_media_supported
+        warn_runtime_config
         ;;
     esac
     case "${role}" in
@@ -582,6 +638,11 @@ case "${cmd}" in
     status_zenoh
     status_one signal
     status_one webrtc
+    ;;
+  doctor)
+    load_env
+    role="${2:-${HORUS_ROLE:-robot}}"
+    doctor "${role}"
     ;;
   logs)
     service="${2:-}"
