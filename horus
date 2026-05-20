@@ -14,6 +14,7 @@ Usage:
   ./horus launch [robot|machine|cloud]
   ./horus stop
   ./horus status
+  ./horus monitor [--once]
   ./horus doctor [robot|machine|cloud]
   ./horus logs [zenoh|webrtc|signal]
 
@@ -638,6 +639,9 @@ case "${cmd}" in
     status_zenoh
     status_one signal
     status_one webrtc
+    ;;
+  monitor|ui|watch)
+    python3 "${ROOT}/scripts/horus_monitor.py" --root "${ROOT}" --env "${ENV_FILE}" "${@:2}"
     ;;
   doctor)
     load_env

@@ -147,6 +147,7 @@ Operations:
 
 ```bash
 ./horus status
+./horus monitor        # live connection console
 ./horus logs zenoh
 ./horus logs webrtc
 ./horus stop
