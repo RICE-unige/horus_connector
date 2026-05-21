@@ -1,0 +1,24 @@
+{
+  "members": [
+    {
+      "name": "robot-a",
+      "role": "machine",
+      "room": "robot-a",
+      "topology": "hub",
+      "cloud_ip": "203.0.113.10",
+      "image_qos": "auto",
+      "image_output_topic": "/robot-a/camera/webrtc/image_raw",
+      "cmd_rate": "0"
+    },
+    {
+      "name": "robot-b",
+      "role": "machine",
+      "room": "robot-b",
+      "topology": "hub",
+      "cloud_ip": "203.0.113.10",
+      "image_qos": "auto",
+      "image_output_topic": "/robot-b/camera/webrtc/image_raw",
+      "cmd_rate": "0"
+    }
+  ]
+}

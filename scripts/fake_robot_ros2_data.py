@@ -61,6 +61,10 @@ class FakeRobotPublisher(Node):
         if np is not None:
             self.image_x = np.linspace(0, 255, args.width, dtype=np.uint16)[None, :]
             self.image_y = np.linspace(0, 255, args.height, dtype=np.uint16)[:, None]
+        self.frame_cache = []
+        if args.frame_cache > 0:
+            for seq in range(max(1, args.frame_cache)):
+                self.frame_cache.append(self.build_image_data(seq))
 
         image_qos = qos_profile_sensor_data if args.image_qos == "sensor_data" else 10
         self.image_pub = self.create_publisher(Image, args.image_topic, image_qos)
@@ -75,7 +79,7 @@ class FakeRobotPublisher(Node):
         self.create_timer(1.0 / args.points_rate, self.publish_points)
         self.get_logger().info(
             f"publishing fake robot={self.robot_id} image={args.image_topic} "
-            f"{args.width}x{args.height}@{args.camera_fps}Hz"
+            f"{args.width}x{args.height}@{args.camera_fps}Hz frame_cache={len(self.frame_cache)}"
         )
 
     def now_msg(self):
@@ -84,10 +88,10 @@ class FakeRobotPublisher(Node):
     def elapsed(self):
         return time.monotonic() - self.start
 
-    def publish_image(self):
+    def build_image_data(self, seq: int):
         width = self.args.width
         height = self.args.height
-        phase = (self.image_seq * 5 + self.args.color_seed) % 256
+        phase = (seq * 5 + self.args.color_seed) % 256
         if np is not None and self.image_x is not None and self.image_y is not None:
             frame = np.empty((height, width, 3), dtype=np.uint8)
             frame[:, :, 0] = np.broadcast_to((self.image_x + self.args.color_seed) & 0xFF, (height, width))
@@ -95,8 +99,8 @@ class FakeRobotPublisher(Node):
             frame[:, :, 2] = ((self.image_x // 2 + self.image_y // 2 + phase) & 0xFF).astype(np.uint8)
 
             box = max(24, min(width, height) // 6)
-            x0 = int(((math.sin(self.image_seq * 0.09) + 1.0) * 0.5) * max(1, width - box))
-            y0 = int(((math.cos(self.image_seq * 0.07) + 1.0) * 0.5) * max(1, height - box))
+            x0 = int(((math.sin(seq * 0.09) + 1.0) * 0.5) * max(1, width - box))
+            y0 = int(((math.cos(seq * 0.07) + 1.0) * 0.5) * max(1, height - box))
             frame[y0 : y0 + box, x0 : x0 + box, 0] = (220 + self.args.color_seed) & 0xFF
             frame[y0 : y0 + box, x0 : x0 + box, 1] = (80 + phase) & 0xFF
             frame[y0 : y0 + box, x0 : x0 + box, 2] = 40
@@ -113,7 +117,11 @@ class FakeRobotPublisher(Node):
                     data[index] = (gx + self.args.color_seed) & 0xFF
                     data[index + 1] = (gy + phase) & 0xFF
                     data[index + 2] = ((gx // 2 + gy // 2) + phase) & 0xFF
+        return data if isinstance(data, bytes) else bytes(data)
 
+    def publish_image(self):
+        width = self.args.width
+        height = self.args.height
         msg = Image()
         msg.header.stamp = self.now_msg()
         msg.header.frame_id = f"{self.frame_prefix}/camera"
@@ -122,7 +130,10 @@ class FakeRobotPublisher(Node):
         msg.encoding = "rgb8"
         msg.is_bigendian = 0
         msg.step = width * 3
-        msg.data = array("B", data)
+        if self.frame_cache:
+            msg.data = self.frame_cache[self.image_seq % len(self.frame_cache)]
+        else:
+            msg.data = self.build_image_data(self.image_seq)
         self.image_pub.publish(msg)
         self.image_seq += 1
 
@@ -209,9 +220,9 @@ class FakeRobotPublisher(Node):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--robot-id", default="robot1")
+    parser.add_argument("--robot-id", default="robot-a")
     parser.add_argument("--image-topic", default="/camera/image_raw")
-    parser.add_argument("--image-qos", choices=["sensor_data", "default"], default="sensor_data")
+    parser.add_argument("--image-qos", choices=["sensor_data", "default"], default="default")
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--scan-topic", default="/scan")
     parser.add_argument("--joint-topic", default="/joint_states")
@@ -219,6 +230,7 @@ def parse_args():
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=360)
     parser.add_argument("--camera-fps", type=float, default=10.0)
+    parser.add_argument("--frame-cache", type=int, default=30)
     parser.add_argument("--state-rate", type=float, default=10.0)
     parser.add_argument("--points-rate", type=float, default=1.0)
     parser.add_argument("--point-count", type=int, default=256)

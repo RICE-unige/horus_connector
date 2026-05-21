@@ -2,34 +2,80 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_DIR="${ROOT}/.run"
+RUN_DIR="${HORUS_RUN_DIR:-${ROOT}/.run}"
 ENV_FILE="${HORUS_ENV:-${ROOT}/.env}"
 mkdir -p "${RUN_DIR}"
 
+# ANSI color helpers
+RESET="\033[0m"
+BOLD="\033[1m"
+FG_GREEN="\033[38;5;48m"
+FG_YELLOW="\033[38;5;214m"
+FG_RED="\033[38;5;203m"
+FG_BLUE="\033[38;5;39m"
+FG_CYAN="\033[38;5;51m"
+FG_MUTED="\033[38;5;244m"
+
+log_success() {
+  echo -e "${FG_GREEN}OK${RESET}      $*"
+}
+log_info() {
+  echo -e "${FG_BLUE}Info${RESET}    $*"
+}
+log_warn() {
+  echo -e "${FG_YELLOW}Warning${RESET} $*"
+}
+log_error() {
+  echo -e "${FG_RED}Error${RESET}   $*" >&2
+}
+log_run() {
+  echo -e "${FG_CYAN}Run${RESET}     $*"
+}
+
+print_banner() {
+  echo ""
+  echo -e "${BOLD}${FG_CYAN}HORUS Connector${RESET}"
+  echo -e "${FG_MUTED}Robot management transport layer${RESET}"
+  echo ""
+}
+
+print_banner_small() {
+  echo -e "${BOLD}${FG_CYAN}HORUS Connector${RESET} ${FG_MUTED}v$(cat "${ROOT}/VERSION" 2>/dev/null || echo "1.x")${RESET}"
+}
+
 usage() {
-  cat <<'USAGE'
-Usage:
-  ./horus init
-  ./horus bootstrap [robot|machine|cloud|auto]
-  ./horus launch [robot|machine|cloud]
-  ./horus stop
-  ./horus status
-  ./horus monitor [--once]
-  ./horus doctor [robot|machine|cloud]
-  ./horus logs [zenoh|webrtc|signal]
+  print_banner
 
-Roles:
-  robot    Robot-side system. Publishes camera over WebRTC and receives cmd_vel over WebRTC.
-  machine  Operator/local machine. Receives WebRTC cameras and connects to robot state.
-  cloud    Single shared relay/router for hub deployments.
+  echo -e "${BOLD}Usage${RESET}"
+  echo -e "  ./horus ${FG_GREEN}<command>${RESET} ${FG_CYAN}[options]${RESET}\n"
 
-Topologies:
-  hub      robot(s) and machine(s) connect through one cloud Zenoh router.
-  direct   robot connects directly to machine over VPN/Tailscale/LAN; no cloud required.
+  echo -e "${BOLD}Commands${RESET}"
+  echo -e "  ${FG_GREEN}setup${RESET}                             Guided setup wizard"
+  echo -e "  ${FG_GREEN}init${RESET}                              Create .env from the template"
+  echo -e "  ${FG_GREEN}bootstrap${RESET} ${FG_CYAN}[role]${RESET}                  Install dependencies for robot, machine, or cloud"
+  echo -e "  ${FG_GREEN}launch${RESET} ${FG_CYAN}[role] [--no-monitor]${RESET}      Start services and open the live console"
+  echo -e "  ${FG_GREEN}stop${RESET}                              Stop running services"
+  echo -e "  ${FG_GREEN}status${RESET} ${FG_CYAN}[--json]${RESET}                  Show service state and runtime settings"
+  echo -e "  ${FG_GREEN}monitor${RESET} ${FG_CYAN}[--once]${RESET}                  Interactive live console"
+  echo -e "  ${FG_GREEN}doctor${RESET} ${FG_CYAN}[role]${RESET}                    Check connectivity and listeners"
+  echo -e "  ${FG_GREEN}logs${RESET} ${FG_CYAN}[service]${RESET}                   Stream a service log"
+  echo -e "  ${FG_GREEN}metrics${RESET} ${FG_CYAN}[--port 9418]${RESET}             Export Prometheus metrics and status JSON"
+  echo -e "  ${FG_GREEN}fleet${RESET} ${FG_CYAN}[launch|stop|status] <file>${RESET} Start multiple rooms from one config"
+  echo -e "  ${FG_GREEN}fake-data${RESET} ${FG_CYAN}[robot_id]${RESET}              Publish synthetic ROS 2 camera/state topics"
+  echo ""
 
-In hub mode the cloud runs Zenoh routing and WebRTC signaling relay only. Media
-encoding/decoding happens on robot and machine endpoints.
-USAGE
+  echo -e "${BOLD}Roles${RESET}"
+  echo -e "  ${BOLD}robot${RESET}     Robot-side system. Sends camera/state and receives velocity commands"
+  echo -e "  ${BOLD}machine${RESET}   Operator/local machine. Receives camera/state and sends commands"
+  echo -e "  ${BOLD}cloud${RESET}     Shared Zenoh router + WebRTC signaling relay"
+  echo ""
+
+  echo -e "${BOLD}Topologies${RESET}"
+  echo -e "  ${BOLD}hub${RESET}       Robot(s) and machine(s) connect through one cloud hub"
+  echo -e "  ${BOLD}direct${RESET}    Robot connects directly to machine over VPN, Tailscale, or LAN"
+  echo ""
+
+  echo -e "${FG_MUTED}Start with ${BOLD}./horus setup${RESET}${FG_MUTED}, then run ${BOLD}./horus bootstrap <role>${RESET}${FG_MUTED} and ${BOLD}./horus launch <role>${RESET}${FG_MUTED}.${RESET}\n"
 }
 
 load_env() {
@@ -49,7 +95,18 @@ load_env() {
 
 source_ros() {
   local distro="${ROS_DISTRO:-jazzy}"
-  if [[ -f "/opt/ros/${distro}/setup.bash" ]]; then
+  if [[ -n "${ROS_SETUP_PATH:-}" ]]; then
+    local setup_path="${ROS_SETUP_PATH/#\~/${HOME}}"
+    if [[ -f "${setup_path}" ]]; then
+      set +u
+      # shellcheck source=/dev/null
+      source "${setup_path}"
+      set -u
+      return
+    fi
+    echo "ROS_SETUP_PATH is set but the file does not exist: ${ROS_SETUP_PATH}" >&2
+    return 1
+  elif [[ -f "/opt/ros/${distro}/setup.bash" ]]; then
     set +u
     # shellcheck source=/dev/null
     source "/opt/ros/${distro}/setup.bash"
@@ -134,7 +191,16 @@ required_value() {
 }
 
 zenoh_config_path() {
-  echo "${ROOT}/${ZENOH_CONFIG:-config/zenoh_split.json5}"
+  local configured="${ZENOH_CONFIG:-auto}"
+  if [[ "${configured}" == "auto" || "${configured}" == "config/zenoh_split.json5" ]]; then
+    case "${HORUS_ROLE:-}" in
+      robot) configured="config/zenoh_robot.json5" ;;
+      machine) configured="config/zenoh_machine.json5" ;;
+      cloud) configured="config/zenoh_cloud.json5" ;;
+      *) configured="config/zenoh_split.json5" ;;
+    esac
+  fi
+  echo "${ROOT}/${configured}"
 }
 
 zenoh_common_args() {
@@ -208,8 +274,13 @@ zenoh_connect_target() {
 webrtc_signal_target() {
   if [[ -n "${HORUS_WEBRTC_SIGNAL_IP:-}" ]]; then
     echo "${HORUS_WEBRTC_SIGNAL_IP}"
-  elif [[ -n "${HORUS_MACHINE_IP:-}" ]]; then
-    echo "${HORUS_MACHINE_IP}"
+  elif [[ "${HORUS_TOPOLOGY:-hub}" == "direct" ]]; then
+    if [[ "${HORUS_ROLE:-}" == "machine" ]]; then
+      echo "${HORUS_MACHINE_IP:-0.0.0.0}"
+    else
+      required_value HORUS_MACHINE_IP "${HORUS_MACHINE_IP:-}"
+      echo "${HORUS_MACHINE_IP}"
+    fi
   else
     required_value HORUS_CLOUD_IP "${HORUS_CLOUD_IP:-}"
     echo "${HORUS_CLOUD_IP}"
@@ -224,6 +295,10 @@ ensure_webrtc_media_supported() {
   fi
 }
 
+zenoh_enabled() {
+  [[ "${HORUS_ZENOH_ENABLED:-1}" != "0" ]]
+}
+
 warn_runtime_config() {
   local duration="${WEBRTC_DURATION:-86400}"
   local duration_int="${duration%%.*}"
@@ -236,46 +311,78 @@ tcp_probe() {
   local host="$1"
   local port="$2"
   if timeout 4 bash -c ":</dev/tcp/${host}/${port}" >/dev/null 2>&1; then
-    echo "open  tcp/${host}:${port}"
+    echo -e "${FG_GREEN}open${RESET} (${host}:${port})"
     return 0
   fi
-  echo "closed tcp/${host}:${port}"
+  echo -e "${FG_RED}closed${RESET} (${host}:${port})"
   return 1
 }
 
 doctor() {
   local role="$1"
   local target=""
-  echo "Role: ${role}"
-  echo "Topology: ${HORUS_TOPOLOGY:-hub}"
-  echo "Room: ${HORUS_ROOM:-default}"
+
+  echo -e "\n${BOLD}${FG_CYAN}Connectivity doctor${RESET}"
+  echo -e "  role       ${role}"
+  echo -e "  topology   ${HORUS_TOPOLOGY:-hub}"
+  echo -e "  room       ${HORUS_ROOM:-default}"
   warn_runtime_config
+  echo ""
 
   case "${role}:${HORUS_TOPOLOGY:-hub}" in
     robot:direct)
       target="$(zenoh_connect_target robot)"
-      echo "Direct target: ${target}"
+      echo -e "  target     ${target}"
+      echo -en "  zenoh      "
       tcp_probe "${target}" "${ZENOH_PORT:-7447}" || true
+      echo -en "  signaling  "
       tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
       ;;
     machine:direct)
-      echo "Machine direct mode listens for robot connections."
-      echo "Local addresses:"
-      hostname -I 2>/dev/null || true
-      echo "Expected listeners after launch: tcp/0.0.0.0:${ZENOH_PORT:-7447} and tcp/0.0.0.0:${WEBRTC_SIGNAL_PORT:-8765}"
-      ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true
+      echo -e "  mode       listening for direct robot connections"
+      echo -e "  addresses"
+      local ips
+      ips=$(hostname -I 2>/dev/null || true)
+      for ip in ${ips}; do
+        if [[ -n "${ip}" ]]; then
+          echo -e "    ${ip}"
+        fi
+      done
+      echo -e "  expected   tcp/0.0.0.0:${ZENOH_PORT:-7447}, tcp/0.0.0.0:${WEBRTC_SIGNAL_PORT:-8765}"
+      local active_listeners
+      active_listeners=$(ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true)
+      if [[ -n "${active_listeners}" ]]; then
+        echo -e "  listeners"
+        while read -r line; do
+          echo -e "    ${FG_GREEN}running${RESET} ${line}"
+        done <<< "${active_listeners}"
+      else
+        echo -e "  listeners  ${FG_MUTED}none detected yet${RESET}"
+      fi
       ;;
     robot:hub|machine:hub)
       target="$(zenoh_connect_target "${role}")"
-      echo "Cloud target: ${target}"
+      echo -e "  cloud      ${target}"
+      echo -en "  zenoh      "
       tcp_probe "${target}" "${ZENOH_PORT:-7447}" || true
+      echo -en "  signaling  "
       tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
       ;;
     cloud:*)
-      echo "Cloud mode listens for robot and machine connections."
-      ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true
+      echo -e "  mode       listening for robot and machine connections"
+      local active_listeners
+      active_listeners=$(ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true)
+      if [[ -n "${active_listeners}" ]]; then
+        echo -e "  listeners"
+        while read -r line; do
+          echo -e "    ${FG_GREEN}running${RESET} ${line}"
+        done <<< "${active_listeners}"
+      else
+        echo -e "  listeners  ${FG_MUTED}none detected${RESET}"
+      fi
       ;;
   esac
+  echo ""
 }
 
 start_bg() {
@@ -285,13 +392,41 @@ start_bg() {
   local pid="${RUN_DIR}/${name}.pid"
 
   if [[ -f "${pid}" ]] && kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
-    echo "${name} already running with pid $(cat "${pid}")"
+    log_warn "Service ${BOLD}${name}${RESET} is already running (PID $(cat "${pid}"))."
     return
   fi
 
-  echo "Starting ${name}; log: ${log}"
+  rotate_log "${name}" "${log}"
+  log_run "Launching ${BOLD}${name}${RESET}... (log: ${FG_MUTED}${log}${RESET})"
   nohup "$@" >"${log}" 2>&1 < /dev/null &
-  echo "$!" > "${pid}"
+  local child_pid="$!"
+  echo "${child_pid}" > "${pid}"
+  sleep 0.5
+  if kill -0 "${child_pid}" >/dev/null 2>&1; then
+    log_success "Service ${BOLD}${name}${RESET} started successfully ${FG_MUTED}(PID ${child_pid})${RESET}"
+  else
+    log_error "Service ${BOLD}${name}${RESET} failed to start. Check: tail -n 20 ${log}"
+  fi
+}
+
+rotate_log() {
+  local name="$1"
+  local log="$2"
+  local keep="${HORUS_LOG_KEEP:-10}"
+  local archive_dir="${RUN_DIR}/logs"
+  local timestamp
+  [[ -s "${log}" ]] || return 0
+  mkdir -p "${archive_dir}"
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  mv "${log}" "${archive_dir}/${name}-${timestamp}.log"
+  if [[ "${keep}" =~ ^[0-9]+$ && "${keep}" -gt 0 ]]; then
+    mapfile -t old_logs < <(find "${archive_dir}" -maxdepth 1 -type f -name "${name}-*.log" | sort)
+    local remove_count=$(( ${#old_logs[@]} - keep ))
+    local index
+    for (( index=0; index<remove_count; index++ )); do
+      rm -f -- "${old_logs[$index]}"
+    done
+  fi
 }
 
 stop_one() {
@@ -304,7 +439,7 @@ stop_one() {
       if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
         kill -KILL "$(cat "${pid}")" || true
       fi
-      echo "Stopped ${name}"
+      log_success "Stopped ${name}."
     fi
     rm -f "${pid}"
   fi
@@ -354,12 +489,14 @@ stop_stale_project_processes() {
     "${ROOT}/scripts/webrtc_camera_receiver.py"
     "${ROOT}/scripts/webrtc_signal_relay.py"
     "${ROOT}/scripts/fake_robot_ros2_data.py"
+    "${ROOT}/scripts/horus_metrics.py"
     "scripts/gst_webrtc_h264_robot.py"
     "scripts/gst_webrtc_h264_machine.py"
     "scripts/webrtc_camera_sender.py"
     "scripts/webrtc_camera_receiver.py"
     "scripts/webrtc_signal_relay.py"
     "scripts/fake_robot_ros2_data.py"
+    "scripts/horus_metrics.py"
   )
 
   terminate_project_pids_by_pattern TERM "${patterns[@]}"
@@ -379,13 +516,44 @@ stop_zenoh() {
   terminate_project_pids_by_name KILL zenoh-bridge-ros2dds
 }
 
+get_pid_stats() {
+  local name="$1"
+  local pid_file="${RUN_DIR}/${name}.pid"
+  if [[ -f "${pid_file}" ]]; then
+    local p_id
+    p_id=$(cat "${pid_file}" 2>/dev/null || echo "")
+    if [[ -n "${p_id}" ]] && kill -0 "${p_id}" >/dev/null 2>&1; then
+      local stats
+      stats=$(ps -p "${p_id}" -o %cpu,%mem,etimes --no-headers 2>/dev/null || echo "")
+      if [[ -n "${stats}" ]]; then
+        local cpu mem etimes uptime_str
+        cpu=$(echo "${stats}" | awk '{print $1}')
+        mem=$(echo "${stats}" | awk '{2}') # Avoid printing empty
+        mem=$(echo "${stats}" | awk '{print $2}')
+        etimes=$(echo "${stats}" | awk '{print $3}')
+
+        if [[ "${etimes}" -lt 60 ]]; then
+          uptime_str="${etimes}s"
+        elif [[ "${etimes}" -lt 3600 ]]; then
+          uptime_str="$((etimes / 60))m$((etimes % 60))s"
+        else
+          uptime_str="$((etimes / 3600))h$(((etimes % 3600) / 60))m"
+        fi
+        echo -ne " ${FG_MUTED}(CPU: ${cpu}%, MEM: ${mem}%, UPTIME: ${uptime_str})${RESET}"
+      fi
+    fi
+  fi
+}
+
 status_one() {
   local name="$1"
   local pid="${RUN_DIR}/${name}.pid"
   if [[ -f "${pid}" ]] && kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
-    echo "${name}: running pid $(cat "${pid}")"
+    local p_id
+    p_id=$(cat "${pid}")
+    printf "  %-10s %b\n" "${name}" "${FG_GREEN}running${RESET} ${FG_MUTED}PID ${p_id}${RESET}$(get_pid_stats "${name}")"
   else
-    echo "${name}: stopped"
+    printf "  %-10s %b\n" "${name}" "${FG_MUTED}stopped${RESET}"
   fi
 }
 
@@ -396,13 +564,31 @@ status_zenoh() {
     [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
     status="$("${docker_cmd[@]}" ps --filter "name=$(zenoh_docker_name "${HORUS_ROLE:-robot}")" --format '{{.Status}}' 2>/dev/null || true)"
     if [[ -n "${status}" ]]; then
-      echo "zenoh: running container $(zenoh_docker_name "${HORUS_ROLE:-robot}") (${status})"
+      printf "  %-10s %b\n" "zenoh" "${FG_GREEN}running${RESET} ${FG_MUTED}Docker $(zenoh_docker_name "${HORUS_ROLE:-robot}") - ${status}${RESET}"
     else
-      echo "zenoh: stopped"
+      printf "  %-10s %b\n" "zenoh" "${FG_MUTED}stopped${RESET}"
     fi
     return
   fi
   status_one zenoh
+}
+
+open_monitor_after_launch() {
+  local no_monitor="$1"
+  if [[ "${no_monitor}" == "1" || "${HORUS_LAUNCH_MONITOR:-1}" == "0" || ! -t 1 ]]; then
+    return
+  fi
+  local monitor_pid="${RUN_DIR}/monitor.pid"
+  if [[ -f "${monitor_pid}" ]]; then
+    local p_id
+    p_id="$(cat "${monitor_pid}" 2>/dev/null || true)"
+    if [[ -n "${p_id}" ]] && kill -0 "${p_id}" >/dev/null 2>&1; then
+      log_info "Live console already open ${FG_MUTED}(PID ${p_id})${RESET}; services are running in the background."
+      return
+    fi
+    rm -f "${monitor_pid}"
+  fi
+  python3 "${ROOT}/scripts/horus_monitor.py" --root "${ROOT}" --env "${ENV_FILE}"
 }
 
 launch_zenoh_client() {
@@ -497,9 +683,17 @@ launch_webrtc_robot() {
       --profile "${ROOT}/.webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
       --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
+      --cmd-watchdog-timeout "${WEBRTC_CMD_WATCHDOG_TIMEOUT:-0.3}" \
+      --cmd-rate-limit-hz "${WEBRTC_CMD_RATE_LIMIT_HZ:-100.0}" \
+      --video-bitrate-kbit "${VIDEO_BITRATE_KBIT:-6000}" \
+      --adaptive-bitrate "${WEBRTC_ADAPTIVE_BITRATE:-1}" \
+      --min-bitrate-kbit "${WEBRTC_MIN_BITRATE_KBIT:-1000}" \
+      --max-bitrate-kbit "${WEBRTC_MAX_BITRATE_KBIT:-${VIDEO_BITRATE_KBIT:-6000}}" \
+      --bitrate-step-kbit "${WEBRTC_BITRATE_STEP_KBIT:-500}" \
+      --bitrate-check-sec "${WEBRTC_BITRATE_CHECK_SEC:-2.0}" \
       --video-source "${WEBRTC_VIDEO_SOURCE:-ros2}" \
       --ros-image-topic "${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/image_raw}}" \
-      --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-sensor_data}" \
+      --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
       --source-pipeline "${WEBRTC_GST_VIDEO_SOURCE:-}" \
       --width "${WEBRTC_VIDEO_WIDTH:-1280}" \
       --height "${WEBRTC_VIDEO_HEIGHT:-720}" \
@@ -541,7 +735,7 @@ launch_webrtc_receiver() {
         --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
         --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
         --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
-        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-sensor_data}" \
+        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
         --cmd-rate "${CMD_RATE:-0}" \
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
@@ -559,7 +753,7 @@ launch_webrtc_receiver() {
         --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
         --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
         --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
-        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-sensor_data}" \
+        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
         --cmd-rate "${CMD_RATE:-0}" \
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
@@ -576,47 +770,147 @@ launch_signal_relay() {
     --port "${WEBRTC_SIGNAL_PORT:-8765}"
 }
 
+launch_metrics() {
+  if [[ -z "${HORUS_METRICS_PORT:-}" || "${HORUS_METRICS_PORT:-0}" == "0" ]]; then
+    return
+  fi
+  start_bg metrics python3 "${ROOT}/scripts/horus_metrics.py" \
+    --root "${ROOT}" \
+    --env "${ENV_FILE}" \
+    --host "${HORUS_METRICS_HOST:-127.0.0.1}" \
+    --port "${HORUS_METRICS_PORT}"
+}
+
+launch_fake_data() {
+  local robot_id="$1"
+  local py="python3"
+  source_ros_required
+  start_bg fake-data "${py}" "${ROOT}/scripts/fake_robot_ros2_data.py" \
+    --robot-id "${robot_id}" \
+    --image-topic "${FAKE_ROS_IMAGE_TOPIC:-${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-/camera/image_raw}}" \
+    --image-qos "${FAKE_ROS_IMAGE_QOS:-default}" \
+    --odom-topic "${FAKE_ROS_ODOM_TOPIC:-/odom}" \
+    --scan-topic "${FAKE_ROS_SCAN_TOPIC:-/scan}" \
+    --joint-topic "${FAKE_ROS_JOINT_TOPIC:-/joint_states}" \
+    --points-topic "${FAKE_ROS_POINTS_TOPIC:-/points}" \
+    --width "${FAKE_CAMERA_WIDTH:-${WEBRTC_VIDEO_WIDTH:-1280}}" \
+    --height "${FAKE_CAMERA_HEIGHT:-${WEBRTC_VIDEO_HEIGHT:-720}}" \
+    --camera-fps "${FAKE_CAMERA_FPS:-${WEBRTC_VIDEO_FPS:-30}}" \
+    --frame-cache "${FAKE_FRAME_CACHE:-30}" \
+    --state-rate "${FAKE_STATE_RATE:-20}" \
+    --points-rate "${FAKE_POINTS_RATE:-1}" \
+    --point-count "${FAKE_POINT_COUNT:-512}" \
+    --color-seed "${FAKE_COLOR_SEED:-17}"
+}
+
 cmd="${1:-help}"
 case "${cmd}" in
+  setup|configure)
+    python3 "${ROOT}/scripts/horus_setup.py" --root "${ROOT}" --env "${ENV_FILE}" "${@:2}"
+    ;;
   init)
+    print_banner
+    echo -e "${BOLD}${FG_CYAN}Initialize configuration${RESET}"
     if [[ -f "${ENV_FILE}" ]]; then
-      echo "${ENV_FILE} already exists"
+      log_warn "Configuration already exists. No changes were made."
+      echo -e "  file       ${FG_MUTED}${ENV_FILE}${RESET}"
+      echo -e "  next       ${FG_CYAN}./horus setup${RESET}"
     else
       cp "${ROOT}/.env.example" "${ENV_FILE}"
-      echo "Created ${ENV_FILE}"
+      log_success "Configuration created."
+      echo -e "  file       ${FG_GREEN}${ENV_FILE}${RESET}"
+      echo ""
+      echo -e "${BOLD}Next commands${RESET}"
+      echo -e "  ${FG_CYAN}./horus setup${RESET}"
+      echo -e "  ${FG_CYAN}./horus bootstrap <role>${RESET}"
+      echo -e "  ${FG_CYAN}./horus launch <role>${RESET}"
     fi
+    echo ""
     ;;
   bootstrap)
     "${ROOT}/scripts/bootstrap.sh" "${2:-}"
     ;;
   boostrap|bootsrap)
-    echo "Interpreting '${cmd}' as 'bootstrap'."
+    log_warn "Interpreting '${cmd}' as 'bootstrap'."
     "${ROOT}/scripts/bootstrap.sh" "${2:-}"
     ;;
   launch)
     load_env
     role="${2:-${HORUS_ROLE:-robot}}"
+    no_monitor=0
+    for arg in "${@:3}"; do
+      case "${arg}" in
+        --no-monitor) no_monitor=1 ;;
+        *) echo "Unknown launch option: ${arg}" >&2; exit 2 ;;
+      esac
+    done
     case "${role}" in
       robot|machine)
         ensure_webrtc_media_supported
         warn_runtime_config
         ;;
+      cloud)
+        ;;
+      fleet)
+        log_error "'fleet' is managed with the fleet command, not launch."
+        echo -e "Use: ${FG_CYAN}./horus fleet launch config/fleet.example.json${RESET}" >&2
+        exit 2
+        ;;
+      *)
+        log_error "Unknown launch role: ${role}"
+        echo -e "Supported roles: ${FG_CYAN}robot${RESET}, ${FG_CYAN}machine${RESET}, ${FG_CYAN}cloud${RESET}" >&2
+        exit 2
+        ;;
     esac
+    print_banner
+    echo -e "${BOLD}${FG_CYAN}Launch ${role}${RESET} ${FG_MUTED}$(date '+%Y-%m-%d %H:%M:%S')${RESET}"
+    echo -e "  role       ${BOLD}${role}${RESET}"
+    echo -e "  topology   ${HORUS_TOPOLOGY:-hub}"
+    echo -e "  room       ${HORUS_ROOM:-default}"
+    echo -e "  config     ${ENV_FILE}"
+    zenoh_target="$(zenoh_connect_target "${role}")"
+    if [[ -n "${zenoh_target}" ]]; then
+      echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, tcp/${zenoh_target}:${FG_CYAN}${ZENOH_PORT:-7447}${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
+    else
+      echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, listening tcp/0.0.0.0:${FG_CYAN}${ZENOH_PORT:-7447}${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
+    fi
+    echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
+    if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+      echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720}${RESET} @ ${FG_CYAN}${WEBRTC_VIDEO_FPS:-30} fps${RESET}, source ${WEBRTC_VIDEO_SOURCE:-ros2}"
+      echo -e "  ros image  ${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-/camera/image_raw}"
+    fi
+    echo -e "  ros        ${ROS_DISTRO:-jazzy}, domain ${FG_CYAN}${ROS_DOMAIN_ID:-0}${RESET}"
+    echo ""
+
+    log_info "Starting services for role: ${BOLD}${role}${RESET}"
     case "${role}" in
       robot)
-        launch_zenoh_client robot "$(zenoh_connect_target robot)"
+        if zenoh_enabled; then
+          launch_zenoh_client robot "$(zenoh_connect_target robot)"
+        else
+          log_warn "Zenoh is disabled for this launch."
+        fi
         launch_webrtc_robot
         ;;
       machine)
-        if [[ "${HORUS_TOPOLOGY:-hub}" == "direct" ]]; then
-          launch_zenoh_router machine
+        if zenoh_enabled; then
+          if [[ "${HORUS_TOPOLOGY:-hub}" == "direct" ]]; then
+            launch_zenoh_router machine
+          else
+            launch_zenoh_client machine "$(zenoh_connect_target machine)"
+          fi
         else
-          launch_zenoh_client machine "$(zenoh_connect_target machine)"
+          log_warn "Zenoh is disabled for this launch."
         fi
         launch_webrtc_receiver machine
         ;;
       cloud)
-        launch_zenoh_router cloud
+        if zenoh_enabled; then
+          launch_zenoh_router cloud
+        else
+          log_warn "Zenoh is disabled for this launch."
+        fi
         if [[ "${HORUS_CLOUD_RUN_SIGNALING:-1}" == "1" ]]; then
           launch_signal_relay
         fi
@@ -626,33 +920,181 @@ case "${cmd}" in
         exit 2
         ;;
     esac
+    launch_metrics
+    open_monitor_after_launch "${no_monitor}"
     ;;
   stop)
     load_env
-    stop_one webrtc
-    stop_one signal
-    stop_zenoh
+    print_banner
+    echo -e "${BOLD}${FG_CYAN}Stop services${RESET}"
+
+    stop_one_styled() {
+      local name="$1"
+      local pid="${RUN_DIR}/${name}.pid"
+      if [[ -f "${pid}" ]]; then
+        if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+          echo -e "  ${name}       stopping PID $(cat "${pid}")"
+          kill "$(cat "${pid}")" || true
+          sleep 1
+          if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+            kill -KILL "$(cat "${pid}")" || true
+          fi
+          echo -e "  ${name}       ${FG_GREEN}stopped${RESET}"
+        else
+          echo -e "  ${name}       ${FG_MUTED}not running${RESET}"
+        fi
+        rm -f "${pid}"
+      else
+        echo -e "  ${name}       ${FG_MUTED}already stopped${RESET}"
+      fi
+    }
+
+    stop_one_styled webrtc
+    stop_one_styled signal
+    stop_one_styled metrics
+    stop_one_styled fake-data
+
+    if [[ "${ZENOH_BRIDGE_RUNTIME:-binary}" == "docker" ]]; then
+      docker_cmd=(docker)
+      [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
+      name="$(zenoh_docker_name "${HORUS_ROLE:-robot}")"
+      if "${docker_cmd[@]}" ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        echo -e "  docker      stopping ${name}"
+        "${docker_cmd[@]}" rm -f "${name}" >/dev/null 2>&1 || true
+        echo -e "  docker      ${FG_GREEN}removed${RESET}"
+      fi
+    fi
+
+    stop_one_styled zenoh
+
+    echo -e "  cleanup     stale connector processes"
     stop_stale_project_processes
+    echo -e "  cleanup     ${FG_GREEN}complete${RESET}"
+
+    log_success "All services are stopped."
+    echo ""
     ;;
   status)
     load_env
+    if [[ "${2:-}" == "--json" ]]; then
+      python3 "${ROOT}/scripts/horus_monitor.py" --root "${ROOT}" --env "${ENV_FILE}" --json
+      exit 0
+    fi
+    print_banner
+    echo -e "${BOLD}${FG_CYAN}Status${RESET} ${FG_MUTED}$(date '+%H:%M:%S')${RESET}"
+    echo -e "  role       ${BOLD}${HORUS_ROLE:-robot}${RESET}"
+    echo -e "  topology   ${HORUS_TOPOLOGY:-hub}"
+    echo -e "  room       ${HORUS_ROOM:-default}"
+    distro="${ROS_DISTRO:-jazzy}"
+    domain="${ROS_DOMAIN_ID:-0}"
+    ns="${ZENOH_NAMESPACE:-/}"
+    echo -e "  ros        ${FG_CYAN}${distro}${RESET}, domain ${FG_CYAN}${domain}${RESET}, namespace ${FG_CYAN}${ns}${RESET}"
+    echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
+    if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+      echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720} @ ${WEBRTC_VIDEO_FPS:-30} fps${RESET}"
+      echo -e "  source     ${FG_CYAN}${WEBRTC_VIDEO_SOURCE:-ros2}${RESET}"
+      if [[ "${WEBRTC_VIDEO_SOURCE:-ros2}" == "ros2" ]]; then
+        echo -e "  image in   ${FG_CYAN}${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-/camera/image_raw}${RESET}"
+      fi
+    fi
+    zenoh_target="$(zenoh_connect_target "${HORUS_ROLE:-robot}")"
+    if [[ -n "${zenoh_target}" ]]; then
+      echo -e "  zenoh      tcp/${zenoh_target}:${ZENOH_PORT:-7447}"
+    else
+      echo -e "  zenoh      listening tcp/0.0.0.0:${ZENOH_PORT:-7447}"
+    fi
+    echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    if [[ -f "${ROOT}/.webrtc_profile.env" ]]; then
+      set -a
+      # shellcheck source=/dev/null
+      source "${ROOT}/.webrtc_profile.env"
+      set +a
+      encoder="${GST_H264_ENCODER_NAME:-unknown}"
+      decoder="${GST_H264_DECODER_NAME:-unknown}"
+      accel="${VIDEO_ENCODER_ACCEL:-${VIDEO_DECODER_ACCEL:-auto}}"
+      echo -e "  codec      ${FG_CYAN}${encoder}${RESET} encode, ${FG_CYAN}${decoder}${RESET} decode (${accel})"
+    fi
+    echo ""
+    echo -e "${BOLD}Services${RESET}"
     status_zenoh
     status_one signal
     status_one webrtc
+    status_one metrics
+    status_one fake-data
+    echo ""
+    echo -e "${FG_MUTED}Run ${FG_CYAN}./horus monitor${RESET}${FG_MUTED} for the live console.${RESET}\n"
     ;;
   monitor|ui|watch)
     python3 "${ROOT}/scripts/horus_monitor.py" --root "${ROOT}" --env "${ENV_FILE}" "${@:2}"
     ;;
+  metrics)
+    load_env
+    shift || true
+    python3 "${ROOT}/scripts/horus_metrics.py" --root "${ROOT}" --env "${ENV_FILE}" "$@"
+    ;;
+  fleet)
+    load_env
+    if [[ -z "${2:-}" ]]; then
+      python3 "${ROOT}/scripts/horus_fleet.py" --root "${ROOT}" --base-env "${ENV_FILE}" --help
+      exit 2
+    fi
+    python3 "${ROOT}/scripts/horus_fleet.py" --root "${ROOT}" --base-env "${ENV_FILE}" "${@:2}"
+    ;;
+  fake-data)
+    load_env
+    robot_id="${2:-${FAKE_DATA_ROBOT_ID:-${HORUS_ROOM:-robot-a}}}"
+    print_banner
+    echo -e "${BOLD}${FG_CYAN}Fake ROS 2 data${RESET}"
+    echo -e "  robot      ${robot_id}"
+    launch_fake_data "${robot_id}"
+    ;;
   doctor)
     load_env
+    print_banner
     role="${2:-${HORUS_ROLE:-robot}}"
     doctor "${role}"
     ;;
   logs)
     service="${2:-}"
     case "${service}" in
-      zenoh|webrtc|signal) tail -f "${RUN_DIR}/${service}.log" ;;
-      *) echo "Choose a log: zenoh, webrtc, or signal" >&2; exit 2 ;;
+      zenoh|webrtc|signal|metrics|fake-data)
+      print_banner
+        log_file="${RUN_DIR}/${service}.log"
+        size_bytes=0
+        line_count=0
+        mod_time="unknown"
+        if [[ -f "${log_file}" ]]; then
+          size_bytes=$(wc -c < "${log_file}" 2>/dev/null || echo 0)
+          line_count=$(wc -l < "${log_file}" 2>/dev/null || echo 0)
+          mod_time=$(date -r "${log_file}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || stat -c %y "${log_file}" 2>/dev/null | cut -d. -f1 || echo "unknown")
+        fi
+
+        status_text="${FG_MUTED}stopped${RESET}"
+        pid_val=""
+        if [[ -f "${RUN_DIR}/${service}.pid" ]]; then
+          p_id=$(cat "${RUN_DIR}/${service}.pid" 2>/dev/null || echo "")
+          if [[ -n "${p_id}" ]] && kill -0 "${p_id}" >/dev/null 2>&1; then
+            status_text="${FG_GREEN}running${RESET}"
+            pid_val=", PID ${p_id}"
+          fi
+        fi
+
+        echo -e "${BOLD}${FG_CYAN}Log stream: ${service}${RESET}"
+        echo -e "  file       ${FG_MUTED}${log_file}${RESET}"
+        echo -e "  service    ${status_text}${FG_MUTED}${pid_val}${RESET}"
+        fmt_size=$(numfmt --to=iec-i --suffix=B "${size_bytes}" 2>/dev/null || echo "${size_bytes} bytes")
+        echo -e "  size       ${fmt_size} (${line_count} lines)"
+        echo -e "  modified   ${mod_time}"
+        echo -e "  control    Press ${BOLD}Ctrl+C${RESET} to stop"
+        echo ""
+        tail -f "${log_file}"
+        ;;
+      *)
+        log_error "Invalid service specified."
+        echo -e "${BOLD}Usage:${RESET}"
+        echo -e "  ./horus logs ${FG_GREEN}[zenoh|webrtc|signal|metrics|fake-data]${RESET}\n" >&2
+        exit 2
+        ;;
     esac
     ;;
   help|-h|--help)
