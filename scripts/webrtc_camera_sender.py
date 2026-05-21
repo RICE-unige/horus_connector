@@ -260,7 +260,7 @@ async def run(args):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--signaling-url", required=True, help="Receiver WebSocket URL, e.g. ws://34.6.77.21:8765")
+    parser.add_argument("--signaling-url", required=True, help="Receiver WebSocket URL, e.g. ws://cloud.example.com:8765")
     parser.add_argument("--duration", type=float, default=30.0)
     parser.add_argument("--camera-fps-scale", type=float, default=1.0)
     parser.add_argument("--quality-scale", type=float, default=1.0)

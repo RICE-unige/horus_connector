@@ -8,6 +8,7 @@ VENV_DIR="${WEBRTC_VENV:-${REPO_ROOT}/.venv-webrtc}"
 ROLE="${1:-${HORUS_ROLE:-}}"
 MEDIA_MODE="${WEBRTC_MEDIA_MODE:-h264}"
 VENV_LOG="${TMPDIR:-/tmp}/horus_connector_${UID}_webrtc_venv_create.log"
+PIP_INDEX_ARGS=()
 
 if [[ ! -f "${REQ_FILE}" ]]; then
   echo "Missing ${REQ_FILE}" >&2
@@ -47,6 +48,12 @@ pip_user_install_flags() {
 }
 
 select_pip_args() {
+  if [[ "${MEDIA_MODE}" == "jpeg" && "${HORUS_ALLOW_LEGACY_JPEG:-0}" != "1" ]]; then
+    echo "WEBRTC_MEDIA_MODE=jpeg is legacy-only and disabled by default during bootstrap."
+    echo "Using native H.264/GStreamer dependencies. Set HORUS_ALLOW_LEGACY_JPEG=1 to enable aiortc."
+    MEDIA_MODE="h264"
+  fi
+
   if [[ "${ROLE}" == "cloud" ]]; then
     if python_lt_38; then
       PIP_ARGS=("websockets>=8,<10")
@@ -66,6 +73,15 @@ select_pip_args() {
     PIP_ARGS=("websocket-client<1.4")
   else
     PIP_ARGS=("websockets>=12")
+  fi
+}
+
+select_pip_index() {
+  if [[ -n "${HORUS_PIP_INDEX_URL:-}" ]]; then
+    PIP_INDEX_ARGS=(--index-url "${HORUS_PIP_INDEX_URL}")
+  elif [[ "${PIP_INDEX_URL:-}" == *"nvidia"* || "${PIP_EXTRA_INDEX_URL:-}" == *"nvidia"* ]]; then
+    echo "Detected NVIDIA pip index; using PyPI for connector Python dependencies."
+    PIP_INDEX_ARGS=(--index-url "https://pypi.org/simple")
   fi
 }
 
@@ -104,10 +120,11 @@ install_python_deps() {
     return
   fi
 
-  "${python_cmd}" -m pip install "$@"
+  "${python_cmd}" -m pip install "${PIP_INDEX_ARGS[@]}" "$@"
 }
 
 select_pip_args
+select_pip_index
 
 echo "WebRTC dependency mode: role=${ROLE:-auto}, media=${MEDIA_MODE}"
 if [[ "${MEDIA_MODE}" != "jpeg" && "${ROLE}" != "cloud" ]]; then

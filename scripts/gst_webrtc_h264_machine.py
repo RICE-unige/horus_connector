@@ -42,6 +42,7 @@ class H264MachineReceiver:
         self.frame_clock = deque()
         self.frame_latency_samples = []
         self.ros_image_publisher = None
+        self.recovering = False
         if self.args.video_output in {"ros2", "both"}:
             self.ros_image_publisher = RosImagePublisher(
                 self.args.ros_image_topic,
@@ -198,10 +199,42 @@ class H264MachineReceiver:
         if message.type == Gst.MessageType.ERROR:
             error, debug = message.parse_error()
             print(f"GStreamer error from {message.src.get_name()}: {error}; {debug}", flush=True)
-            self.stop()
+            if not self.recovering:
+                self.recovering = True
+                print("Initiating automatic pipeline recovery in 2 seconds...", flush=True)
+                GLib.timeout_add_seconds(2, self._recover_pipeline)
         elif message.type == Gst.MessageType.WARNING:
             warning, debug = message.parse_warning()
             print(f"GStreamer warning from {message.src.get_name()}: {warning}; {debug}", flush=True)
+
+    def _recover_pipeline(self):
+        print("Recovering Machine GStreamer pipeline...", flush=True)
+        try:
+            if self.pipeline is not None:
+                self.pipeline.set_state(Gst.State.NULL)
+                self.pipeline = None
+            self.webrtc = None
+            self.cmd_channel = None
+            self.frame_clock.clear()
+
+            # Rebuild pipeline
+            self.pipeline = self._build_pipeline()
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self._on_bus_message)
+            self.webrtc.connect("on-ice-candidate", self._on_ice_candidate)
+            self.webrtc.connect("pad-added", self._on_incoming_stream)
+            try:
+                self.webrtc.connect("on-data-channel", self._on_data_channel)
+            except TypeError:
+                pass
+            self.pipeline.set_state(Gst.State.PLAYING)
+            self.recovering = False
+            print("Machine pipeline successfully recovered and listening.", flush=True)
+        except Exception as e:
+            print(f"Failed to recover Machine pipeline: {e}. Retrying in 5 seconds...", flush=True)
+            GLib.timeout_add_seconds(5, self._recover_pipeline)
+        return False
 
     def _on_incoming_stream(self, _webrtc, pad):
         caps = pad.get_current_caps() or pad.query_caps(None)
@@ -384,7 +417,7 @@ def parse_args():
     parser.add_argument("--ros-image-topic", default="/camera/webrtc/image_raw")
     parser.add_argument("--ros-image-encoding", choices=["rgb8", "bgr8", "rgba8", "bgra8", "mono8"], default="rgb8")
     parser.add_argument("--ros-image-frame-id", default="webrtc_camera")
-    parser.add_argument("--ros-image-qos", choices=["sensor_data", "default"], default="sensor_data")
+    parser.add_argument("--ros-image-qos", choices=["auto", "sensor_data", "default"], default="auto")
     parser.add_argument("--cmd-rate", type=float, default=0.0)
     parser.add_argument("--cmd-linear-x", type=float, default=0.0)
     parser.add_argument("--cmd-angular-z", type=float, default=0.0)

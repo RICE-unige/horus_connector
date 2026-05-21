@@ -29,14 +29,18 @@ class Relay:
 
     async def register(self, websocket, role: str, room: str):
         key = (room, role)
+        notify_peer = None
         async with self.lock:
             old = self.peers.get(key)
             if old and old is not websocket:
                 await old.close()
             self.peers[key] = websocket
             queued = self.pending.pop(key, [])
+            notify_peer = self.peers.get((room, self.target_role(role)))
         for text in queued:
             await websocket.send(text)
+        if notify_peer is not None:
+            await notify_peer.send(json.dumps({"type": "peer-ready", "role": role, "room": room}))
         print(f"registered role={role} room={room}", flush=True)
 
     async def unregister(self, websocket):

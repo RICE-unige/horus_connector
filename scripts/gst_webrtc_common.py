@@ -120,8 +120,9 @@ def make_session_description(kind: str, sdp_text: str):
 
 
 class JsonSignaling:
-    def __init__(self, on_message):
+    def __init__(self, on_message, on_connected=None):
         self.on_message = on_message
+        self.on_connected = on_connected
         self.ws = None
         self.connected = threading.Event()
         self.closed = threading.Event()
@@ -144,19 +145,28 @@ class JsonSignaling:
     def _read_loop(self):
         self.connected.set()
         self._flush_pending()
+        if self.on_connected is not None:
+            self.on_connected()
         try:
             for text in self.ws:
                 try:
-                    self.on_message(json.loads(text))
+                    message = json.loads(text)
+                    if message.get("type") == "register":
+                        print(
+                            f"WebRTC peer registered: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
+                            flush=True,
+                        )
+                    self.on_message(message)
                 except Exception as exc:
                     print(f"ignoring signaling message: {exc}", flush=True)
         finally:
-            self.closed.set()
+            print("WebRTC signaling disconnected", flush=True)
+            self.connected.clear()
 
 
 class ClientSignaling(JsonSignaling):
-    def __init__(self, url: str, role: str, room: str, on_message):
-        super().__init__(on_message)
+    def __init__(self, url: str, role: str, room: str, on_message, on_connected=None):
+        super().__init__(on_message, on_connected)
         self.url = url
         self.role = role
         self.room = room
@@ -171,11 +181,19 @@ class ClientSignaling(JsonSignaling):
                     if connect is not None:
                         self.ws = connect(self.url, open_timeout=10)
                         self.ws.send(json.dumps({"type": "register", "role": self.role, "room": self.room}))
+                        print(
+                            f"WebRTC signaling connected: role={self.role} room={self.room} url={self.url}",
+                            flush=True,
+                        )
                         self._read_loop()
                     else:
                         self.ws = websocket.create_connection(self.url, timeout=10)
                         self.ws.settimeout(None)
                         self.ws.send(json.dumps({"type": "register", "role": self.role, "room": self.room}))
+                        print(
+                            f"WebRTC signaling connected: role={self.role} room={self.room} url={self.url}",
+                            flush=True,
+                        )
                         self._legacy_read_loop()
                 except Exception as exc:
                     print(f"signaling reconnect after error: {exc}", flush=True)
@@ -186,22 +204,31 @@ class ClientSignaling(JsonSignaling):
     def _legacy_read_loop(self):
         self.connected.set()
         self._flush_pending()
+        if self.on_connected is not None:
+            self.on_connected()
         try:
             while not self.closed.is_set():
                 text = self.ws.recv()
                 if not text:
                     break
                 try:
-                    self.on_message(json.loads(text))
+                    message = json.loads(text)
+                    if message.get("type") == "register":
+                        print(
+                            f"WebRTC peer registered: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
+                            flush=True,
+                        )
+                    self.on_message(message)
                 except Exception as exc:
                     print(f"ignoring signaling message: {exc}", flush=True)
         finally:
-            self.closed.set()
+            print("WebRTC signaling disconnected", flush=True)
+            self.connected.clear()
 
 
 class ServerSignaling(JsonSignaling):
-    def __init__(self, host: str, port: int, on_message):
-        super().__init__(on_message)
+    def __init__(self, host: str, port: int, on_message, on_connected=None):
+        super().__init__(on_message, on_connected)
         self.host = host
         self.port = port
         self.server = None
@@ -212,7 +239,16 @@ class ServerSignaling(JsonSignaling):
 
         def handler(ws):
             self.ws = ws
-            self._read_loop()
+            remote = getattr(ws, "remote_address", None)
+            if isinstance(remote, tuple):
+                remote_text = f"{remote[0]}:{remote[1]}"
+            else:
+                remote_text = str(remote or "unknown")
+            print(f"WebRTC signaling peer connected: {remote_text}", flush=True)
+            try:
+                self._read_loop()
+            finally:
+                print(f"WebRTC signaling peer disconnected: {remote_text}", flush=True)
 
         def run():
             with serve(handler, self.host, self.port) as server:

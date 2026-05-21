@@ -55,6 +55,14 @@ def qos_profile(qos_name: str):
     return qos_profile_sensor_data
 
 
+def subscription_qos_profiles(qos_name: str):
+    if qos_name == "auto":
+        return [qos_profile("sensor_data"), qos_profile("default")]
+    if qos_name == "default":
+        return [qos_profile("default"), qos_profile("sensor_data")]
+    return [qos_profile(qos_name)]
+
+
 def ensure_rclpy():
     import rclpy
 
@@ -88,6 +96,7 @@ class RosImageAppSrc:
         self.node = None
         self.executor = None
         self.thread = None
+        self.subscriptions = []
         self.image_type = None
         self.seq = 0
         self.received_count = 0
@@ -95,6 +104,8 @@ class RosImageAppSrc:
         self.last_report = time.monotonic()
         self.caps_string = ""
         self.unsupported_encoding = ""
+        self.last_message_key = None
+        self.deduplicate_qos_messages = len(subscription_qos_profiles(qos_name)) > 1
 
     def start(self):
         if not self.topic:
@@ -106,13 +117,14 @@ class RosImageAppSrc:
 
         self.image_type = Image
         self.node = self.rclpy.create_node("horus_webrtc_image_source")
-        self.node.create_subscription(Image, self.topic, self._on_image, qos_profile(self.qos_name))
+        for profile in subscription_qos_profiles(self.qos_name):
+            self.subscriptions.append(self.node.create_subscription(Image, self.topic, self._on_image, profile))
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         self.thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.thread.start()
         self._configure_live_appsrc()
-        print(f"Subscribing ROS images from {self.topic}", flush=True)
+        print(f"Subscribing ROS images from {self.topic} with {self.qos_name} QoS", flush=True)
 
     def _configure_live_appsrc(self):
         properties = {
@@ -141,6 +153,8 @@ class RosImageAppSrc:
             self.thread = None
 
     def _on_image(self, msg):
+        if self.deduplicate_qos_messages and self._is_duplicate_qos_message(msg):
+            return
         self.received_count += 1
         try:
             gst_format, bytes_per_pixel = ros_encoding_to_gst(msg.encoding)
@@ -176,6 +190,16 @@ class RosImageAppSrc:
         elif result not in (Gst.FlowReturn.FLUSHING,):
             print(f"appsrc push-buffer returned {result}", flush=True)
         self._maybe_report_rate()
+
+    def _is_duplicate_qos_message(self, msg) -> bool:
+        stamp = getattr(msg.header, "stamp", None)
+        if stamp is None or (int(stamp.sec) == 0 and int(stamp.nanosec) == 0):
+            return False
+        key = (int(stamp.sec), int(stamp.nanosec), int(msg.width), int(msg.height), int(msg.step))
+        if key == self.last_message_key:
+            return True
+        self.last_message_key = key
+        return False
 
     def _maybe_report_rate(self):
         now = time.monotonic()

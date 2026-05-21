@@ -1,4 +1,5 @@
-# Legacy JPEG WebRTC mode only.
+# Legacy JPEG WebRTC mode only. Bootstrap installs this file only when
+# WEBRTC_MEDIA_MODE=jpeg and HORUS_ALLOW_LEGACY_JPEG=1.
 # The default H.264/GStreamer path installs minimal signaling dependencies
 # from scripts/setup_webrtc.sh and does not require aiortc.
 aiortc>=1.9,<2
