@@ -7,18 +7,42 @@ ROLE_ARG="${1:-}"
 ROLE=""
 RUN_APT="${RUN_APT:-auto}"
 
+# ANSI color helpers
+RESET="\033[0m"
+BOLD="\033[1m"
+FG_GREEN="\033[38;5;48m"
+FG_YELLOW="\033[38;5;214m"
+FG_RED="\033[38;5;203m"
+FG_BLUE="\033[38;5;39m"
+FG_CYAN="\033[38;5;51m"
+FG_MUTED="\033[38;5;244m"
+
+log_success() {
+  echo -e "${FG_GREEN}OK${RESET}      $*"
+}
+log_info() {
+  echo -e "${FG_BLUE}Info${RESET}    $*"
+}
+log_warn() {
+  echo -e "${FG_YELLOW}Warning${RESET} $*"
+}
+log_error() {
+  echo -e "${FG_RED}Error${RESET}   $*" >&2
+}
+log_run() {
+  echo -e "${FG_CYAN}Run${RESET}     $*"
+}
+
 if [[ "${ROLE_ARG}" == "-h" || "${ROLE_ARG}" == "--help" ]]; then
-  cat <<'USAGE'
-Usage: scripts/bootstrap.sh [robot|machine|cloud|auto]
-
-Installs the local runtime pieces:
-  - Zenoh ROS 2 DDS bridge binary
-  - Python WebRTC dependencies
-  - GStreamer video encoder detection profile
-
-If passwordless sudo is unavailable, the script prints the apt command and
-continues with user-local setup.
-USAGE
+  echo -e "\n${BOLD}${FG_CYAN}HORUS Bootstrap${RESET}"
+  echo -e "${FG_MUTED}Prepare dependencies for robot, machine, or cloud roles${RESET}\n"
+  echo -e "${BOLD}Usage${RESET}"
+  echo -e "  ./scripts/bootstrap.sh ${FG_GREEN}[robot|machine|cloud|auto]${RESET}\n"
+  echo -e "${BOLD}What it prepares${RESET}"
+  echo -e "  - Zenoh ROS 2 DDS bridge binary or Docker fallback"
+  echo -e "  - Python WebRTC and GLib dependencies"
+  echo -e "  - GStreamer video path with hardware detection where available\n"
+  echo -e "${FG_MUTED}If passwordless sudo is unavailable, bootstrap prints the apt command and continues with user-local setup.${RESET}\n"
   exit 0
 fi
 
@@ -63,6 +87,10 @@ APT_BASE_PACKAGES=(
 APT_SIGNALING_PACKAGES=(
   python3-websocket
   python3-websockets
+)
+
+APT_CLOUD_TURN_PACKAGES=(
+  coturn
 )
 
 APT_MEDIA_COMMON_PACKAGES=(
@@ -124,6 +152,12 @@ append_intel_media_driver() {
   local -n packages_ref="$1"
   local package
 
+  if apt_package_installed intel-media-va-driver && [[ "${HORUS_INTEL_MEDIA_DRIVER:-free}" == "non-free" ]]; then
+    log_warn "intel-media-va-driver is already installed; keeping it to avoid a non-free driver conflict."
+    packages_ref+=(intel-media-va-driver)
+    return
+  fi
+
   for package in "${APT_INTEL_DRIVER_PACKAGES[@]}"; do
     if apt_package_installed "${package}"; then
       packages_ref+=("${package}")
@@ -153,12 +187,65 @@ append_intel_media_driver() {
   esac
 }
 
+dedupe_packages() {
+  local -n packages_ref="$1"
+  local deduped=()
+  local package seen exists
+  for package in "${packages_ref[@]}"; do
+    exists=0
+    for seen in "${deduped[@]}"; do
+      if [[ "${seen}" == "${package}" ]]; then
+        exists=1
+        break
+      fi
+    done
+    [[ "${exists}" == "0" ]] && deduped+=("${package}")
+  done
+  packages_ref=("${deduped[@]}")
+}
+
+filter_conflicting_packages() {
+  local -n packages_ref="$1"
+  local filtered=()
+  local package
+  local free_requested=0
+  local nonfree_requested=0
+  for package in "${packages_ref[@]}"; do
+    [[ "${package}" == "intel-media-va-driver" ]] && free_requested=1
+    [[ "${package}" == "intel-media-va-driver-non-free" ]] && nonfree_requested=1
+  done
+  if [[ "${free_requested}" == "1" && "${nonfree_requested}" == "1" ]]; then
+    local keep="intel-media-va-driver"
+    if apt_package_installed intel-media-va-driver-non-free; then
+      keep="intel-media-va-driver-non-free"
+    elif [[ "${HORUS_INTEL_MEDIA_DRIVER:-free}" == "non-free" ]] && ! apt_package_installed intel-media-va-driver; then
+      keep="intel-media-va-driver-non-free"
+    fi
+    log_warn "Both Intel VA drivers are available; selecting ${keep} to avoid apt conflicts."
+    for package in "${packages_ref[@]}"; do
+      case "${package}" in
+        intel-media-va-driver|intel-media-va-driver-non-free)
+          [[ "${package}" == "${keep}" ]] && filtered+=("${package}")
+          ;;
+        *)
+          filtered+=("${package}")
+          ;;
+      esac
+    done
+    packages_ref=("${filtered[@]}")
+  fi
+}
+
 build_apt_packages() {
   local -n output_ref="$1"
   output_ref=("${APT_BASE_PACKAGES[@]}")
   append_available_packages output_ref "${APT_SIGNALING_PACKAGES[@]}"
 
   if [[ "${ROLE}" == "cloud" ]]; then
+    if [[ "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
+      append_available_packages output_ref "${APT_CLOUD_TURN_PACKAGES[@]}"
+    fi
+    dedupe_packages output_ref
     return
   fi
 
@@ -172,6 +259,8 @@ build_apt_packages() {
   else
     append_available_packages output_ref "${APT_DRM_MEDIA_PACKAGES[@]}"
   fi
+  filter_conflicting_packages output_ref
+  dedupe_packages output_ref
 }
 
 run_apt() {
@@ -180,28 +269,41 @@ run_apt() {
   fi
 
   local packages=()
+  apt_update() {
+    local runner=("$@")
+    if ! "${runner[@]}" apt-get -o Acquire::ForceIPv4=true update; then
+      log_warn "apt-get update failed. Continuing with the existing package cache."
+      log_warn "If package installation fails, fix the broken apt source shown above and rerun bootstrap."
+      return 0
+    fi
+  }
+
+  apt_install() {
+    local runner=("$@")
+    "${runner[@]}" apt-get install -y "${packages[@]}"
+  }
 
   if [[ "$(id -u)" -eq 0 ]]; then
-    apt-get update
+    apt_update
     build_apt_packages packages
-    apt-get install -y "${packages[@]}"
+    apt_install
   elif sudo -n true >/dev/null 2>&1; then
-    sudo apt-get update
+    apt_update sudo
     build_apt_packages packages
-    sudo apt-get install -y "${packages[@]}"
+    apt_install sudo
   elif [[ -t 0 ]] && have sudo; then
-    echo "Bootstrap needs sudo to install system packages."
+    log_warn "Bootstrap needs sudo to install system packages."
     sudo -v
-    sudo apt-get update
+    apt_update sudo
     build_apt_packages packages
-    sudo apt-get install -y "${packages[@]}"
+    apt_install sudo
   else
     local install_cmd
     build_apt_packages packages
     printf -v install_cmd ' %q' "${packages[@]}"
-    install_cmd="sudo apt-get update && sudo apt-get install -y${install_cmd}"
-    echo "No passwordless sudo. Run this once if packages are missing:"
-    echo "${install_cmd}"
+    install_cmd="sudo apt-get -o Acquire::ForceIPv4=true update; sudo apt-get install -y${install_cmd}"
+    log_warn "No passwordless sudo. Run this once if packages are missing:"
+    echo -e "  ${FG_CYAN}${install_cmd}${RESET}"
   fi
 }
 
@@ -211,13 +313,23 @@ check_ros2_runtime() {
   fi
 
   local distro="${ROS_DISTRO:-jazzy}"
+  if [[ -n "${ROS_SETUP_PATH:-}" ]]; then
+    local setup_path="${ROS_SETUP_PATH/#\~/${HOME}}"
+    if [[ -f "${setup_path}" ]]; then
+      return
+    fi
+    log_error "ROS_SETUP_PATH is set but the file does not exist: ${ROS_SETUP_PATH}"
+    log_warn "Run ./horus setup again and provide the correct setup.bash/local_setup.bash path."
+    return 1
+  fi
+
   if [[ -f "/opt/ros/${distro}/setup.bash" || -f "/opt/ros/${distro}/local_setup.bash" ]]; then
     return
   fi
 
-  echo "ROS 2 setup file not found for ROS_DISTRO=${distro}." >&2
-  echo "Install ROS 2 on this robot/machine, or set ROS_DISTRO to the installed ROS 2 distro before bootstrap." >&2
-  echo "Expected: /opt/ros/${distro}/setup.bash" >&2
+  log_error "ROS 2 setup file not found for ROS_DISTRO=${distro}."
+  log_warn "Install ROS 2 on this robot/machine, or set ROS_SETUP_PATH to the setup file from the ROS install/workspace."
+  log_warn "Expected: /opt/ros/${distro}/setup.bash"
   return 1
 }
 
@@ -255,15 +367,15 @@ install_zenoh() {
   zip="${ROOT}/zenoh-plugin-ros2dds-${version}-${target}-standalone.zip"
   url="https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases/download/${version}/zenoh-plugin-ros2dds-${version}-${target}-standalone.zip"
 
-  echo "Zenoh bridge target: ${version} (${target})"
+  log_info "Zenoh bridge target: ${version} (${target})"
   if [[ -x "${ROOT}/zenoh-bridge-ros2dds" ]] && "${ROOT}/zenoh-bridge-ros2dds" --version 2>/dev/null | grep -q "${version}"; then
     write_zenoh_profile "binary" "" "eclipse/zenoh-bridge-ros2dds:${version}" ""
-    echo "Zenoh bridge already installed."
+    log_success "Zenoh bridge already installed."
     return
   fi
 
   if ! have curl || ! have unzip; then
-    echo "curl/unzip missing; cannot install Zenoh automatically." >&2
+    log_error "curl/unzip missing; cannot install Zenoh automatically."
     return 1
   fi
 
@@ -283,9 +395,9 @@ install_zenoh() {
     return
   fi
 
-  echo "Zenoh bridge binary is not usable on this host:" >&2
-  echo "${error}" >&2
-  echo "Install Docker or use a newer OS/JetPack with glibc >= 2.28." >&2
+  log_error "Zenoh bridge binary is not usable on this host:"
+  echo -e "${FG_RED}${error}${RESET}"
+  log_warn "Install Docker or use a newer OS/JetPack with glibc >= 2.28."
   return 1
 }
 
@@ -337,8 +449,8 @@ configure_zenoh_docker_fallback() {
     return 1
   fi
 
-  echo "Zenoh binary is not compatible with this host; using Docker fallback."
-  echo "Binary error: ${error//$'\n'/ }"
+  log_warn "Zenoh binary is not compatible with this host; using Docker fallback."
+  log_warn "Binary error: ${error//$'\n'/ }"
   if [[ "${mode}" == "sudo" ]]; then
     if ! sudo -n docker pull "${image}"; then
       image="eclipse/zenoh-bridge-ros2dds:latest"
@@ -347,9 +459,9 @@ configure_zenoh_docker_fallback() {
     write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using Docker fallback. Add the user to the docker group for passwordless launches."
   elif [[ "${mode}" == "sudo-unverified" ]]; then
     write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using sudo Docker fallback. Run sudo -v before launch, or add the user to the docker group."
-    echo "Docker is installed but needs sudo. Configured sudo Docker fallback."
-    echo "Before launch, run: sudo -v"
-    echo "If the image is not cached yet, run: sudo docker pull ${image}"
+    log_info "Docker is installed but needs sudo. Configured sudo Docker fallback."
+    log_info "Before launch, run: sudo -v"
+    log_info "If the image is not cached yet, run: sudo docker pull ${image}"
   else
     if ! docker pull "${image}"; then
       image="eclipse/zenoh-bridge-ros2dds:latest"
@@ -357,14 +469,14 @@ configure_zenoh_docker_fallback() {
     fi
     write_zenoh_profile "docker" "0" "${image}" "Host binary incompatible; using Docker fallback."
   fi
-  echo "Configured Zenoh Docker fallback: ${image}"
+  log_success "Configured Zenoh Docker fallback: ${image}"
   return 0
 }
 
 cd "${ROOT}"
 if [[ ! -f .env ]]; then
   cp .env.example .env
-  echo "Created .env from .env.example. Edit it before launch."
+  log_success "Created new config: ${BOLD}.env${RESET} (from .env.example)"
 fi
 
 set -a
@@ -385,27 +497,32 @@ fi
 case "${ROLE}" in
   robot|machine|cloud) ;;
   *)
-    echo "Unknown role: ${ROLE}" >&2
-    echo "Use robot, machine, cloud, or auto." >&2
+    log_error "Unknown role: ${ROLE}"
+    log_warn "Supported roles: robot, machine, cloud, auto"
     exit 2
     ;;
 esac
 
-echo "Bootstrap role: ${ROLE}"
-echo "Machine: $(machine_kind) $(uname -m) $(hardware_kind)"
+echo -e "\n${BOLD}${FG_CYAN}HORUS Bootstrap${RESET}"
+echo -e "  role       ${ROLE}"
+echo -e "  machine    $(machine_kind) ($(uname -m), $(hardware_kind))"
+echo ""
 
 check_ros2_runtime
 run_apt
+if [[ "${ROLE}" == "cloud" && "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
+  "${SCRIPT_DIR}/setup_turn.sh"
+fi
 install_zenoh
 "${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}"
 if [[ "${ROLE}" == "cloud" ]]; then
-  echo "Cloud role: skipping media hardware detection; hub mode relays signaling only."
+  log_info "Cloud role: skipping media hardware detection; hub mode relays signaling only."
 else
   "${SCRIPT_DIR}/detect_video_stack.sh" --role "${ROLE}" --out "${ROOT}/.webrtc_profile.env"
 fi
 
-echo
-echo "Bootstrap complete."
-echo "Next:"
-echo "  edit .env"
-echo "  ./horus launch ${ROLE}"
+echo ""
+log_success "Bootstrap complete."
+echo -e "${BOLD}Next commands${RESET}"
+echo -e "  ${FG_CYAN}./horus setup${RESET}        ${FG_MUTED}optional, to review configuration${RESET}"
+echo -e "  ${FG_CYAN}./horus launch ${ROLE}${RESET}\n"
