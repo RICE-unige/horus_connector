@@ -19,7 +19,7 @@
 - WebRTC carries camera traffic as H.264. The robot subscribes to a ROS 2 raw image topic, encodes it, and the machine decodes it back into a ROS 2 image topic.
 - WebRTC `cmd-vel` DataChannel carries robot control commands such as `/cmd_vel`.
 
-`config/zenoh_split.json5` intentionally keeps cameras and `/cmd_vel` out of Zenoh. The decoded WebRTC image is published only on the machine-side ROS 2 graph unless you explicitly bridge that topic elsewhere.
+The role-specific Zenoh configs intentionally keep cameras and `/cmd_vel` out of Zenoh. Robots export state, machines import state, and the cloud only routes Zenoh traffic. The decoded WebRTC image is published only on the machine-side ROS 2 graph unless you explicitly bridge that topic elsewhere.
 
 ## Benchmark
 
@@ -50,10 +50,11 @@ In hub mode, the cloud does not encode or decode camera streams. It only routes 
 
 ```bash
 cd ~/horus_connector
-./horus init
-nano .env
+./horus setup
 ./horus bootstrap robot     # or machine/cloud
 ```
+
+`./horus setup` asks for the role, topology, room name, cloud or VPN address, `ROS_DOMAIN_ID`, and camera profile. It auto-detects the local ROS 2 distro and setup file when possible, including source-built installs, then writes `.env` with a backup if one already exists.
 
 Bootstrap installs/probes Zenoh, GStreamer WebRTC, `gstreamer1.0-nice`, and a stable H.264 encoder/decoder profile on `robot` and `machine`. The `cloud` role installs only Zenoh plus signaling dependencies and skips media packages/hardware probing.
 
@@ -64,8 +65,7 @@ Each machine normally only needs:
 ```bash
 git clone <repo-url>
 cd horus_connector
-./horus init
-nano .env
+./horus setup
 ./horus bootstrap robot     # robot-side system
 ./horus bootstrap machine   # operator-side system
 ```
@@ -90,25 +90,49 @@ Supported hardware paths:
 
 Older JetPack 4 systems may not expose WebRTC DataChannel support in GStreamer 1.14. In that case H.264 camera streaming still works, but `/cmd_vel` over WebRTC requires a newer JetPack/GStreamer stack or a ROS/Zenoh fallback.
 
+For NAT-heavy hub deployments, enable TURN on the cloud:
+
+```bash
+HORUS_CLOUD_RUN_TURN=1
+TURN_USER=horus
+TURN_PASSWORD=<password>
+WEBRTC_ICE_SERVERS=stun:stun.l.google.com:19302,turn://horus:<password>@<cloud-ip-or-dns>:3478
+```
+
+Then rerun `./horus bootstrap cloud`. The cloud still relays only signaling and TURN media packets; video encoding/decoding remains on robot and machine endpoints.
+
 Required `.env` values:
 
 ```bash
 HORUS_ROLE=robot            # robot | machine | cloud
-HORUS_ROOM=robot1           # one room per robot-machine pair
+HORUS_ROOM=robot-a          # one room per robot-machine pair
 HORUS_TOPOLOGY=hub          # hub | direct
-HORUS_CLOUD_IP=34.6.77.21   # hub mode
+HORUS_CLOUD_IP=203.0.113.10 # hub public IP or DNS
 HORUS_MACHINE_IP=           # direct mode or direct WebRTC target
-ZENOH_NAMESPACE=/robot1     # unique per robot
+ZENOH_NAMESPACE=/robot-a    # unique per robot
+ZENOH_CONFIG=auto           # selects robot/machine/cloud Zenoh profile
 ROS_DISTRO=jazzy
+ROS_DOMAIN_ID=0
+ROS_SETUP_PATH=             # optional path for source-built/non-/opt ROS installs
 ROS_LOCALHOST_ONLY=1
 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 ROS_CMD_TOPIC=/cmd_vel
 WEBRTC_ROS_IMAGE_INPUT_TOPIC=/camera/image_raw
 WEBRTC_ROS_IMAGE_OUTPUT_TOPIC=/camera/webrtc/image_raw
+WEBRTC_ROS_IMAGE_QOS=auto
 WEBRTC_H264_KEY_INT_MAX=10
+WEBRTC_CMD_WATCHDOG_TIMEOUT=0.3
+WEBRTC_CMD_RATE_LIMIT_HZ=100.0
 ```
 
 Set `ROS_DISTRO` to the ROS 2 distro actually installed on the machine, for example `humble` or `jazzy`.
+
+Manual setup is still available:
+
+```bash
+./horus init
+nano .env
+```
 
 Camera path:
 
@@ -119,6 +143,8 @@ robot ROS 2 Image -> WebRTC H.264 -> machine ROS 2 Image
 Set `WEBRTC_VIDEO_SOURCE=ros2` on the robot and `WEBRTC_VIDEO_OUTPUT=ros2` on the machine. Use `WEBRTC_VIDEO_OUTPUT=both` if the machine should also open a local GStreamer video sink.
 
 ## Launch
+
+`./horus launch <role>` starts the services and opens the live connector console in an interactive terminal. Use `--no-monitor` or `HORUS_LAUNCH_MONITOR=0` for headless starts.
 
 Hub mode:
 
@@ -147,17 +173,38 @@ Operations:
 
 ```bash
 ./horus status
-./horus monitor        # live connection console
+./horus status --json
+./horus monitor        # open the live connection console again
+./horus metrics --port 9418
 ./horus logs zenoh
 ./horus logs webrtc
 ./horus stop
 ```
 
+Synthetic integration data:
+
+```bash
+./horus fake-data robot-a
+```
+
+`WEBRTC_ROS_IMAGE_QOS=auto` is the recommended camera setting. It accepts both normal reliable image publishers and sensor-data best-effort publishers.
+The fake-data publisher defaults to reliable local image QoS and `FAKE_FRAME_CACHE=30` so high-resolution validation streams do not get limited by local DDS fragmentation or image generation.
+
+Fleet receiver launch on one machine:
+
+```bash
+./horus fleet launch config/fleet.example.json --role machine
+./horus fleet status config/fleet.example.json
+./horus fleet stop config/fleet.example.json
+```
+
+Fleet machine mode starts one shared Zenoh bridge and one WebRTC receiver per room.
+
 ## Network
 
 - Zenoh: TCP `7447`.
 - WebRTC signaling relay: TCP `8765`.
-- WebRTC media/control: UDP/ICE end-to-end, or configure TURN with `WEBRTC_ICE_SERVERS`.
+- WebRTC media/control: UDP/ICE end-to-end. TURN uses TCP/UDP `3478` plus the configured relay port range.
 
 Runtime files are written to `.run/` and are ignored by git.
 
@@ -167,14 +214,14 @@ Run `./scripts/gst_h264_smoke_test.sh` after bootstrap to confirm the selected e
 
 For questions or support:
 
-Omotoye Shamsudeen Adekoya  
+Omotoye Shamsudeen Adekoya
 Email: omotoye.adekoya@edu.unige.it
 
 ## Acknowledgments
 
 This project is part of PhD research at the University of Genoa, under the supervision of:
 
-Prof. Carmine Recchiuto  
+Prof. Carmine Recchiuto
 Prof. Antonio Sgorbissa
 
 Developed by RICE Lab, University of Genoa.
