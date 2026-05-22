@@ -129,6 +129,25 @@ class JsonSignaling:
         self.send_lock = threading.Lock()
         self.pending: queue.Queue[str] = queue.Queue()
 
+    @staticmethod
+    def _log_control_message(message):
+        kind = message.get("type")
+        if kind == "register":
+            print(
+                f"WebRTC peer registered: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
+                flush=True,
+            )
+        elif kind == "peer-ready":
+            print(
+                f"WebRTC peer ready: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
+                flush=True,
+            )
+        elif kind == "peer-left":
+            print(
+                f"WebRTC peer left: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
+                flush=True,
+            )
+
     def send(self, payload: dict):
         text = json.dumps(payload, separators=(",", ":"))
         if not self.connected.wait(timeout=30):
@@ -151,11 +170,7 @@ class JsonSignaling:
             for text in self.ws:
                 try:
                     message = json.loads(text)
-                    if message.get("type") == "register":
-                        print(
-                            f"WebRTC peer registered: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
-                            flush=True,
-                        )
+                    self._log_control_message(message)
                     self.on_message(message)
                 except Exception as exc:
                     print(f"ignoring signaling message: {exc}", flush=True)
@@ -213,11 +228,7 @@ class ClientSignaling(JsonSignaling):
                     break
                 try:
                     message = json.loads(text)
-                    if message.get("type") == "register":
-                        print(
-                            f"WebRTC peer registered: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
-                            flush=True,
-                        )
+                    self._log_control_message(message)
                     self.on_message(message)
                 except Exception as exc:
                     print(f"ignoring signaling message: {exc}", flush=True)

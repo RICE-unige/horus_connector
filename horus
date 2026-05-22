@@ -767,7 +767,8 @@ launch_signal_relay() {
   py="$(signal_python_bin)"
   start_bg signal "${py}" "${ROOT}/scripts/webrtc_signal_relay.py" \
     --host 0.0.0.0 \
-    --port "${WEBRTC_SIGNAL_PORT:-8765}"
+    --port "${WEBRTC_SIGNAL_PORT:-8765}" \
+    --state-file "${RUN_DIR}/signal_members.json"
 }
 
 launch_metrics() {
@@ -951,6 +952,7 @@ case "${cmd}" in
 
     stop_one_styled webrtc
     stop_one_styled signal
+    rm -f "${RUN_DIR}/signal_members.json"
     stop_one_styled metrics
     stop_one_styled fake-data
 

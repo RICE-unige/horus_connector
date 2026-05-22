@@ -42,6 +42,13 @@ BG = {
     "muted": "\033[48;5;236m",
 }
 
+MONITOR_ROS_NODES = {"/horus_monitor_topic_probe"}
+ROLE_SUMMARIES = {
+    "robot": "robot endpoint - sends camera/state, receives cmd_vel",
+    "machine": "machine endpoint - receives camera/state, sends cmd_vel",
+    "cloud": "cloud hub - routes Zenoh and WebRTC signaling",
+}
+
 
 @dataclass
 class ProcessState:
@@ -190,17 +197,128 @@ def unique_matches(lines: Iterable[str], pattern: str, limit: int = 6) -> List[s
     return seen[-limit:]
 
 
-def webrtc_registrations(lines: Iterable[str], limit: int = 8) -> List[str]:
-    seen: List[str] = []
-    regex = re.compile(r"WebRTC peer registered:\s*role=([a-z]+)\s+room=([\w.-]+)")
+def add_active(values: List[str], value: str):
+    if value not in values:
+        values.append(value)
+
+
+def remove_active(values: List[str], value: str):
+    try:
+        values.remove(value)
+    except ValueError:
+        pass
+
+
+def active_bridge_members(lines: Iterable[str], limit: int = 12) -> List[str]:
+    active: List[str] = []
+    join_regex = re.compile(r"New ROS 2 bridge detected:\s*([0-9A-Fa-f]+)")
+    left_regex = re.compile(r"Remote ROS 2 bridge left:\s*([0-9A-Fa-f]+)")
     for line in lines:
-        match = regex.search(line)
-        if not match:
+        joined = join_regex.search(line)
+        if joined:
+            add_active(active, joined.group(1))
+        left = left_regex.search(line)
+        if left:
+            remove_active(active, left.group(1))
+    return active[-limit:]
+
+
+def active_ros_nodes(lines: Iterable[str], limit: int = 8) -> List[str]:
+    active: List[str] = []
+    discovered_regex = re.compile(r"Discovered ROS Node\s+([/\w.-]+)")
+    undiscovered_regex = re.compile(r"Undiscovered ROS Node\s+([/\w.-]+)")
+    for line in lines:
+        discovered = discovered_regex.search(line)
+        if discovered:
+            node = discovered.group(1)
+            if node not in MONITOR_ROS_NODES:
+                add_active(active, node)
+        undiscovered = undiscovered_regex.search(line)
+        if undiscovered:
+            remove_active(active, undiscovered.group(1))
+    return active[-limit:]
+
+
+def active_signal_members(lines: Iterable[str], limit: int = 16) -> List[str]:
+    active: List[str] = []
+    registered_regex = re.compile(r"\bregistered role=([a-z]+) room=([\w.-]+)")
+    unregistered_regex = re.compile(r"\bunregistered role=([a-z]+) room=([\w.-]+)")
+    for line in lines:
+        unregistered = unregistered_regex.search(line)
+        if unregistered:
+            remove_active(active, f"{unregistered.group(1)}:{unregistered.group(2)}")
             continue
-        value = f"{match.group(1)}:{match.group(2)}"
-        if value not in seen:
-            seen.append(value)
-    return seen[-limit:]
+        registered = registered_regex.search(line)
+        if registered:
+            add_active(active, f"{registered.group(1)}:{registered.group(2)}")
+    return active[-limit:]
+
+
+def load_signal_members_state(path: Path, limit: int = 16) -> List[str]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    members: List[str] = []
+    for peer in payload.get("peers", []):
+        if not isinstance(peer, dict):
+            continue
+        role = str(peer.get("role", "")).strip()
+        room = str(peer.get("room", "")).strip()
+        if role and room:
+            add_active(members, f"{role}:{room}")
+    return members[-limit:]
+
+
+def webrtc_registrations(lines: Iterable[str], limit: int = 8) -> List[str]:
+    active: List[str] = []
+    connected_regex = re.compile(r"WebRTC peer (?:registered|ready):\s*role=([a-z]+)\s+room=([\w.-]+)")
+    left_regex = re.compile(r"WebRTC peer left:\s*role=([a-z]+)\s+room=([\w.-]+)")
+    for line in lines:
+        left = left_regex.search(line)
+        if left:
+            remove_active(active, f"{left.group(1)}:{left.group(2)}")
+            continue
+        match = connected_regex.search(line)
+        if match:
+            add_active(active, f"{match.group(1)}:{match.group(2)}")
+            continue
+        if "WebRTC signaling disconnected" in line or "WebRTC signaling peer disconnected" in line:
+            active.clear()
+    return active[-limit:]
+
+
+def active_webrtc_peers(lines: Iterable[str], limit: int = 8) -> List[str]:
+    active: List[str] = []
+    connected_regex = re.compile(r"WebRTC signaling peer connected:\s*(.+)")
+    disconnected_regex = re.compile(r"WebRTC signaling peer disconnected:\s*(.+)")
+    for line in lines:
+        connected = connected_regex.search(line)
+        if connected:
+            add_active(active, connected.group(1).strip())
+            continue
+        disconnected = disconnected_regex.search(line)
+        if disconnected:
+            remove_active(active, disconnected.group(1).strip())
+            continue
+        if "WebRTC signaling disconnected" in line:
+            active.clear()
+    return active[-limit:]
+
+
+def active_webrtc_clients(lines: Iterable[str], limit: int = 8) -> List[str]:
+    active: List[str] = []
+    connected_regex = re.compile(r"WebRTC signaling connected:\s*(.+)")
+    for line in lines:
+        connected = connected_regex.search(line)
+        if connected:
+            active = [connected.group(1).strip()]
+            continue
+        if "WebRTC signaling disconnected" in line or "signaling reconnect after error" in line:
+            active.clear()
+    return active[-limit:]
 
 
 def tcp_open(host: str, port: int, timeout: float = 0.35) -> Optional[bool]:
@@ -339,23 +457,20 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
         for name in ("zenoh", "webrtc", "signal")
     }
     logs = {
-        "zenoh": tail(run_dir / "zenoh.log"),
-        "webrtc": tail(run_dir / "webrtc.log"),
-        "signal": tail(run_dir / "signal.log"),
+        "zenoh": tail(run_dir / "zenoh.log", lines=2000),
+        "webrtc": tail(run_dir / "webrtc.log", lines=1000),
+        "signal": tail(run_dir / "signal.log", lines=1000),
     }
     listeners = local_listeners([zenoh_port, signal_port])
     topics = ros_topics(env, root, cache, force_refresh)
 
-    bridge_members = unique_matches(logs["zenoh"], r"New ROS 2 bridge detected:\s*([0-9A-Fa-f]+)")
-    ros_nodes = unique_matches(logs["zenoh"], r"Discovered ROS Node\s+([/\w.-]+)", limit=8)
-    signal_members = []
-    for line_item in logs["signal"]:
-        match = re.search(r"registered role=([a-z]+) room=([\w.-]+)", line_item)
-        if match:
-            signal_members.append(f"{match.group(1)}:{match.group(2)}")
-    signal_members = list(dict.fromkeys(signal_members))[-8:]
-    webrtc_peers = unique_matches(logs["webrtc"], r"WebRTC signaling peer connected:\s*([^ ]+)", limit=8)
-    webrtc_clients = unique_matches(logs["webrtc"], r"WebRTC signaling connected:\s*(.+)", limit=8)
+    bridge_members = active_bridge_members(logs["zenoh"])
+    ros_nodes = active_ros_nodes(logs["zenoh"], limit=8)
+    signal = processes["signal"]
+    signal_state = load_signal_members_state(run_dir / "signal_members.json") if signal.running else []
+    signal_members = signal_state or active_signal_members(logs["signal"])
+    webrtc_peers = active_webrtc_peers(logs["webrtc"], limit=8)
+    webrtc_clients = active_webrtc_clients(logs["webrtc"], limit=8)
     webrtc_registered = webrtc_registrations(logs["webrtc"])
 
     ips = local_ips()
@@ -621,7 +736,7 @@ def render(state: Dict[str, object], args: argparse.Namespace, show_help: bool, 
     if show_members:
         out.append("")
         out.append(section("members", use_color))
-        for line_item in member_lines(state, logs):
+        for line_item in member_lines(state, logs, use_color):
             out.append("  " + truncate(line_item, width - 2))
 
     if show_ros:
@@ -687,15 +802,17 @@ def route_detail(state: Dict[str, object], env: Dict[str, str]) -> str:
     ports: Dict[str, int] = state["ports"]  # type: ignore[assignment]
     listeners: Dict[int, str] = state["listeners"]  # type: ignore[assignment]
     target_ports: Dict[int, Optional[bool]] = state["target_ports"]  # type: ignore[assignment]
+    processes: Dict[str, ProcessState] = state["processes"]  # type: ignore[assignment]
     role = str(state["role"])
     topology = str(state["topology"])
     if role == "cloud" or (topology == "direct" and role == "machine"):
-        zenoh = "listening" if ports["zenoh"] in listeners else "closed"
-        webrtc = "listening" if ports["signal"] in listeners else "closed"
+        zenoh = "listening" if processes["zenoh"].running and ports["zenoh"] in listeners else "stopped"
+        webrtc_process = processes["signal"] if role == "cloud" else processes["webrtc"]
+        webrtc = "listening" if webrtc_process.running and ports["signal"] in listeners else "stopped"
     else:
-        zenoh = "open" if target_ports.get(ports["zenoh"]) is True else "closed"
-        signal = target_ports.get(ports["signal"])
-        webrtc = "connected" if signal is True else "reconnecting" if signal is False else "unknown"
+        zenoh = "stopped" if not processes["zenoh"].running else "open" if target_ports.get(ports["zenoh"]) is True else "closed"
+        signal = target_ports.get(ports["signal"]) if processes["webrtc"].running else None
+        webrtc = "connected" if signal is True else "reconnecting" if signal is False else "stopped"
     return (
         f"zenoh tcp/{ports['zenoh']} {zenoh}   "
         f"webrtc ws/{ports['signal']} {webrtc}   "
@@ -739,6 +856,10 @@ def connection_focus(state: Dict[str, object], logs: Dict[str, List[str]], env: 
 
 
 def named_zenoh_members(state: Dict[str, object]) -> List[str]:
+    processes: Dict[str, ProcessState] = state["processes"]  # type: ignore[assignment]
+    zenoh_proc = processes.get("zenoh")
+    if zenoh_proc and not zenoh_proc.running:
+        return []
     bridge_members: List[str] = state["bridge_members"]  # type: ignore[assignment]
     if not bridge_members:
         return []
@@ -763,6 +884,15 @@ def named_webrtc_members(state: Dict[str, object], logs: Dict[str, List[str]]) -
     role = str(state["role"])
     topology = str(state["topology"])
     room = env.get("HORUS_ROOM", "default")
+    processes: Dict[str, ProcessState] = state["processes"]  # type: ignore[assignment]
+    if role == "cloud":
+        signal_proc = processes.get("signal")
+        if signal_proc and not signal_proc.running:
+            return []
+    else:
+        webrtc_proc = processes.get("webrtc")
+        if webrtc_proc and not webrtc_proc.running:
+            return []
     registered: List[str] = state["webrtc_registrations"]  # type: ignore[assignment]
     peers: List[str] = state["webrtc_peers"]  # type: ignore[assignment]
     clients: List[str] = state["webrtc_clients"]  # type: ignore[assignment]
@@ -782,7 +912,60 @@ def named_webrtc_members(state: Dict[str, object], logs: Dict[str, List[str]]) -
     return []
 
 
-def member_lines(state: Dict[str, object], logs: Dict[str, List[str]]) -> List[str]:
+def group_role_members(members: Sequence[str]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {"robot": [], "machine": []}
+    for member in members:
+        if ":" not in member:
+            continue
+        role, room = member.split(":", 1)
+        if role not in grouped:
+            grouped[role] = []
+        add_active(grouped[role], room)
+    return grouped
+
+
+def room_presence(members: Sequence[str]) -> List[str]:
+    rooms: Dict[str, List[str]] = {}
+    for member in members:
+        if ":" not in member:
+            continue
+        role, room = member.split(":", 1)
+        rooms.setdefault(room, [])
+        add_active(rooms[room], role)
+    output = []
+    for room in sorted(rooms):
+        roles = rooms[room]
+        if "robot" in roles and "machine" in roles:
+            output.append(f"{room}: robot + machine")
+        else:
+            output.append(f"{room}: " + " + ".join(sorted(roles)))
+    return output
+
+
+def endpoint_lines(state: Dict[str, object], use_color: bool) -> List[str]:
+    env: Dict[str, str] = state["env"]  # type: ignore[assignment]
+    role = str(state["role"])
+    room = env.get("HORUS_ROOM", "default")
+    ip = str(state["local_route_ip"])
+    label = ROLE_SUMMARIES.get(role, f"{role} endpoint")
+    lines = [f"this    {style(role, BOLD, use_color)}:{room} @ {ip}  {color(label, 'muted', use_color)}"]
+    signal_members: List[str] = state["signal_members"]  # type: ignore[assignment]
+    if role == "cloud":
+        grouped = group_role_members(signal_members)
+        robots = ", ".join(grouped.get("robot", [])) or "none"
+        machines = ", ".join(grouped.get("machine", [])) or "none"
+        lines.append(f"users   robots {robots}   machines {machines}")
+        rooms = room_presence(signal_members)
+        lines.append("rooms   " + (", ".join(rooms) if rooms else "waiting for robot and machine endpoints"))
+    else:
+        webrtc_names: List[str] = state["webrtc_registrations"]  # type: ignore[assignment]
+        peer_type = "machine" if role == "robot" else "robot"
+        peer = ", ".join(webrtc_names) if webrtc_names else f"no {peer_type} peer yet"
+        lines.append(f"users   local {role}:{room}   remote {peer}")
+    return lines
+
+
+def member_lines(state: Dict[str, object], logs: Dict[str, List[str]], use_color: bool = False) -> List[str]:
     lines: List[str] = []
     processes: Dict[str, ProcessState] = state["processes"]  # type: ignore[assignment]
     zenoh_names = named_zenoh_members(state)
@@ -790,6 +973,8 @@ def member_lines(state: Dict[str, object], logs: Dict[str, List[str]]) -> List[s
     zenoh_proc = processes.get("zenoh")
     webrtc_proc = processes.get("webrtc")
     signal_proc = processes.get("signal")
+
+    lines.extend(endpoint_lines(state, use_color))
 
     if zenoh_proc and not zenoh_proc.running:
         lines.append("zenoh   service stopped")
@@ -858,15 +1043,21 @@ def infer_webrtc_peer(lines: List[str]) -> str:
 def recent_events(logs: Dict[str, List[str]]) -> List[str]:
     markers = [
         "New ROS 2 bridge detected",
+        "Remote ROS 2 bridge left",
         "Discovered ROS Node",
+        "Undiscovered ROS Node",
         "Unable to connect",
         "Failed to start",
         "WebRTC signaling listening",
         "WebRTC signaling connected",
         "WebRTC signaling peer connected",
+        "WebRTC signaling peer disconnected",
         "WebRTC signaling disconnected",
         "WebRTC peer registered",
+        "WebRTC peer ready",
+        "WebRTC peer left",
         "registered role=",
+        "unregistered role=",
         "DataChannel received",
         "cmd-vel DataChannel open",
         "Incoming RTP video",
@@ -908,17 +1099,34 @@ def format_event(name: str, line_item: str) -> str:
     bridge = re.search(r"New ROS 2 bridge detected:\s*([0-9A-Fa-f]+)", line_item)
     if bridge:
         return f"{name}: ROS bridge peer connected"
+    bridge_left = re.search(r"Remote ROS 2 bridge left:\s*([0-9A-Fa-f]+)", line_item)
+    if bridge_left:
+        return f"{name}: ROS bridge peer left"
     node = re.search(r"Discovered ROS Node\s+([/\w.-]+)", line_item)
     if node:
-        if "_ros2cli_daemon" in node.group(1):
+        if "_ros2cli_daemon" in node.group(1) or node.group(1) in MONITOR_ROS_NODES:
             return ""
         return f"{name}: ROS node {node.group(1)} discovered"
-    registered = re.search(r"registered role=([a-z]+) room=([\w.-]+)", line_item)
+    node_left = re.search(r"Undiscovered ROS Node\s+([/\w.-]+)", line_item)
+    if node_left:
+        if "_ros2cli_daemon" in node_left.group(1) or node_left.group(1) in MONITOR_ROS_NODES:
+            return ""
+        return f"{name}: ROS node {node_left.group(1)} left"
+    unregistered = re.search(r"\bunregistered role=([a-z]+) room=([\w.-]+)", line_item)
+    if unregistered:
+        return f"{name}: {unregistered.group(1)} left room {unregistered.group(2)}"
+    registered = re.search(r"\bregistered role=([a-z]+) room=([\w.-]+)", line_item)
     if registered:
         return f"{name}: {registered.group(1)} joined room {registered.group(2)}"
     direct_registered = re.search(r"WebRTC peer registered:\s*role=([a-z]+)\s+room=([\w.-]+)", line_item)
     if direct_registered:
         return f"webrtc: {direct_registered.group(1)}:{direct_registered.group(2)} registered"
+    peer_ready = re.search(r"WebRTC peer ready:\s*role=([a-z]+)\s+room=([\w.-]+)", line_item)
+    if peer_ready:
+        return f"webrtc: {peer_ready.group(1)}:{peer_ready.group(2)} ready"
+    peer_left = re.search(r"WebRTC peer left:\s*role=([a-z]+)\s+room=([\w.-]+)", line_item)
+    if peer_left:
+        return f"webrtc: {peer_left.group(1)}:{peer_left.group(2)} left"
     if "WebRTC signaling listening" in line_item:
         return "webrtc: signaling listener is ready"
     if "WebRTC signaling connected:" in line_item:
@@ -926,6 +1134,9 @@ def format_event(name: str, line_item: str) -> str:
     if "WebRTC signaling peer connected:" in line_item:
         peer = line_item.split("WebRTC signaling peer connected:", 1)[-1].strip()
         return f"webrtc: peer connected from {peer}"
+    if "WebRTC signaling peer disconnected:" in line_item:
+        peer = line_item.split("WebRTC signaling peer disconnected:", 1)[-1].strip()
+        return f"webrtc: peer disconnected from {peer}"
     if "WebRTC signaling disconnected" in line_item:
         return "webrtc: signaling disconnected"
     if "Incoming RTP video" in line_item:
@@ -1057,6 +1268,7 @@ def status_snapshot(state: Dict[str, object]) -> Dict[str, object]:
     return {
         "updated_at": state.get("updated_at"),
         "role": state.get("role"),
+        "role_summary": ROLE_SUMMARIES.get(str(state.get("role")), ""),
         "topology": state.get("topology"),
         "room": env.get("HORUS_ROOM", "default"),
         "ros": {
@@ -1090,6 +1302,7 @@ def status_snapshot(state: Dict[str, object]) -> Dict[str, object]:
             "webrtc": named_webrtc_members(state, state["logs"]),  # type: ignore[arg-type]
             "signal": state.get("signal_members", []),
         },
+        "presence": room_presence(state.get("signal_members", [])),  # type: ignore[arg-type]
         "topics": state.get("topics", []),
     }
 
