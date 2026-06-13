@@ -33,7 +33,7 @@ Use `./horus setup` for normal configuration. Edit `.env` directly only when you
 | `ZENOH_PORT` | Zenoh TCP port. Default: `7447`. |
 | `ZENOH_VERSION` | Bridge version installed by bootstrap. |
 | `ZENOH_CONFIG` | `auto` selects the role config, or set a custom JSON5 path. |
-| `ZENOH_NAMESPACE` | Optional namespace for robot topics, for example `/robot-a`. |
+| `ZENOH_NAMESPACE` | Optional namespace for robot topics, for example `/robot_a`. |
 | `HORUS_ZENOH_ENABLED` | Set `0` to disable Zenoh for a run. |
 
 Role configs:
@@ -79,6 +79,8 @@ Zenoh priority `1` is highest, `7` is lowest. `:express` reduces latency for sma
 | `WEBRTC_SIGNAL_PORT` | WebRTC signaling port. Default: `8765`. |
 | `WEBRTC_DURATION` | Runtime duration in seconds. Use `86400` for long runs. |
 | `WEBRTC_ICE_SERVERS` | Comma-separated STUN/TURN servers. |
+| `WEBRTC_ICE_TRANSPORT_POLICY` | `all` for normal direct-first behavior, or `relay` to force TURN validation. |
+| `HORUS_WEBRTC_DEBUG_ICE` | Set `1` to log sanitized ICE candidate exchange while debugging connectivity. |
 | `WEBRTC_VIDEO_WIDTH` | Camera output width. |
 | `WEBRTC_VIDEO_HEIGHT` | Camera output height. |
 | `WEBRTC_VIDEO_FPS` | Camera FPS. |
@@ -125,11 +127,12 @@ TURN is optional. Use it when WebRTC cannot establish media through NAT/firewall
 |---|---|
 | `HORUS_CLOUD_RUN_TURN` | Set `1` on cloud to install/configure TURN. |
 | `TURN_PORT` | TURN listening port. Default: `3478`. |
-| `TURN_MIN_PORT` | Minimum relay UDP port. |
-| `TURN_MAX_PORT` | Maximum relay UDP port. |
+| `TURN_MIN_PORT` | Minimum relay UDP port. Default: `49152`. |
+| `TURN_MAX_PORT` | Maximum relay UDP port. Default: `65535`. |
 | `TURN_REALM` | TURN realm. |
 | `TURN_USER` | TURN username. |
 | `TURN_PASSWORD` | TURN password. |
+| `TURN_PRIVATE_IP` | Optional VM/private IP for cloud NAT mapping. Auto-detected during bootstrap when empty. |
 
 Example:
 
@@ -140,6 +143,16 @@ TURN_PASSWORD=<password>
 WEBRTC_ICE_SERVERS=stun:stun.l.google.com:19302,turn://horus:<password>@cloud.example.com:3478
 ./horus bootstrap cloud
 ```
+
+Cloud firewall requirements:
+
+```text
+tcp/3478
+udp/3478
+udp/49152-65535
+```
+
+Robot and machine roles do not run TURN. They only need the same `WEBRTC_ICE_SERVERS` value that points to the cloud relay.
 
 ## Synthetic Data
 
@@ -185,6 +198,6 @@ Each robot still runs a normal robot launch with its own room:
 
 ```bash
 HORUS_ROOM=robot-a
-ZENOH_NAMESPACE=/robot-a
+ZENOH_NAMESPACE=/robot_a
 ./horus launch robot
 ```

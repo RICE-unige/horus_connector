@@ -511,7 +511,7 @@ echo ""
 check_ros2_runtime
 run_apt
 if [[ "${ROLE}" == "cloud" && "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
-  "${SCRIPT_DIR}/setup_turn.sh"
+  bash "${SCRIPT_DIR}/setup_turn.sh"
 fi
 install_zenoh
 "${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}"

@@ -4,6 +4,7 @@
 import argparse
 from collections import deque
 import json
+import os
 import statistics
 import time
 from pathlib import Path
@@ -43,6 +44,8 @@ class H264MachineReceiver:
         self.frame_latency_samples = []
         self.ros_image_publisher = None
         self.recovering = False
+        self.answer_in_progress = False
+        self.last_remote_offer_sdp = ""
         if self.args.video_output in {"ros2", "both"}:
             self.ros_image_publisher = RosImagePublisher(
                 self.args.ros_image_topic,
@@ -71,7 +74,7 @@ class H264MachineReceiver:
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
         if self.webrtc is None:
             raise RuntimeError("failed to create webrtcbin")
-        configure_webrtcbin(self.webrtc, self.args.ice_servers)
+        configure_webrtcbin(self.webrtc, self.args.ice_servers, self.args.ice_transport_policy)
         pipeline.add(self.webrtc)
         return pipeline
 
@@ -167,6 +170,8 @@ class H264MachineReceiver:
         return False
 
     def _on_ice_candidate(self, _element, mlineindex, candidate):
+        if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+            print(f"Local ICE candidate: {candidate}", flush=True)
         self.signaling.send({"type": "ice", "sdpMLineIndex": int(mlineindex), "candidate": candidate})
 
     def _handle_signaling_message(self, message):
@@ -175,11 +180,18 @@ class H264MachineReceiver:
     def _handle_signaling_message_in_loop(self, message):
         kind = message.get("type")
         if kind == "offer":
-            offer = make_session_description("offer", message["sdp"])
+            sdp = message.get("sdp", "")
+            if not sdp or sdp == self.last_remote_offer_sdp:
+                return False
+            self.last_remote_offer_sdp = sdp
+            self.answer_in_progress = True
+            offer = make_session_description("offer", sdp)
             self.webrtc.emit("set-remote-description", offer, Gst.Promise.new())
             promise = Gst.Promise.new_with_change_func(self._on_answer_created, None)
             self.webrtc.emit("create-answer", None, promise)
         elif kind == "ice":
+            if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+                print(f"Remote ICE candidate: {message.get('candidate', '')}", flush=True)
             self.webrtc.emit("add-ice-candidate", int(message["sdpMLineIndex"]), message["candidate"])
         return False
 
@@ -188,12 +200,14 @@ class H264MachineReceiver:
         reply = promise.get_reply()
         answer = reply.get_value("answer") if reply is not None else None
         if answer is None:
+            self.answer_in_progress = False
             detail = reply.to_string() if reply is not None else "no promise reply"
             print(f"failed to create WebRTC answer: {detail}", flush=True)
             self.stop()
             return
         self.webrtc.emit("set-local-description", answer, Gst.Promise.new())
         self.signaling.send({"type": "answer", "sdp": answer.sdp.as_text()})
+        self.answer_in_progress = False
 
     def _on_bus_message(self, _bus, message):
         if message.type == Gst.MessageType.ERROR:
@@ -216,6 +230,8 @@ class H264MachineReceiver:
             self.webrtc = None
             self.cmd_channel = None
             self.frame_clock.clear()
+            self.answer_in_progress = False
+            self.last_remote_offer_sdp = ""
 
             # Rebuild pipeline
             self.pipeline = self._build_pipeline()
@@ -412,6 +428,7 @@ def parse_args():
     parser.add_argument("--room", default="default")
     parser.add_argument("--profile", default=".webrtc_profile.env")
     parser.add_argument("--ice-servers", default="stun:stun.l.google.com:19302")
+    parser.add_argument("--ice-transport-policy", choices=["all", "relay"], default="all")
     parser.add_argument("--video-sink", default="fakesink")
     parser.add_argument("--video-output", choices=["ros2", "display", "both"], default="display")
     parser.add_argument("--ros-image-topic", default="/camera/webrtc/image_raw")

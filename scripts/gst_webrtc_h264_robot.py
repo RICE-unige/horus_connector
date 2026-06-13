@@ -96,7 +96,9 @@ class H264RobotSender:
         self.last_adaptive_error_count = 0
         self.current_bitrate_kbit = max(1, args.video_bitrate_kbit)
         self.recovering = False
+        self.negotiation_in_progress = False
         self.offer_pending = False
+        self.last_remote_answer_sdp = ""
         self.last_peer_ready_recovery = 0.0
         self.signaling = self._make_signaling()
 
@@ -160,7 +162,7 @@ class H264RobotSender:
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
         if self.webrtc is None:
             raise RuntimeError("failed to create webrtcbin")
-        configure_webrtcbin(self.webrtc, self.args.ice_servers)
+        configure_webrtcbin(self.webrtc, self.args.ice_servers, self.args.ice_transport_policy)
         media = Gst.parse_bin_from_description(self._media_bin_description(), True)
         if self.args.video_source == "ros2":
             appsrc = media.get_by_name("ros_image_src")
@@ -261,7 +263,17 @@ class H264RobotSender:
         return False
 
     def _on_negotiation_needed(self, _element):
+        if self.webrtc is None:
+            self.offer_pending = True
+            return
+        if not self.signaling.connected.is_set():
+            self.offer_pending = True
+            return
+        if self.negotiation_in_progress:
+            self.offer_pending = True
+            return
         self.offer_pending = False
+        self.negotiation_in_progress = True
         promise = Gst.Promise.new_with_change_func(self._on_offer_created, None)
         self.webrtc.emit("create-offer", None, promise)
 
@@ -270,6 +282,7 @@ class H264RobotSender:
         reply = promise.get_reply()
         offer = reply.get_value("offer") if reply is not None else None
         if offer is None:
+            self.negotiation_in_progress = False
             detail = reply.to_string() if reply is not None else "no promise reply"
             print(f"failed to create WebRTC offer: {detail}", flush=True)
             self.stop()
@@ -332,6 +345,8 @@ class H264RobotSender:
             self.encoder = None
             self.frame_clock_channel = None
             self.frame_clock_open = False
+            self.negotiation_in_progress = False
+            self.last_remote_answer_sdp = ""
             self._start_pipeline()
             self.recovering = False
             print("Robot GStreamer pipeline recovered", flush=True)
@@ -341,6 +356,8 @@ class H264RobotSender:
         return False
 
     def _on_ice_candidate(self, _element, mlineindex, candidate):
+        if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+            print(f"Local ICE candidate: {candidate}", flush=True)
         self.signaling.send({"type": "ice", "sdpMLineIndex": int(mlineindex), "candidate": candidate})
 
     def _handle_signaling_message(self, message: dict):
@@ -353,9 +370,17 @@ class H264RobotSender:
             self._recover_for_peer_ready()
             return False
         if kind == "answer":
-            answer = make_session_description("answer", message["sdp"])
+            sdp = message.get("sdp", "")
+            if not sdp or sdp == self.last_remote_answer_sdp:
+                return False
+            self.last_remote_answer_sdp = sdp
+            answer = make_session_description("answer", sdp)
             self.webrtc.emit("set-remote-description", answer, Gst.Promise.new())
+            self.negotiation_in_progress = False
+            self.offer_pending = False
         elif kind == "ice":
+            if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+                print(f"Remote ICE candidate: {message.get('candidate', '')}", flush=True)
             self.webrtc.emit("add-ice-candidate", int(message["sdpMLineIndex"]), message["candidate"])
         return False
 
@@ -502,6 +527,7 @@ def parse_args():
     parser.add_argument("--room", default="default")
     parser.add_argument("--profile", default=".webrtc_profile.env")
     parser.add_argument("--ice-servers", default="stun:stun.l.google.com:19302")
+    parser.add_argument("--ice-transport-policy", choices=["all", "relay"], default=os.environ.get("WEBRTC_ICE_TRANSPORT_POLICY", "all"))
     parser.add_argument("--ros-cmd-topic", default="/cmd_vel")
     parser.add_argument("--cmd-watchdog-timeout", type=float, default=float(os.environ.get("WEBRTC_CMD_WATCHDOG_TIMEOUT", "0.3")))
     parser.add_argument("--cmd-rate-limit-hz", type=float, default=float(os.environ.get("WEBRTC_CMD_RATE_LIMIT_HZ", "100.0")))

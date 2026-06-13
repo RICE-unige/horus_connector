@@ -129,7 +129,7 @@ The benchmark compares practical camera transport paths using fresh-frame delive
 - Zenoh: TCP `7447`
 - WebRTC signaling: TCP `8765`
 - WebRTC media/control: UDP/ICE end-to-end
-- TURN, when enabled: TCP/UDP `3478` plus the configured relay port range
+- TURN fallback, when enabled on cloud: TCP/UDP `3478` and UDP `49152-65535`
 
 ## Contact
 

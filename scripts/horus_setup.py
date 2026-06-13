@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import secrets
 import shutil
 import socket
 import sys
@@ -217,7 +218,7 @@ class Wizard:
             cloud_ip = self.prompt_text(
                 "Cloud public IP or DNS name",
                 cloud_default,
-                required=(role != "cloud"),
+                required=True,
                 validator=is_host,
                 hint="Robots and machines use this to reach the hub.",
             )
@@ -248,7 +249,7 @@ class Wizard:
 
         namespace_default = self.args.namespace
         if namespace_default is None:
-            namespace_default = f"/{room}" if role == "robot" else ""
+            namespace_default = f"/{ros_safe_name(room)}" if role == "robot" else ""
         namespace = namespace_default
         print(f"Zenoh namespace: {self.color.paint(namespace or '-', 'green')}")
         print("  Robots use /robot_name. Machines and cloud usually stay empty.\n")
@@ -299,22 +300,44 @@ class Wizard:
             encoder_preference = "stable"
             print("Cloud role skips media encoding and decoding.\n")
 
-        use_turn = self.args.turn
+        existing_turn = (
+            self.existing.get("HORUS_CLOUD_RUN_TURN") == "1"
+            or "turn:" in self.existing.get("WEBRTC_ICE_SERVERS", "")
+            or "turns:" in self.existing.get("WEBRTC_ICE_SERVERS", "")
+        )
+        use_turn = self.args.turn or existing_turn
         if self.interactive and topology == "hub":
             use_turn = self.prompt_yes_no(
-                "Use a TURN relay now?",
-                False,
-                "Leave this off for the current lab/cloud setup unless WebRTC cannot connect.",
+                "Enable TURN fallback?",
+                use_turn,
+                "TURN relays media through the cloud only when direct WebRTC cannot connect.",
             )
         turn_user = self.args.turn_user or self.existing.get("TURN_USER", "horus")
-        turn_password = self.args.turn_password or self.existing.get("TURN_PASSWORD", "change-me")
+        existing_turn_password = self.existing.get("TURN_PASSWORD", "")
+        generated_turn_password = generate_turn_password()
+        if self.args.turn_password:
+            turn_password = self.args.turn_password
+        elif role == "cloud" and (not existing_turn_password or existing_turn_password == "change-me"):
+            turn_password = generated_turn_password
+        else:
+            turn_password = existing_turn_password
+        turn_port = self.args.turn_port or self.existing.get("TURN_PORT", "3478")
+        turn_min_port = normalize_turn_min_port(self.args.turn_min_port or self.existing.get("TURN_MIN_PORT", ""))
+        turn_max_port = normalize_turn_max_port(self.args.turn_max_port or self.existing.get("TURN_MAX_PORT", ""))
+        turn_realm = self.args.turn_realm or self.existing.get("TURN_REALM", "horus")
         if use_turn:
             turn_user = self.prompt_text("TURN username", turn_user, True, is_name)
-            turn_password = self.prompt_text("TURN password", turn_password, True)
+            turn_password = self.prompt_text(
+                "TURN password",
+                turn_password,
+                True,
+                is_turn_secret,
+                "Use the same value on the cloud, robot, and machine. Allowed: letters, numbers, dot, underscore, dash, tilde.",
+            )
 
         ice_servers = "stun:stun.l.google.com:19302"
         if use_turn and cloud_ip:
-            ice_servers = f"{ice_servers},turn://{turn_user}:{turn_password}@{cloud_ip}:3478"
+            ice_servers = f"{ice_servers},turn://{turn_user}:{turn_password}@{cloud_ip}:{turn_port}"
 
         self.values = {
             "HORUS_ROLE": role,
@@ -335,7 +358,12 @@ class Wizard:
             "WEBRTC_MEDIA_MODE": "h264",
             "HORUS_ALLOW_LEGACY_JPEG": "0",
             "WEBRTC_ICE_SERVERS": ice_servers,
+            "WEBRTC_ICE_TRANSPORT_POLICY": self.existing.get("WEBRTC_ICE_TRANSPORT_POLICY", "all"),
             "HORUS_CLOUD_RUN_TURN": "1" if role == "cloud" and use_turn else "0",
+            "TURN_PORT": turn_port,
+            "TURN_MIN_PORT": turn_min_port,
+            "TURN_MAX_PORT": turn_max_port,
+            "TURN_REALM": turn_realm,
             "TURN_USER": turn_user,
             "TURN_PASSWORD": turn_password,
             "WEBRTC_VIDEO_WIDTH": str(width),
@@ -457,7 +485,7 @@ class Wizard:
         if self.args.camera_output_topic:
             return self.args.camera_output_topic
         if role == "machine":
-            expected = f"/{room}/camera/webrtc/image_raw"
+            expected = f"/{ros_safe_name(room)}/camera/webrtc/image_raw"
             existing_room = self.existing.get("HORUS_ROOM", "")
             existing_output = self.existing.get("WEBRTC_ROS_IMAGE_OUTPUT_TOPIC", "")
             if existing_room == room and existing_output:
@@ -498,6 +526,11 @@ class Wizard:
         if self.values.get("ROS_SETUP_PATH"):
             print(f"  ros setup  {self.values['ROS_SETUP_PATH']}")
         print(f"  namespace  {self.values['ZENOH_NAMESPACE'] or '-'}")
+        if role == "cloud":
+            turn_status = "enabled" if self.values["HORUS_CLOUD_RUN_TURN"] == "1" else "disabled"
+            print(f"  turn       {turn_status}")
+        elif "turn:" in self.values.get("WEBRTC_ICE_SERVERS", ""):
+            print("  turn       fallback configured")
         if role != "cloud":
             print(
                 "  camera     "
@@ -644,6 +677,12 @@ def sanitize_name(value: str) -> str:
     return value.strip("-")
 
 
+def ros_safe_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_]+", "_", value.strip())
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "robot"
+
+
 def is_name(value: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_.-]+$", value))
 
@@ -656,6 +695,10 @@ def is_uint(value: str) -> bool:
     return value.isdigit()
 
 
+def is_turn_secret(value: str) -> bool:
+    return value != "change-me" and bool(re.match(r"^[A-Za-z0-9_.~-]{8,128}$", value))
+
+
 def is_topic(value: str) -> bool:
     return bool(re.match(r"^/[A-Za-z0-9_/]+$", value))
 
@@ -666,6 +709,18 @@ def is_namespace(value: str) -> bool:
 
 def is_existing_file(value: str) -> bool:
     return Path(os.path.expanduser(value)).is_file()
+
+
+def generate_turn_password() -> str:
+    return secrets.token_urlsafe(24).rstrip("=")
+
+
+def normalize_turn_min_port(value: str) -> str:
+    return "49152" if value in {"", "49160"} else value
+
+
+def normalize_turn_max_port(value: str) -> str:
+    return "65535" if value in {"", "49200"} else value
 
 
 def parse_args() -> argparse.Namespace:
@@ -694,6 +749,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn", action="store_true")
     parser.add_argument("--turn-user")
     parser.add_argument("--turn-password")
+    parser.add_argument("--turn-port", default=None)
+    parser.add_argument("--turn-min-port", default=None)
+    parser.add_argument("--turn-max-port", default=None)
+    parser.add_argument("--turn-realm", default=None)
     parser.add_argument("--yes", action="store_true", help="Accept defaults and provided flags")
     parser.add_argument("--force", action="store_true", help="Overwrite without asking")
     parser.add_argument("--dry-run", action="store_true")

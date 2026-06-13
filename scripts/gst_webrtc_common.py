@@ -2,6 +2,7 @@
 """Shared helpers for GStreamer WebRTC media scripts."""
 
 import json
+import os
 import queue
 import threading
 import time
@@ -69,8 +70,16 @@ def turn_property(servers: str) -> str:
     return "turn://" + server[len("turn:") :]
 
 
-def webrtcbin_properties(ice_servers: str) -> str:
+def normalize_ice_transport_policy(value: str) -> str:
+    policy = (value or "all").strip().lower()
+    return policy if policy in {"all", "relay"} else "all"
+
+
+def webrtcbin_properties(ice_servers: str, ice_transport_policy: str = "all") -> str:
     props = ["bundle-policy=max-bundle"]
+    policy = normalize_ice_transport_policy(ice_transport_policy)
+    if policy != "all":
+        props.append(f"ice-transport-policy={policy}")
     stun = stun_property(ice_servers)
     turn = turn_property(ice_servers)
     if stun:
@@ -80,15 +89,32 @@ def webrtcbin_properties(ice_servers: str) -> str:
     return " ".join(props)
 
 
-def configure_webrtcbin(element, ice_servers: str):
+def configure_webrtcbin(element, ice_servers: str, ice_transport_policy: str = "all"):
     if element.find_property("bundle-policy"):
         element.set_property("bundle-policy", "max-bundle")
+    policy = normalize_ice_transport_policy(ice_transport_policy)
+    if element.find_property("ice-transport-policy"):
+        element.set_property("ice-transport-policy", policy)
     stun = stun_property(ice_servers)
     turn = turn_property(ice_servers)
+    turn_added = None
     if stun and element.find_property("stun-server"):
         element.set_property("stun-server", stun)
     if turn and element.find_property("turn-server"):
-        element.set_property("turn-server", turn)
+        turn_added = False
+        try:
+            turn_added = bool(element.emit("add-turn-server", turn))
+        except Exception:
+            turn_added = False
+        if not turn_added:
+            element.set_property("turn-server", turn)
+    if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+        print(
+            "WebRTC ICE config: "
+            f"policy={policy} stun={'on' if stun else 'off'} "
+            f"turn={'on' if turn else 'off'} turn_registered={turn_added}",
+            flush=True,
+        )
 
 
 def ensure_webrtc_runtime():

@@ -67,7 +67,7 @@ usage() {
   echo -e "${BOLD}Roles${RESET}"
   echo -e "  ${BOLD}robot${RESET}     Robot-side system. Sends camera/state and receives velocity commands"
   echo -e "  ${BOLD}machine${RESET}   Operator/local machine. Receives camera/state and sends commands"
-  echo -e "  ${BOLD}cloud${RESET}     Shared Zenoh router + WebRTC signaling relay"
+  echo -e "  ${BOLD}cloud${RESET}     Shared Zenoh router + WebRTC signaling relay, optionally TURN"
   echo ""
 
   echo -e "${BOLD}Topologies${RESET}"
@@ -318,6 +318,77 @@ tcp_probe() {
   return 1
 }
 
+turn_enabled() {
+  [[ "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]
+}
+
+turn_service_name() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files coturn.service >/dev/null 2>&1; then
+    echo "coturn"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files turnserver.service >/dev/null 2>&1; then
+    echo "turnserver"
+  else
+    echo "coturn"
+  fi
+}
+
+run_root_available() {
+  [[ "$(id -u)" -eq 0 ]] || sudo -n true >/dev/null 2>&1
+}
+
+run_root_cmd() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+turn_running() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --quiet is-active "$(turn_service_name)" >/dev/null 2>&1 && return 0
+  fi
+  pgrep -x turnserver >/dev/null 2>&1
+}
+
+start_turn_relay() {
+  turn_enabled || return 0
+  if ! command -v turnserver >/dev/null 2>&1; then
+    log_error "TURN is enabled but coturn is not installed. Run ./horus bootstrap cloud."
+    return 1
+  fi
+  if run_root_available; then
+    bash "${ROOT}/scripts/setup_turn.sh"
+    return
+  fi
+  if turn_running; then
+    log_success "TURN relay is already running."
+    return
+  fi
+  log_warn "TURN is enabled but cannot be started without sudo. Run ./horus bootstrap cloud on the hub."
+}
+
+stop_turn_relay() {
+  turn_enabled || return 0
+  if command -v systemctl >/dev/null 2>&1 && run_root_available; then
+    run_root_cmd systemctl stop "$(turn_service_name)" >/dev/null 2>&1 || true
+  fi
+}
+
+status_turn() {
+  if ! turn_enabled; then
+    printf "  %-10s %b\n" "turn" "${FG_MUTED}disabled${RESET}"
+    return
+  fi
+  local service
+  service="$(turn_service_name)"
+  if turn_running; then
+    printf "  %-10s %b\n" "turn" "${FG_GREEN}running${RESET} ${FG_MUTED}${service}, udp/tcp ${TURN_PORT:-3478}, relay ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}${RESET}"
+  else
+    printf "  %-10s %b\n" "turn" "${FG_RED}stopped${RESET} ${FG_MUTED}${service}${RESET}"
+  fi
+}
+
 doctor() {
   local role="$1"
   local target=""
@@ -367,11 +438,14 @@ doctor() {
       tcp_probe "${target}" "${ZENOH_PORT:-7447}" || true
       echo -en "  signaling  "
       tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
+      if [[ "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ]]; then
+        echo -e "  turn       ${FG_GREEN}configured${RESET} ${FG_MUTED}${WEBRTC_ICE_SERVERS#*,}${RESET}"
+      fi
       ;;
     cloud:*)
       echo -e "  mode       listening for robot and machine connections"
       local active_listeners
-      active_listeners=$(ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true)
+      active_listeners=$(ss -ltunp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765}|${TURN_PORT:-3478})" || true)
       if [[ -n "${active_listeners}" ]]; then
         echo -e "  listeners"
         while read -r line; do
@@ -379,6 +453,9 @@ doctor() {
         done <<< "${active_listeners}"
       else
         echo -e "  listeners  ${FG_MUTED}none detected${RESET}"
+      fi
+      if turn_enabled; then
+        echo -e "  turn       ${FG_GREEN}enabled${RESET} udp/tcp ${TURN_PORT:-3478}, relay udp ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}"
       fi
       ;;
   esac
@@ -682,6 +759,7 @@ launch_webrtc_robot() {
       --room "${HORUS_ROOM:-default}" \
       --profile "${ROOT}/.webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+      --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
       --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
       --cmd-watchdog-timeout "${WEBRTC_CMD_WATCHDOG_TIMEOUT:-0.3}" \
       --cmd-rate-limit-hz "${WEBRTC_CMD_RATE_LIMIT_HZ:-100.0}" \
@@ -730,6 +808,7 @@ launch_webrtc_receiver() {
         --room "${HORUS_ROOM:-default}" \
         --profile "${ROOT}/.webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
         --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
         --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
@@ -748,6 +827,7 @@ launch_webrtc_receiver() {
         --room "${HORUS_ROOM:-default}" \
         --profile "${ROOT}/.webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
         --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
         --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
@@ -876,6 +956,15 @@ case "${cmd}" in
       echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, listening tcp/0.0.0.0:${FG_CYAN}${ZENOH_PORT:-7447}${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
     fi
     echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    if [[ "${role}" == "cloud" ]]; then
+      if turn_enabled; then
+        echo -e "  turn       ${FG_CYAN}enabled${RESET}, udp/tcp ${TURN_PORT:-3478}, relay ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}"
+      else
+        echo -e "  turn       ${FG_MUTED}disabled${RESET}"
+      fi
+    elif [[ "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ]]; then
+      echo -e "  turn       ${FG_CYAN}fallback configured${RESET}"
+    fi
     echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
     if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720}${RESET} @ ${FG_CYAN}${WEBRTC_VIDEO_FPS:-30} fps${RESET}, source ${WEBRTC_VIDEO_SOURCE:-ros2}"
@@ -915,6 +1004,7 @@ case "${cmd}" in
         if [[ "${HORUS_CLOUD_RUN_SIGNALING:-1}" == "1" ]]; then
           launch_signal_relay
         fi
+        start_turn_relay
         ;;
       *)
         echo "Unknown launch role: ${role}" >&2
@@ -953,6 +1043,17 @@ case "${cmd}" in
     stop_one_styled webrtc
     stop_one_styled signal
     rm -f "${RUN_DIR}/signal_members.json"
+    if turn_enabled; then
+      echo -e "  turn        stopping $(turn_service_name)"
+      stop_turn_relay
+      if turn_running; then
+        echo -e "  turn        ${FG_YELLOW}still running${RESET}"
+      else
+        echo -e "  turn        ${FG_GREEN}stopped${RESET}"
+      fi
+    else
+      echo -e "  turn        ${FG_MUTED}disabled${RESET}"
+    fi
     stop_one_styled metrics
     stop_one_styled fake-data
 
@@ -1020,6 +1121,7 @@ case "${cmd}" in
     echo -e "${BOLD}Services${RESET}"
     status_zenoh
     status_one signal
+    status_turn
     status_one webrtc
     status_one metrics
     status_one fake-data
@@ -1059,6 +1161,23 @@ case "${cmd}" in
   logs)
     service="${2:-}"
     case "${service}" in
+      turn)
+        print_banner
+        echo -e "${BOLD}${FG_CYAN}Log stream: turn${RESET}"
+        echo -e "  service    $(turn_service_name)"
+        echo -e "  control    Press ${BOLD}Ctrl+C${RESET} to stop"
+        echo ""
+        if command -v journalctl >/dev/null 2>&1; then
+          journalctl -u "$(turn_service_name)" -n 80 -f
+        elif [[ -r /var/log/turnserver.log ]]; then
+          tail -f /var/log/turnserver.log
+        elif sudo -n test -r /var/log/turnserver.log >/dev/null 2>&1; then
+          sudo -n tail -f /var/log/turnserver.log
+        else
+          log_error "TURN log is not readable. Try: sudo journalctl -u $(turn_service_name) -f"
+          exit 1
+        fi
+        ;;
       zenoh|webrtc|signal|metrics|fake-data)
       print_banner
         log_file="${RUN_DIR}/${service}.log"
@@ -1094,7 +1213,7 @@ case "${cmd}" in
       *)
         log_error "Invalid service specified."
         echo -e "${BOLD}Usage:${RESET}"
-        echo -e "  ./horus logs ${FG_GREEN}[zenoh|webrtc|signal|metrics|fake-data]${RESET}\n" >&2
+        echo -e "  ./horus logs ${FG_GREEN}[zenoh|webrtc|signal|turn|metrics|fake-data]${RESET}\n" >&2
         exit 2
         ;;
     esac
