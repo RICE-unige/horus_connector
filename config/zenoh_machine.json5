@@ -8,18 +8,10 @@
       allow: {
         publishers: [],
         subscribers: [
-          "^/tf$",
-          "^/.*/tf$",
-          "^/tf_static$",
-          "^/.*/tf_static$",
-          "^/odom$",
-          "^/.*/odom$",
-          "^/joint_states$",
-          "^/.*/joint_states$",
-          "^/scan$",
-          "^/.*/scan$",
-          "^/points$",
-          "^/.*/points$",
+          // Import any remote topic that this machine explicitly subscribes to.
+          // Local machine publishers remain blocked above, so this does not
+          // leak operator-side topics back into the robot or hub.
+          "^/.*$",
         ],
         service_servers: [],
         service_clients: [],

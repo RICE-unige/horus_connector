@@ -6,26 +6,13 @@
       ros_automatic_discovery_range: "LOCALHOST",
 
       allow: {
-        publishers: [
-          "^/tf$",
-          "^/.*/tf$",
-          "^/tf_static$",
-          "^/.*/tf_static$",
-          "^/odom$",
-          "^/.*/odom$",
-          "^/joint_states$",
-          "^/.*/joint_states$",
-          "^/scan$",
-          "^/.*/scan$",
-          "^/points$",
-          "^/.*/points$",
-        ],
-        subscribers: [],
-        service_servers: [],
-        service_clients: [],
-        action_servers: [],
-        action_clients: [],
-      },
+  publishers: ["^/.*$"],
+  subscribers: ["^/.*$"],
+  service_servers: ["^/.*$"],
+  service_clients: ["^/.*$"],
+  action_servers: ["^/.*$"],
+  action_clients: ["^/.*$"],
+},
 
       pub_max_frequencies: [
         ".*/tf$=20",
