@@ -14,6 +14,7 @@ import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from PIL import Image
 
+from experiment_metrics import CsvMetricWriter, default_metrics_path
 from webrtc_common import camera_specs, candidate_summary, pack_frame, wait_for_ice_gathering_complete
 
 
@@ -87,6 +88,39 @@ def write_summary(path, payload):
         return
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def write_standard_metrics(path, payload):
+    target = Path(path) if path else default_metrics_path("webrtc_metrics.csv")
+    if target is None:
+        return
+
+    fields = (
+        "role",
+        "stream",
+        "camera",
+        "generated",
+        "sent",
+        "dropped",
+        "mbps_sent",
+        "encode_ms_median",
+        "encode_ms_p95",
+    )
+    with CsvMetricWriter(target, fieldnames=fields) as writer:
+        for camera, stats in sorted(payload.get("cameras", {}).items()):
+            writer.write(
+                {
+                    "role": "sender",
+                    "stream": "webrtc_camera",
+                    "camera": camera,
+                    "generated": stats.get("generated"),
+                    "sent": stats.get("sent"),
+                    "dropped": stats.get("dropped"),
+                    "mbps_sent": stats.get("mbps_sent"),
+                    "encode_ms_median": stats.get("encode_ms_median"),
+                    "encode_ms_p95": stats.get("encode_ms_p95"),
+                }
+            )
 
 
 class RosCmdPublisher:
@@ -252,6 +286,7 @@ async def run(args):
         summary = stats.summary()
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
         write_summary(args.json, summary)
+        write_standard_metrics(args.metrics_csv, summary)
         channel.close()
         await asyncio.sleep(0.5)
     ros_publisher.close()
@@ -271,6 +306,7 @@ def parse_args():
     parser.add_argument("--ice-server", action="append", default=["stun:stun.l.google.com:19302"])
     parser.add_argument("--ros-cmd-topic", default="", help="If set, publish incoming WebRTC cmd_vel commands to this ROS Twist topic.")
     parser.add_argument("--json", default=None)
+    parser.add_argument("--metrics-csv", default=None)
     return parser.parse_args()
 
 

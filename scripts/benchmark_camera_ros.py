@@ -16,6 +16,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
 
+from experiment_metrics import CsvMetricWriter, default_metrics_path
+
 
 def qos(depth: int) -> QoSProfile:
     return QoSProfile(
@@ -222,7 +224,49 @@ def parse_args():
     parser.add_argument("--scene", choices=["gradient", "textured", "noise"], default="textured")
     parser.add_argument("--json", default=None)
     parser.add_argument("--samples-json", default=None)
+    parser.add_argument("--metrics-csv", default=None)
     return parser.parse_args()
+
+
+def write_standard_metrics(path: str | None, role: str, payload: dict):
+    target = Path(path) if path else default_metrics_path("source_metrics.csv")
+    if target is None:
+        return
+
+    fields = (
+        "role",
+        "profile",
+        "topic",
+        "target_fps",
+        "width",
+        "height",
+        "scene",
+        "messages",
+        "fps",
+        "mbps",
+        "payload_bytes",
+        "latency_ms_median",
+        "latency_ms_p95",
+        "latency_ms_p99",
+    )
+    row = {
+        "role": role,
+        "profile": payload.get("profile"),
+        "topic": payload.get("topic", ""),
+        "target_fps": payload.get("target_fps"),
+        "width": payload.get("width"),
+        "height": payload.get("height"),
+        "scene": payload.get("scene"),
+        "messages": payload.get("messages"),
+        "fps": payload.get("fps"),
+        "mbps": payload.get("mbps"),
+        "payload_bytes": payload.get("payload_bytes", ""),
+        "latency_ms_median": payload.get("latency_ms_median", ""),
+        "latency_ms_p95": payload.get("latency_ms_p95", ""),
+        "latency_ms_p99": payload.get("latency_ms_p99", ""),
+    }
+    with CsvMetricWriter(target, fieldnames=fields) as writer:
+        writer.write(row)
 
 
 def main():
@@ -235,8 +279,10 @@ def main():
             rclpy.spin_once(node, timeout_sec=0.05)
     finally:
         payload = node.summary()
+        payload["topic"] = args.topic
         print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
         write_json(args.json, payload)
+        write_standard_metrics(args.metrics_csv, args.role, payload)
         if args.role == "sub":
             write_samples(args.samples_json, args, node.samples)
         node.destroy_node()
