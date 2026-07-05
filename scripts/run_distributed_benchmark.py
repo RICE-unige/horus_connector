@@ -14,7 +14,7 @@ import time
 ROOT_WIN = r"\\wsl.localhost\Ubuntu\home\omotoye\horus_connector"
 ROOT_POSIX = "~/horus_connector"
 LOCAL_RUN_WIN = Path(ROOT_WIN) / ".run"
-BENCH_WIN = LOCAL_RUN_WIN / "distributed_benchmark"
+BENCH_WIN = Path(os.environ.get("HORUS_BENCH_OUTPUT_DIR", str(LOCAL_RUN_WIN / "distributed_benchmark")))
 BENCH_REMOTE = ".run/bench"
 DURATION = float(os.environ.get("HORUS_BENCH_DURATION", "300"))
 REPETITIONS = int(os.environ.get("HORUS_BENCH_REPETITIONS", "1"))
