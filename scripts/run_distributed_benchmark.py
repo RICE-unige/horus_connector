@@ -24,6 +24,8 @@ QOS_DEPTH = 1
 CLOCK_PORT = int(os.environ.get("HORUS_BENCH_CLOCK_PORT", "8765"))
 CLOCK_SAMPLES = int(os.environ.get("HORUS_BENCH_CLOCK_SAMPLES", "80"))
 CLOCK_DRIFT_LIMIT_MS = float(os.environ.get("HORUS_BENCH_CLOCK_DRIFT_LIMIT_MS", "5.0"))
+RESOURCE_INTERVAL_SEC = float(os.environ.get("HORUS_BENCH_RESOURCE_INTERVAL_SEC", "1.0"))
+CONTROL_RATE_HZ = float(os.environ.get("HORUS_BENCH_CONTROL_RATE_HZ", "20.0"))
 ZENOH_PRODUCTION_ARM = os.environ.get("HORUS_BENCH_ZENOH_ARM", "quic_dgram")
 ZENOH_ARMS = {
     "tcp": {"endpoint": "tcp/{host}:7447", "protocol": "tcp", "tls": False},
@@ -32,12 +34,23 @@ ZENOH_ARMS = {
     "quic_dgram": {"endpoint": "quic/{host}:7447?multistream=1;mixed_rel=auto", "protocol": "quic", "tls": True},
 }
 
+NETWORK_PROFILES = {
+    "unconstrained": {"bandwidth_mbps": None, "loss_percent": 0.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+    "bw40": {"bandwidth_mbps": 40.0, "loss_percent": 0.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+    "bw20": {"bandwidth_mbps": 20.0, "loss_percent": 0.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+    "bw10": {"bandwidth_mbps": 10.0, "loss_percent": 0.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+    "bw5": {"bandwidth_mbps": 5.0, "loss_percent": 0.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+    "bw2": {"bandwidth_mbps": 2.0, "loss_percent": 0.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+    "loss1": {"bandwidth_mbps": None, "loss_percent": 1.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+    "loss3": {"bandwidth_mbps": None, "loss_percent": 3.0, "delay_ms": 0.0, "jitter_ms": 0.0},
+}
+
 
 NODES = {
     "wsl": {"kind": "wsl", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "host": "local", "ip": "100.70.153.10"},
     "arancino": {"kind": "ssh", "alias": "arancino", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "ip": "10.186.13.53"},
     "arancina": {"kind": "ssh", "alias": "arancina", "distro": "jazzy", "root": "/home/rice/horus_connector", "ip": "10.186.13.39"},
-    "poke": {"kind": "ssh", "alias": "poke", "distro": "humble", "root": "/home/rice/horus_connector", "ip": "100.73.164.13"},
+    "poke": {"kind": "ssh", "alias": "poke", "distro": "humble", "root": "/home/rice/horus_connector", "ip": "10.186.13.16"},
     "cloud": {"kind": "ssh", "alias": "googlecloud", "distro": "", "root": "/home/adeko/horus_connector", "ip": "34.7.220.13"},
 }
 
@@ -54,7 +67,7 @@ RESOLUTIONS = {
 }
 
 PATHS = {
-    "lan": {"sender": "arancina", "receiver": "arancino", "target": NODES["arancino"]["ip"], "clock_target": NODES["arancino"]["ip"]},
+    "lan": {"sender": "arancina", "receiver": "poke", "target": NODES["poke"]["ip"], "clock_target": NODES["poke"]["ip"]},
     "vpn": {"sender": "arancina", "receiver": "wsl", "target": NODES["wsl"]["ip"], "clock_target": NODES["wsl"]["ip"]},
     "cloud": {"sender": "arancina", "receiver": "wsl", "target": NODES["cloud"]["ip"], "clock_target": NODES["cloud"]["ip"], "clock_hub": "cloud", "hub": "cloud"},
 }
@@ -78,15 +91,15 @@ ZENOH_PUB_CONFIG = """{
       ros_localhost_only: true,
       ros_automatic_discovery_range: "LOCALHOST",
       allow: {
-        publishers: ["^/benchmark/camera$"],
-        subscribers: [],
+        publishers: ["^/benchmark/camera$", "^/benchmark/cmd_vel_ack$"],
+        subscribers: ["^/benchmark/cmd_vel$"],
         service_servers: [],
         service_clients: [],
         action_servers: [],
         action_clients: [],
       },
       pub_max_frequencies: [".*/benchmark/camera$=30"],
-      pub_priorities: [".*/benchmark/camera$=3:express"],
+      pub_priorities: [".*/benchmark/camera$=5", ".*/benchmark/cmd_vel_ack$=2:express"],
       reliable_routes_blocking: false,
       transient_local_cache_multiplier: 1,
     },
@@ -114,14 +127,15 @@ ZENOH_SUB_CONFIG = """{
       ros_localhost_only: true,
       ros_automatic_discovery_range: "LOCALHOST",
       allow: {
-        publishers: [],
-        subscribers: ["^/benchmark/camera$"],
+        publishers: ["^/benchmark/cmd_vel$"],
+        subscribers: ["^/benchmark/camera$", "^/benchmark/cmd_vel_ack$"],
         service_servers: [],
         service_clients: [],
         action_servers: [],
         action_clients: [],
       },
       reliable_routes_blocking: false,
+      pub_priorities: [".*/benchmark/cmd_vel$=1:express"],
       transient_local_cache_multiplier: 1,
     },
   },
@@ -195,6 +209,18 @@ def checked(node: str, script: str, *, input_text: str | None = None, timeout: f
     return proc.stdout
 
 
+def sudo_bash(node: str, body: str) -> str:
+    password = os.environ.get(f"HORUS_BENCH_{node.upper()}_SUDO_PASSWORD") or os.environ.get("HORUS_BENCH_SUDO_PASSWORD")
+    quoted = shlex.quote(body)
+    if password:
+        return f"printf '%s\\n' {shlex.quote(password)} | sudo -S -p '' bash -lc {quoted}"
+    return f"sudo -n bash -lc {quoted}"
+
+
+def python_bin_expr() -> str:
+    return "$(if [ -x .venv-webrtc/bin/python ]; then printf %s .venv-webrtc/bin/python; else printf %s python3; fi)"
+
+
 def percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
@@ -220,6 +246,15 @@ def write_local_json(name: str, payload: dict) -> None:
     (BENCH_WIN / name).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def network_profile_suffix(profile_name: str) -> str:
+    return "" if profile_name == "unconstrained" else f"_{profile_name}"
+
+
+def profile_needs_shaping(profile_name: str) -> bool:
+    profile = NETWORK_PROFILES[profile_name]
+    return bool(profile["bandwidth_mbps"] or profile["loss_percent"] or profile["delay_ms"] or profile["jitter_ms"])
+
+
 def bash_prefix(node: str, domain: int, localhost_only: int) -> str:
     distro = NODES[node]["distro"]
     source = f"source /opt/ros/{distro}/setup.bash" if distro else "true"
@@ -238,6 +273,9 @@ def setup_node(node: str) -> None:
         f"cd {shlex.quote(NODES[node]['root'])}; "
         f"mkdir -p {BENCH_REMOTE}; "
         f"find {BENCH_REMOTE} -maxdepth 1 -type f -name 'modeb_*' -delete; "
+        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name 'cmd_*' -delete; "
+        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name '*_resources.csv' -delete; "
+        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name '*_network.json' -delete; "
         f"find {BENCH_REMOTE} -maxdepth 1 -type f -name '*_clock*.json' -delete",
         timeout=120,
     )
@@ -377,6 +415,69 @@ def stop_all(nodes: set[str] | None = None) -> None:
             print(f"warning: cleanup timed out on {node}", flush=True)
 
 
+def route_interface(node: str, target_ip: str) -> str:
+    output = checked(
+        node,
+        f"ip route get {shlex.quote(target_ip)} | awk '{{for (i=1; i<=NF; i++) if ($i == \"dev\") {{print $(i+1); exit}}}}'",
+        timeout=10,
+    ).strip()
+    if not output:
+        raise RuntimeError(f"could not determine route interface from {node} to {target_ip}")
+    return output.splitlines()[0].strip()
+
+
+def clear_network_profile(node: str, iface: str | None) -> None:
+    if not iface:
+        return
+    node_cmd(node, sudo_bash(node, f"tc qdisc del dev {shlex.quote(iface)} root 2>/dev/null || true"), timeout=20)
+
+
+def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
+    if profile_name not in NETWORK_PROFILES:
+        raise ValueError(f"unknown network profile: {profile_name}")
+    profile = NETWORK_PROFILES[profile_name]
+    iface = route_interface(node, target_ip)
+    payload = {
+        "profile": profile_name,
+        "sender": node,
+        "target_ip": target_ip,
+        "interface": iface,
+        **profile,
+        "active": profile_needs_shaping(profile_name),
+    }
+    clear_network_profile(node, iface)
+    if not payload["active"]:
+        payload["tc_qdisc"] = checked(node, f"tc -s qdisc show dev {shlex.quote(iface)}", timeout=10)
+        return payload
+
+    bandwidth = profile["bandwidth_mbps"]
+    loss = float(profile["loss_percent"])
+    delay = float(profile["delay_ms"])
+    jitter = float(profile["jitter_ms"])
+    netem_parts: list[str] = []
+    if loss > 0:
+        netem_parts.append(f"loss {loss:g}%")
+    if delay > 0:
+        netem_parts.append(f"delay {delay:g}ms {jitter:g}ms" if jitter > 0 else f"delay {delay:g}ms")
+
+    if bandwidth:
+        lines = [
+            f"tc qdisc replace dev {shlex.quote(iface)} root handle 1: htb default 10",
+            (
+                f"tc class replace dev {shlex.quote(iface)} parent 1: classid 1:10 "
+                f"htb rate {bandwidth:g}mbit ceil {bandwidth:g}mbit burst 64k cburst 64k"
+            ),
+        ]
+        if netem_parts:
+            lines.append(f"tc qdisc replace dev {shlex.quote(iface)} parent 1:10 handle 10: netem {' '.join(netem_parts)}")
+    else:
+        lines = [f"tc qdisc replace dev {shlex.quote(iface)} root netem {' '.join(netem_parts)}"]
+    script = "set -e; " + "; ".join(lines)
+    checked(node, sudo_bash(node, script), timeout=30)
+    payload["tc_qdisc"] = checked(node, f"tc -s qdisc show dev {shlex.quote(iface)}", timeout=10)
+    return payload
+
+
 def fetch(node: str, remote_path: str, local_name: str) -> None:
     dest = BENCH_WIN / local_name
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -387,6 +488,32 @@ def fetch(node: str, remote_path: str, local_name: str) -> None:
             dest.write_bytes(src.read_bytes())
         return
     subprocess.run(["scp", f"{info['alias']}:{NODES[node]['root']}/{remote_path}", str(dest)], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def start_resource_samplers(name: str, node_labels: dict[str, list[str]], duration: float) -> list[tuple[str, str, str]]:
+    samplers: list[tuple[str, str, str]] = []
+    for node, labels in sorted(node_labels.items()):
+        if not labels:
+            continue
+        sampler_label = f"{name}_{node}_resources"
+        remote_csv = f"{BENCH_REMOTE}/{sampler_label}.csv"
+        pid_args = " ".join(
+            f"--pid-label {shlex.quote(label + '=' + BENCH_REMOTE + '/' + label + '.pid')}" for label in sorted(set(labels))
+        )
+        command = (
+            f"python3 scripts/sample_process_metrics.py --output {shlex.quote(remote_csv)} "
+            f"--interval {RESOURCE_INTERVAL_SEC:g} --duration {duration:g} {pid_args}"
+        )
+        start_bg(node, sampler_label, command, domain=0, localhost_only=1)
+        samplers.append((node, sampler_label, remote_csv))
+    return samplers
+
+
+def stop_and_fetch_samplers(samplers: list[tuple[str, str, str]]) -> None:
+    for node, label, _remote_csv in samplers:
+        stop_label(node, label)
+    for node, label, remote_csv in samplers:
+        fetch(node, remote_csv, f"{label}.csv")
 
 
 def run_clock_probe(name: str, phase: str, sender: str, receiver: str, receiver_ip: str) -> dict:
@@ -614,11 +741,18 @@ def ros_pair(
     clock_target: str,
     clock_hub: str | None = None,
     zenoh_arm: str = "tcp",
+    network_profile: str = "unconstrained",
 ) -> None:
     print(f"\n=== {name} ===", flush=True)
     labels: list[tuple[str, str]] = []
-    pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target, clock_hub=clock_hub)
+    resource_labels: dict[str, list[str]] = {}
+    samplers: list[tuple[str, str, str]] = []
+    network_state: dict | None = None
+    pre_clock: dict | None = None
     try:
+        network_state = apply_network_profile(sender, clock_target, network_profile)
+        write_local_json(f"{name}_network.json", network_state)
+        pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target, clock_hub=clock_hub)
         if transport == "zenoh":
             if zenoh_arm not in ZENOH_ARMS:
                 raise ValueError(f"unknown Zenoh arm: {zenoh_arm}")
@@ -633,6 +767,7 @@ def ros_pair(
                     localhost_only=1,
                 )
                 labels.append((cloud, f"{name}_cloud_bridge"))
+                resource_labels.setdefault(cloud, []).append(f"{name}_cloud_bridge")
                 time.sleep(2)
                 start_bg(
                     receiver,
@@ -649,6 +784,8 @@ def ros_pair(
                     localhost_only=1,
                 )
                 labels.extend([(receiver, f"{name}_sub_bridge"), (sender, f"{name}_pub_bridge")])
+                resource_labels.setdefault(receiver, []).append(f"{name}_sub_bridge")
+                resource_labels.setdefault(sender, []).append(f"{name}_pub_bridge")
             else:
                 listen_endpoint = zenoh_endpoint(zenoh_arm, "0.0.0.0")
                 connect_endpoint = zenoh_endpoint(zenoh_arm, target)
@@ -660,6 +797,7 @@ def ros_pair(
                     localhost_only=1,
                 )
                 labels.append((receiver, f"{name}_sub_bridge"))
+                resource_labels.setdefault(receiver, []).append(f"{name}_sub_bridge")
                 time.sleep(2)
                 start_bg(
                     sender,
@@ -669,6 +807,7 @@ def ros_pair(
                     localhost_only=1,
                 )
                 labels.append((sender, f"{name}_pub_bridge"))
+                resource_labels.setdefault(sender, []).append(f"{name}_pub_bridge")
             time.sleep(5)
             assert_zenoh_transport(labels, zenoh_arm)
 
@@ -686,32 +825,60 @@ def ros_pair(
         )
         start_bg(receiver, f"{name}_sub", sub_cmd, domain=domain, localhost_only=localhost_only)
         labels.append((receiver, f"{name}_sub"))
+        resource_labels.setdefault(receiver, []).append(f"{name}_sub")
         time.sleep(3)
         start_bg(sender, f"{name}_pub", pub_cmd, domain=domain, localhost_only=localhost_only)
         labels.append((sender, f"{name}_pub"))
+        resource_labels.setdefault(sender, []).append(f"{name}_pub")
+        samplers = start_resource_samplers(name, resource_labels, DURATION + 15)
         time.sleep(DURATION + 10)
         fetch(sender, f"{BENCH_REMOTE}/{name}_pub.json", f"{name}_pub.json")
         fetch(receiver, f"{BENCH_REMOTE}/{name}_sub.json", f"{name}_sub.json")
         fetch(receiver, f"{BENCH_REMOTE}/{name}_sub.samples.json", f"{name}_sub.samples.json")
+        stop_and_fetch_samplers(samplers)
+        samplers = []
         clock = finish_clock_file(name, sender, receiver, clock_target, pre_clock, clock_hub=clock_hub)
         apply_ros_clock_correction(name, clock)
     finally:
+        if samplers:
+            stop_and_fetch_samplers(samplers)
         for node, label in reversed(labels):
             stop_label(node, label)
+        if network_state:
+            clear_network_profile(sender, network_state.get("interface"))
 
 
-def webrtc_pair(name: str, sender: str, receiver: str, width: int, height: int, domain: int, *, target: str, clock_target: str, clock_hub: str | None = None, cloud: str | None = None) -> None:
+def webrtc_pair(
+    name: str,
+    sender: str,
+    receiver: str,
+    width: int,
+    height: int,
+    domain: int,
+    *,
+    target: str,
+    clock_target: str,
+    clock_hub: str | None = None,
+    cloud: str | None = None,
+    network_profile: str = "unconstrained",
+) -> None:
     print(f"\n=== {name} ===", flush=True)
     labels: list[tuple[str, str]] = []
-    pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target, clock_hub=clock_hub)
+    resource_labels: dict[str, list[str]] = {}
+    samplers: list[tuple[str, str, str]] = []
+    network_state: dict | None = None
+    pre_clock: dict | None = None
     signal_py = "python3"
-    venv_nodes = {"wsl", "arancino"}
-    machine_py = ".venv-webrtc/bin/python" if receiver in venv_nodes else "python3"
-    robot_py = ".venv-webrtc/bin/python" if sender in venv_nodes else "python3"
+    machine_py = python_bin_expr()
+    robot_py = python_bin_expr()
     try:
+        network_state = apply_network_profile(sender, clock_target, network_profile)
+        write_local_json(f"{name}_network.json", network_state)
+        pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target, clock_hub=clock_hub)
         if cloud:
             start_bg(cloud, f"{name}_signal", f"{signal_py} scripts/webrtc_signal_relay.py --host 0.0.0.0 --port 8765", domain=0, localhost_only=1)
             labels.append((cloud, f"{name}_signal"))
+            resource_labels.setdefault(cloud, []).append(f"{name}_signal")
             time.sleep(2)
             machine_signal = f"ws://{target}:8765"
             robot_signal = f"ws://{target}:8765"
@@ -736,6 +903,7 @@ def webrtc_pair(name: str, sender: str, receiver: str, width: int, height: int, 
 
         start_bg(receiver, f"{name}_machine", machine_cmd, domain=domain, localhost_only=1)
         labels.append((receiver, f"{name}_machine"))
+        resource_labels.setdefault(receiver, []).append(f"{name}_machine")
         time.sleep(4)
         fake_cmd = (
             f"python3 scripts/benchmark_camera_ros.py pub --profile raw --topic /benchmark/webrtc_camera "
@@ -752,28 +920,194 @@ def webrtc_pair(name: str, sender: str, receiver: str, width: int, height: int, 
         )
         start_bg(sender, f"{name}_fake", fake_cmd, domain=domain, localhost_only=1)
         labels.append((sender, f"{name}_fake"))
+        resource_labels.setdefault(sender, []).append(f"{name}_fake")
         time.sleep(2)
         start_bg(sender, f"{name}_robot", robot_cmd, domain=domain, localhost_only=1)
         labels.append((sender, f"{name}_robot"))
+        resource_labels.setdefault(sender, []).append(f"{name}_robot")
+        samplers = start_resource_samplers(name, resource_labels, DURATION + 20)
         time.sleep(DURATION + 15)
         fetch(receiver, f"{BENCH_REMOTE}/{name}_latency.json", f"{name}_latency.json")
+        stop_and_fetch_samplers(samplers)
+        samplers = []
         clock = finish_clock_file(name, sender, receiver, clock_target, pre_clock, clock_hub=clock_hub)
         apply_webrtc_clock_correction(name, clock)
     finally:
+        if samplers:
+            stop_and_fetch_samplers(samplers)
         for node, label in reversed(labels):
             stop_label(node, label)
+        if network_state:
+            clear_network_profile(sender, network_state.get("interface"))
+
+
+def control_pair(
+    name: str,
+    sender: str,
+    receiver: str,
+    domain: int,
+    *,
+    transport: str,
+    target: str | None,
+    cloud: str | None = None,
+    clock_target: str,
+    zenoh_arm: str = "tcp",
+    network_profile: str = "unconstrained",
+    video_load: tuple[int, int] | None = None,
+) -> None:
+    print(f"\n=== {name} ===", flush=True)
+    labels: list[tuple[str, str]] = []
+    resource_labels: dict[str, list[str]] = {}
+    samplers: list[tuple[str, str, str]] = []
+    network_state: dict | None = None
+    try:
+        network_state = apply_network_profile(sender, clock_target, network_profile)
+        write_local_json(f"{name}_network.json", network_state)
+        if transport == "zenoh":
+            if zenoh_arm not in ZENOH_ARMS:
+                raise ValueError(f"unknown Zenoh arm: {zenoh_arm}")
+            if cloud:
+                listen_endpoint = zenoh_endpoint(zenoh_arm, "0.0.0.0")
+                connect_endpoint = zenoh_endpoint(zenoh_arm, target)
+                start_bg(
+                    cloud,
+                    f"{name}_cloud_bridge",
+                    zenoh_bridge_command(".run/bench/zenoh_cloud.json5", listen_endpoint, "router", zenoh_arm, listener=True),
+                    domain=domain,
+                    localhost_only=1,
+                )
+                labels.append((cloud, f"{name}_cloud_bridge"))
+                resource_labels.setdefault(cloud, []).append(f"{name}_cloud_bridge")
+                time.sleep(2)
+                start_bg(
+                    receiver,
+                    f"{name}_machine_bridge",
+                    zenoh_bridge_command(".run/bench/zenoh_sub.json5", connect_endpoint, "client", zenoh_arm, listener=False),
+                    domain=domain,
+                    localhost_only=1,
+                )
+                start_bg(
+                    sender,
+                    f"{name}_robot_bridge",
+                    zenoh_bridge_command(".run/bench/zenoh_pub.json5", connect_endpoint, "client", zenoh_arm, listener=False),
+                    domain=domain,
+                    localhost_only=1,
+                )
+                labels.extend([(receiver, f"{name}_machine_bridge"), (sender, f"{name}_robot_bridge")])
+                resource_labels.setdefault(receiver, []).append(f"{name}_machine_bridge")
+                resource_labels.setdefault(sender, []).append(f"{name}_robot_bridge")
+            else:
+                listen_endpoint = zenoh_endpoint(zenoh_arm, "0.0.0.0")
+                connect_endpoint = zenoh_endpoint(zenoh_arm, target)
+                start_bg(
+                    receiver,
+                    f"{name}_machine_bridge",
+                    zenoh_bridge_command(".run/bench/zenoh_sub.json5", listen_endpoint, "router", zenoh_arm, listener=True),
+                    domain=domain,
+                    localhost_only=1,
+                )
+                labels.append((receiver, f"{name}_machine_bridge"))
+                resource_labels.setdefault(receiver, []).append(f"{name}_machine_bridge")
+                time.sleep(2)
+                start_bg(
+                    sender,
+                    f"{name}_robot_bridge",
+                    zenoh_bridge_command(".run/bench/zenoh_pub.json5", connect_endpoint, "client", zenoh_arm, listener=False),
+                    domain=domain,
+                    localhost_only=1,
+                )
+                labels.append((sender, f"{name}_robot_bridge"))
+                resource_labels.setdefault(sender, []).append(f"{name}_robot_bridge")
+            time.sleep(5)
+            assert_zenoh_transport(labels, zenoh_arm)
+
+        localhost_only = 0 if transport == "dds" else 1
+        robot_cmd = (
+            f"python3 scripts/benchmark_cmd_vel_ros.py robot --cmd-topic /benchmark/cmd_vel "
+            f"--ack-topic /benchmark/cmd_vel_ack --duration {DURATION + 8:.0f} --qos-depth {QOS_DEPTH} "
+            f"--json {BENCH_REMOTE}/{name}_robot_ack.json"
+        )
+        machine_cmd = (
+            f"python3 scripts/benchmark_cmd_vel_ros.py machine --cmd-topic /benchmark/cmd_vel "
+            f"--ack-topic /benchmark/cmd_vel_ack --rate-hz {CONTROL_RATE_HZ:g} --duration {DURATION:.0f} "
+            f"--qos-depth {QOS_DEPTH} --json {BENCH_REMOTE}/{name}_cmd.json "
+            f"--samples-json {BENCH_REMOTE}/{name}_cmd.samples.json"
+        )
+        start_bg(sender, f"{name}_robot_ack", robot_cmd, domain=domain, localhost_only=localhost_only)
+        labels.append((sender, f"{name}_robot_ack"))
+        resource_labels.setdefault(sender, []).append(f"{name}_robot_ack")
+        time.sleep(2)
+
+        if video_load:
+            width, height = video_load
+            load_sub_cmd = (
+                f"python3 scripts/benchmark_camera_ros.py sub --profile compressed --topic /benchmark/camera "
+                f"--width {width} --height {height} --fps {FPS} --duration {DURATION + 5:.0f} --qos-depth {QOS_DEPTH} "
+                f"--fresh-deadline-ms {DEADLINE_MS} --json {BENCH_REMOTE}/{name}_load_sub.json "
+                f"--samples-json {BENCH_REMOTE}/{name}_load_sub.samples.json"
+            )
+            load_pub_cmd = (
+                f"python3 scripts/benchmark_camera_ros.py pub --profile compressed --topic /benchmark/camera "
+                f"--width {width} --height {height} --fps {FPS} --duration {DURATION:.0f} --qos-depth {QOS_DEPTH} "
+                f"--jpeg-quality 72 --scene textured --json {BENCH_REMOTE}/{name}_load_pub.json"
+            )
+            start_bg(receiver, f"{name}_load_sub", load_sub_cmd, domain=domain, localhost_only=localhost_only)
+            labels.append((receiver, f"{name}_load_sub"))
+            resource_labels.setdefault(receiver, []).append(f"{name}_load_sub")
+            time.sleep(2)
+            start_bg(sender, f"{name}_load_pub", load_pub_cmd, domain=domain, localhost_only=localhost_only)
+            labels.append((sender, f"{name}_load_pub"))
+            resource_labels.setdefault(sender, []).append(f"{name}_load_pub")
+
+        start_bg(receiver, f"{name}_machine_cmd", machine_cmd, domain=domain, localhost_only=localhost_only)
+        labels.append((receiver, f"{name}_machine_cmd"))
+        resource_labels.setdefault(receiver, []).append(f"{name}_machine_cmd")
+        samplers = start_resource_samplers(name, resource_labels, DURATION + 15)
+        time.sleep(DURATION + 10)
+        fetch(sender, f"{BENCH_REMOTE}/{name}_robot_ack.json", f"{name}_robot_ack.json")
+        fetch(receiver, f"{BENCH_REMOTE}/{name}_cmd.json", f"{name}_cmd.json")
+        fetch(receiver, f"{BENCH_REMOTE}/{name}_cmd.samples.json", f"{name}_cmd.samples.json")
+        if video_load:
+            fetch(sender, f"{BENCH_REMOTE}/{name}_load_pub.json", f"{name}_load_pub.json")
+            fetch(receiver, f"{BENCH_REMOTE}/{name}_load_sub.json", f"{name}_load_sub.json")
+            fetch(receiver, f"{BENCH_REMOTE}/{name}_load_sub.samples.json", f"{name}_load_sub.samples.json")
+        stop_and_fetch_samplers(samplers)
+        samplers = []
+    finally:
+        if samplers:
+            stop_and_fetch_samplers(samplers)
+        for node, label in reversed(labels):
+            stop_label(node, label)
+        if network_state:
+            clear_network_profile(sender, network_state.get("interface"))
 
 
 def main() -> None:
     BENCH_WIN.mkdir(parents=True, exist_ok=True)
     for artifact in BENCH_WIN.glob("modeb_*"):
         artifact.unlink()
+    for artifact in BENCH_WIN.glob("cmd_*"):
+        artifact.unlink()
+    for artifact in BENCH_WIN.glob("*_resources.csv"):
+        artifact.unlink()
+    for artifact in BENCH_WIN.glob("*_network.json"):
+        artifact.unlink()
     for artifact in BENCH_WIN.glob("*_clock*.json"):
         artifact.unlink()
     selected_resolutions = set(filter(None, os.environ.get("HORUS_BENCH_RESOLUTIONS", ",".join(RESOLUTIONS)).split(",")))
     selected_paths = set(filter(None, os.environ.get("HORUS_BENCH_PATHS", ",".join(PATHS)).split(",")))
     selected_transports = set(filter(None, os.environ.get("HORUS_BENCH_TRANSPORTS", "dds,zenoh,webrtc").split(",")))
+    selected_network_profiles = list(
+        filter(None, os.environ.get("HORUS_BENCH_NETWORK_PROFILES", "unconstrained").split(","))
+    )
+    unknown_profiles = [profile for profile in selected_network_profiles if profile not in NETWORK_PROFILES]
+    if unknown_profiles:
+        raise ValueError(f"unknown network profiles: {', '.join(unknown_profiles)}")
+    run_control = os.environ.get("HORUS_BENCH_CONTROL", "0").lower() in {"1", "true", "yes", "on"}
+    control_with_video = os.environ.get("HORUS_BENCH_CONTROL_WITH_VIDEO", "0").lower() in {"1", "true", "yes", "on"}
+    selected_control_transports = set(filter(None, os.environ.get("HORUS_BENCH_CONTROL_TRANSPORTS", "zenoh").split(",")))
     zenoh_arms = zenoh_arms_from_selection(selected_transports)
+    control_zenoh_arms = zenoh_arms_from_selection(selected_control_transports)
     active_nodes = {"wsl"}
     for path, info in PATHS.items():
         if path not in selected_paths:
@@ -797,6 +1131,10 @@ def main() -> None:
         "clock_drift_limit_ms": CLOCK_DRIFT_LIMIT_MS,
         "zenoh_production_arm": ZENOH_PRODUCTION_ARM,
         "selected_transports": sorted(selected_transports),
+        "selected_network_profiles": selected_network_profiles,
+        "run_control": run_control,
+        "control_with_video": control_with_video,
+        "selected_control_transports": sorted(selected_control_transports),
         "nodes": NODES,
         "paths": PATHS,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -816,62 +1154,117 @@ def main() -> None:
             target = info["target"]
             clock_target = info["clock_target"]
             clock_hub = info.get("clock_hub")
-            if path != "cloud" and "dds" in selected_transports:
-                conditions.append(
-                    {
-                        "kind": "ros",
-                        "name": f"modeb_{resolution}_{path}_dds",
-                        "sender": sender,
-                        "receiver": receiver,
-                        "profile": "compressed",
-                        "width": width,
-                        "height": height,
-                        "domain": domain,
-                        "transport": "dds",
-                        "target": target,
-                        "clock_target": clock_target,
-                        "clock_hub": clock_hub,
-                    }
-                )
-                domain += 10
             cloud = info.get("hub")
-            for transport_label, zenoh_arm in zenoh_arms:
-                conditions.append(
-                    {
-                        "kind": "ros",
-                        "name": f"modeb_{resolution}_{path}_{transport_label}",
-                        "sender": sender,
-                        "receiver": receiver,
-                        "profile": "compressed",
-                        "width": width,
-                        "height": height,
-                        "domain": domain,
-                        "transport": "zenoh",
-                        "target": target,
-                        "clock_target": clock_target,
-                        "clock_hub": clock_hub,
-                        "cloud": cloud,
-                        "zenoh_arm": zenoh_arm,
-                    }
-                )
-                domain += 10
-            if "webrtc" in selected_transports:
-                conditions.append(
-                    {
-                        "kind": "webrtc",
-                        "name": f"modeb_{resolution}_{path}_webrtc",
-                        "sender": sender,
-                        "receiver": receiver,
-                        "width": width,
-                        "height": height,
-                        "domain": domain,
-                        "target": target,
-                        "clock_target": clock_target,
-                        "clock_hub": clock_hub,
-                        "cloud": cloud,
-                    }
-                )
-                domain += 10
+            for network_profile in selected_network_profiles:
+                suffix = network_profile_suffix(network_profile)
+                if path != "cloud" and "dds" in selected_transports:
+                    conditions.append(
+                        {
+                            "kind": "ros",
+                            "name": f"modeb_{resolution}_{path}_dds{suffix}",
+                            "sender": sender,
+                            "receiver": receiver,
+                            "profile": "compressed",
+                            "width": width,
+                            "height": height,
+                            "domain": domain,
+                            "transport": "dds",
+                            "target": target,
+                            "clock_target": clock_target,
+                            "clock_hub": clock_hub,
+                            "network_profile": network_profile,
+                        }
+                    )
+                    domain += 10
+                for transport_label, zenoh_arm in zenoh_arms:
+                    conditions.append(
+                        {
+                            "kind": "ros",
+                            "name": f"modeb_{resolution}_{path}_{transport_label}{suffix}",
+                            "sender": sender,
+                            "receiver": receiver,
+                            "profile": "compressed",
+                            "width": width,
+                            "height": height,
+                            "domain": domain,
+                            "transport": "zenoh",
+                            "target": target,
+                            "clock_target": clock_target,
+                            "clock_hub": clock_hub,
+                            "cloud": cloud,
+                            "zenoh_arm": zenoh_arm,
+                            "network_profile": network_profile,
+                        }
+                    )
+                    domain += 10
+                if "webrtc" in selected_transports:
+                    conditions.append(
+                        {
+                            "kind": "webrtc",
+                            "name": f"modeb_{resolution}_{path}_webrtc{suffix}",
+                            "sender": sender,
+                            "receiver": receiver,
+                            "width": width,
+                            "height": height,
+                            "domain": domain,
+                            "target": target,
+                            "clock_target": clock_target,
+                            "clock_hub": clock_hub,
+                            "cloud": cloud,
+                            "network_profile": network_profile,
+                        }
+                    )
+                    domain += 10
+    if run_control:
+        control_resolution = os.environ.get("HORUS_BENCH_CONTROL_LOAD_RESOLUTION", "1080p30")
+        if control_resolution not in RESOLUTIONS:
+            raise ValueError(f"unknown control load resolution: {control_resolution}")
+        video_load = RESOLUTIONS[control_resolution] if control_with_video else None
+        for path, info in PATHS.items():
+            if path not in selected_paths:
+                continue
+            sender = info["sender"]
+            receiver = info["receiver"]
+            target = info["target"]
+            clock_target = info["clock_target"]
+            cloud = info.get("hub")
+            for network_profile in selected_network_profiles:
+                suffix = network_profile_suffix(network_profile)
+                load_suffix = "_with_video" if control_with_video else ""
+                if path != "cloud" and "dds" in selected_control_transports:
+                    conditions.append(
+                        {
+                            "kind": "control",
+                            "name": f"cmd_{path}_dds{load_suffix}{suffix}",
+                            "sender": sender,
+                            "receiver": receiver,
+                            "domain": domain,
+                            "transport": "dds",
+                            "target": target,
+                            "clock_target": clock_target,
+                            "network_profile": network_profile,
+                            "video_load": video_load,
+                        }
+                    )
+                    domain += 10
+                for transport_label, zenoh_arm in control_zenoh_arms:
+                    conditions.append(
+                        {
+                            "kind": "control",
+                            "name": f"cmd_{path}_{transport_label}{load_suffix}{suffix}",
+                            "sender": sender,
+                            "receiver": receiver,
+                            "domain": domain,
+                            "transport": "zenoh",
+                            "target": target,
+                            "cloud": cloud,
+                            "clock_target": clock_target,
+                            "network_profile": network_profile,
+                            "zenoh_arm": zenoh_arm,
+                            "video_load": video_load,
+                        }
+                    )
+                    domain += 10
     seed = int(os.environ.get("HORUS_BENCH_SHUFFLE_SEED", "20260705"))
     try:
         for rep in range(1, REPETITIONS + 1):
@@ -894,8 +1287,9 @@ def main() -> None:
                         clock_target=condition["clock_target"],
                         clock_hub=condition.get("clock_hub"),
                         zenoh_arm=condition.get("zenoh_arm", "tcp"),
+                        network_profile=condition.get("network_profile", "unconstrained"),
                     )
-                else:
+                elif condition["kind"] == "webrtc":
                     webrtc_pair(
                         name,
                         condition["sender"],
@@ -907,6 +1301,21 @@ def main() -> None:
                         clock_target=condition["clock_target"],
                         clock_hub=condition.get("clock_hub"),
                         cloud=condition.get("cloud"),
+                        network_profile=condition.get("network_profile", "unconstrained"),
+                    )
+                else:
+                    control_pair(
+                        name,
+                        condition["sender"],
+                        condition["receiver"],
+                        condition["domain"] + rep,
+                        transport=condition["transport"],
+                        target=condition.get("target"),
+                        cloud=condition.get("cloud"),
+                        clock_target=condition["clock_target"],
+                        zenoh_arm=condition.get("zenoh_arm", "tcp"),
+                        network_profile=condition.get("network_profile", "unconstrained"),
+                        video_load=condition.get("video_load"),
                     )
     finally:
         stop_all(active_nodes)
