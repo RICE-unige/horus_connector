@@ -38,7 +38,7 @@ NODES = {
     "arancino": {"kind": "ssh", "alias": "arancino", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "ip": "10.186.13.53"},
     "arancina": {"kind": "ssh", "alias": "arancina", "distro": "jazzy", "root": "/home/rice/horus_connector", "ip": "10.186.13.39"},
     "poke": {"kind": "ssh", "alias": "poke", "distro": "humble", "root": "/home/rice/horus_connector", "ip": "100.73.164.13"},
-    "cloud": {"kind": "ssh", "alias": "googlecloud", "distro": "", "root": "/home/adebayoadekoya01/horus_connector", "ip": "34.7.220.13"},
+    "cloud": {"kind": "ssh", "alias": "googlecloud", "distro": "", "root": "/home/adeko/horus_connector", "ip": "34.7.220.13"},
 }
 
 for node_name, info in NODES.items():
