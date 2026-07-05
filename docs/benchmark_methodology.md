@@ -101,6 +101,8 @@ python3 scripts/run_distributed_benchmark.py
 The runner interleaves repetitions, uses camera QoS depth 1, probes clock offset
 before and after each condition, rejects excessive drift, and aborts if the
 requested Zenoh transport is not the transport that actually started.
+The default clock-probe port is TCP `8765`, reused before WebRTC signaling starts
+so cloud firewalls do not need an extra benchmark-only port.
 
 Create one artifact name per condition:
 
