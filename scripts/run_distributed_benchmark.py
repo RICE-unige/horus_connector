@@ -200,7 +200,14 @@ def bash_prefix(node: str, domain: int, localhost_only: int) -> str:
 
 
 def setup_node(node: str) -> None:
-    checked(node, f"cd {shlex.quote(NODES[node]['root'])}; mkdir -p {BENCH_REMOTE}; rm -f {BENCH_REMOTE}/modeb_*", timeout=30)
+    checked(
+        node,
+        f"cd {shlex.quote(NODES[node]['root'])}; "
+        f"mkdir -p {BENCH_REMOTE}; "
+        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name 'modeb_*' -delete; "
+        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name '*_clock*.json' -delete",
+        timeout=120,
+    )
     put_text(node, f"{BENCH_REMOTE}/zenoh_pub.json5", ZENOH_PUB_CONFIG)
     put_text(node, f"{BENCH_REMOTE}/zenoh_sub.json5", ZENOH_SUB_CONFIG)
     put_text(node, f"{BENCH_REMOTE}/zenoh_cloud.json5", ZENOH_CLOUD_CONFIG)
@@ -669,6 +676,10 @@ def webrtc_pair(name: str, sender: str, receiver: str, width: int, height: int, 
 
 def main() -> None:
     BENCH_WIN.mkdir(parents=True, exist_ok=True)
+    for artifact in BENCH_WIN.glob("modeb_*"):
+        artifact.unlink()
+    for artifact in BENCH_WIN.glob("*_clock*.json"):
+        artifact.unlink()
     selected_resolutions = set(filter(None, os.environ.get("HORUS_BENCH_RESOLUTIONS", ",".join(RESOLUTIONS)).split(",")))
     selected_paths = set(filter(None, os.environ.get("HORUS_BENCH_PATHS", ",".join(PATHS)).split(",")))
     selected_transports = set(filter(None, os.environ.get("HORUS_BENCH_TRANSPORTS", "dds,zenoh,webrtc").split(",")))
