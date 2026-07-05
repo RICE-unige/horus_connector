@@ -316,6 +316,7 @@ def stop_all(nodes: set[str] | None = None) -> None:
     for node in nodes or set(NODES):
         cleanup = (
             f"cd {shlex.quote(NODES[node]['root'])} 2>/dev/null || exit 0; "
+            "sudo -n systemctl stop horus-cloud.service 2>/dev/null || true; "
             f"for p in {BENCH_REMOTE}/*.pid; do [ -f \"$p\" ] || continue; "
             "pid=$(cat \"$p\"); kill $pid 2>/dev/null || true; rm -f \"$p\"; done; "
             "sleep 0.5; "
