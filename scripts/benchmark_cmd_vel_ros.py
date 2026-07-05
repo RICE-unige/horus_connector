@@ -106,7 +106,11 @@ class MachineProbeNode(Node):
         self.samples: list[dict] = []
         self.publisher = self.create_publisher(String, args.cmd_topic, qos(args.qos_depth))
         self.create_subscription(String, args.ack_topic, self.on_ack, qos(args.qos_depth))
-        self.create_timer(1.0 / args.rate_hz, self.publish_command)
+        self.timer = None
+
+    def start_publishing(self):
+        self.started = time.monotonic()
+        self.timer = self.create_timer(1.0 / self.args.rate_hz, self.publish_command)
 
     def publish_command(self):
         seq = self.seq
@@ -187,6 +191,7 @@ def parse_args():
     parser.add_argument("--qos-depth", type=int, default=1)
     parser.add_argument("--linear-x", type=float, default=0.05)
     parser.add_argument("--angular-z", type=float, default=0.02)
+    parser.add_argument("--warmup-sec", type=float, default=2.0)
     parser.add_argument("--json", default=None)
     parser.add_argument("--samples-json", default=None)
     return parser.parse_args()
@@ -198,6 +203,13 @@ def main():
         raise SystemExit("--rate-hz must be positive")
     rclpy.init()
     node = RobotAckNode(args) if args.role == "robot" else MachineProbeNode(args)
+    if args.role == "machine" and args.warmup_sec > 0:
+        warmup_deadline = time.monotonic() + args.warmup_sec
+        while rclpy.ok() and time.monotonic() < warmup_deadline:
+            rclpy.spin_once(node, timeout_sec=0.02)
+        node.start_publishing()
+    elif args.role == "machine":
+        node.start_publishing()
     deadline = time.monotonic() + args.duration
     try:
         while rclpy.ok() and time.monotonic() < deadline:

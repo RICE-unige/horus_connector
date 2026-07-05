@@ -1024,13 +1024,13 @@ def control_pair(
         localhost_only = 0 if transport == "dds" else 1
         robot_cmd = (
             f"python3 scripts/benchmark_cmd_vel_ros.py robot --cmd-topic /benchmark/cmd_vel "
-            f"--ack-topic /benchmark/cmd_vel_ack --duration {DURATION + 8:.0f} --qos-depth {QOS_DEPTH} "
+            f"--ack-topic /benchmark/cmd_vel_ack --duration {DURATION + 15:.0f} --qos-depth {QOS_DEPTH} "
             f"--json {BENCH_REMOTE}/{name}_robot_ack.json"
         )
         machine_cmd = (
             f"python3 scripts/benchmark_cmd_vel_ros.py machine --cmd-topic /benchmark/cmd_vel "
             f"--ack-topic /benchmark/cmd_vel_ack --rate-hz {CONTROL_RATE_HZ:g} --duration {DURATION:.0f} "
-            f"--qos-depth {QOS_DEPTH} --json {BENCH_REMOTE}/{name}_cmd.json "
+            f"--qos-depth {QOS_DEPTH} --warmup-sec 5 --json {BENCH_REMOTE}/{name}_cmd.json "
             f"--samples-json {BENCH_REMOTE}/{name}_cmd.samples.json"
         )
         start_bg(sender, f"{name}_robot_ack", robot_cmd, domain=domain, localhost_only=localhost_only)
