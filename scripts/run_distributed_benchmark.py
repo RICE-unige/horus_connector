@@ -147,7 +147,9 @@ def node_cmd(node: str, script: str, *, input_text: str | None = None, timeout: 
     if info["kind"] == "wsl":
         if os.name == "nt":
             script = script.replace("$", "\\$")
-        cmd = ["wsl.exe", "-d", "Ubuntu", "--", "bash", "-lc", script]
+            cmd = ["wsl.exe", "-d", "Ubuntu", "--", "bash", "-lc", script]
+        else:
+            cmd = ["bash", "-lc", script]
     else:
         cmd = ["ssh", info["alias"], script]
     return subprocess.run(cmd, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
