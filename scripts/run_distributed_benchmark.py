@@ -26,6 +26,7 @@ CLOCK_SAMPLES = int(os.environ.get("HORUS_BENCH_CLOCK_SAMPLES", "80"))
 CLOCK_DRIFT_LIMIT_MS = float(os.environ.get("HORUS_BENCH_CLOCK_DRIFT_LIMIT_MS", "5.0"))
 RESOURCE_INTERVAL_SEC = float(os.environ.get("HORUS_BENCH_RESOURCE_INTERVAL_SEC", "1.0"))
 CONTROL_RATE_HZ = float(os.environ.get("HORUS_BENCH_CONTROL_RATE_HZ", "20.0"))
+TC_BIN = os.environ.get("HORUS_BENCH_TC_BIN", "/usr/sbin/tc")
 ZENOH_PRODUCTION_ARM = os.environ.get("HORUS_BENCH_ZENOH_ARM", "quic_dgram")
 ZENOH_ARMS = {
     "tcp": {"endpoint": "tcp/{host}:7447", "protocol": "tcp", "tls": False},
@@ -215,6 +216,14 @@ def sudo_bash(node: str, body: str) -> str:
     if password:
         return f"printf '%s\\n' {shlex.quote(password)} | sudo -S -p '' bash -lc {quoted}"
     return f"sudo -n bash -lc {quoted}"
+
+
+def sudo_tc(node: str, *args: str) -> str:
+    password = os.environ.get(f"HORUS_BENCH_{node.upper()}_SUDO_PASSWORD") or os.environ.get("HORUS_BENCH_SUDO_PASSWORD")
+    command = " ".join([shlex.quote(TC_BIN), *(shlex.quote(arg) for arg in args)])
+    if password:
+        return f"printf '%s\\n' {shlex.quote(password)} | sudo -S -p '' {command}"
+    return f"sudo -n {command}"
 
 
 def python_bin_expr() -> str:
@@ -429,7 +438,7 @@ def route_interface(node: str, target_ip: str) -> str:
 def clear_network_profile(node: str, iface: str | None) -> None:
     if not iface:
         return
-    node_cmd(node, sudo_bash(node, f"tc qdisc del dev {shlex.quote(iface)} root 2>/dev/null || true"), timeout=20)
+    node_cmd(node, f"{sudo_tc(node, 'qdisc', 'del', 'dev', iface, 'root')} 2>/dev/null || true", timeout=20)
 
 
 def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
@@ -454,26 +463,52 @@ def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
     loss = float(profile["loss_percent"])
     delay = float(profile["delay_ms"])
     jitter = float(profile["jitter_ms"])
-    netem_parts: list[str] = []
+    netem_args: list[str] = []
     if loss > 0:
-        netem_parts.append(f"loss {loss:g}%")
+        netem_args.extend(["loss", f"{loss:g}%"])
     if delay > 0:
-        netem_parts.append(f"delay {delay:g}ms {jitter:g}ms" if jitter > 0 else f"delay {delay:g}ms")
+        netem_args.extend(["delay", f"{delay:g}ms"])
+        if jitter > 0:
+            netem_args.append(f"{jitter:g}ms")
 
     if bandwidth:
-        lines = [
-            f"tc qdisc replace dev {shlex.quote(iface)} root handle 1: htb default 10",
-            (
-                f"tc class replace dev {shlex.quote(iface)} parent 1: classid 1:10 "
-                f"htb rate {bandwidth:g}mbit ceil {bandwidth:g}mbit burst 64k cburst 64k"
+        checked(
+            node,
+            sudo_tc(node, "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "10"),
+            timeout=30,
+        )
+        checked(
+            node,
+            sudo_tc(
+                node,
+                "class",
+                "replace",
+                "dev",
+                iface,
+                "parent",
+                "1:",
+                "classid",
+                "1:10",
+                "htb",
+                "rate",
+                f"{bandwidth:g}mbit",
+                "ceil",
+                f"{bandwidth:g}mbit",
+                "burst",
+                "64k",
+                "cburst",
+                "64k",
             ),
-        ]
-        if netem_parts:
-            lines.append(f"tc qdisc replace dev {shlex.quote(iface)} parent 1:10 handle 10: netem {' '.join(netem_parts)}")
+            timeout=30,
+        )
+        if netem_args:
+            checked(
+                node,
+                sudo_tc(node, "qdisc", "replace", "dev", iface, "parent", "1:10", "handle", "10:", "netem", *netem_args),
+                timeout=30,
+            )
     else:
-        lines = [f"tc qdisc replace dev {shlex.quote(iface)} root netem {' '.join(netem_parts)}"]
-    script = "set -e; " + "; ".join(lines)
-    checked(node, sudo_bash(node, script), timeout=30)
+        checked(node, sudo_tc(node, "qdisc", "replace", "dev", iface, "root", "netem", *netem_args), timeout=30)
     payload["tc_qdisc"] = checked(node, f"tc -s qdisc show dev {shlex.quote(iface)}", timeout=10)
     return payload
 
