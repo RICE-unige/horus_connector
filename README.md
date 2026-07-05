@@ -7,7 +7,7 @@
 
 ![ROS2](https://img.shields.io/badge/ROS2-Humble%20%7C%20Jazzy-22314E)
 ![Zenoh](https://img.shields.io/badge/Zenoh-ROS2DDS-blue)
-![WebRTC](https://img.shields.io/badge/WebRTC-camera%20%2B%20optional%20cmd_vel-0A7)
+![WebRTC](https://img.shields.io/badge/WebRTC-camera%20video-0A7)
 [![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)](LICENSE)
 
 `horus_connector` is the transport layer for HORUS robot management. It connects robot ROS 2 graphs to operator machines over the internet, VPN, Tailscale, or LAN.
@@ -16,7 +16,7 @@
 
 - **Zenoh** carries ROS 2 state topics such as TF, odometry, joint states, LaserScan, and point clouds.
 - **WebRTC** carries camera video as low-latency H.264 and publishes the decoded stream back to ROS 2 on the machine.
-- **WebRTC DataChannel** can carry bounded control commands such as `/cmd_vel` when explicitly enabled.
+- **ROS 2 commands** such as `/cmd_vel` stay on ROS 2 and cross the Zenoh bridge.
 
 The cloud role is only a hub: it routes Zenoh traffic and relays WebRTC signaling. Camera encoding/decoding stays on the robot and machine.
 
@@ -116,7 +116,7 @@ Most users should use:
 ./horus setup
 ```
 
-Advanced configuration is documented in [docs/configuration.md](docs/configuration.md), including environment variables, Zenoh topic filters, priorities, TURN, hardware codec preferences, and fleet examples.
+Advanced configuration is documented in [docs/configuration.md](docs/configuration.md), including environment variables, Zenoh topic filters, priorities, QUIC/TLS, TURN, hardware codec preferences, and fleet examples.
 
 ## Benchmark
 
@@ -126,15 +126,22 @@ The benchmark compares practical camera transport paths using fresh-frame delive
 
 ## Network
 
-- Zenoh: TCP `7447`
+- Zenoh: TCP `7447`; optional QUIC on UDP `7447`
 - WebRTC signaling: TCP `8765`
-- WebRTC media/control: UDP/ICE end-to-end
+- WebRTC media: UDP/ICE end-to-end
 - TURN fallback, when enabled on cloud: TCP/UDP `3478` and UDP `49152-65535`
 
-WebRTC `/cmd_vel` publishing is disabled by default. Enable it only for robot profiles with known velocity limits:
+Zenoh QUIC uses TLS certificates. In `auto` mode HORUS uses QUIC first when TLS is configured and keeps TCP as fallback:
 
 ```bash
-export WEBRTC_ENABLE_CONTROL=1
+./horus quic setup-server          # cloud or direct-mode listener
+./horus quic install-cert cert.pem # robot and machine clients
+```
+
+Legacy WebRTC `/cmd_vel` publishing is disabled by default. Enable it only for robot profiles with known velocity limits:
+
+```bash
+export WEBRTC_CONTROL_ENABLED=1
 export HORUS_WEBRTC_CONTROL_TOKEN=<shared-control-token>
 export WEBRTC_CMD_MAX_LINEAR_MPS=0.5
 export WEBRTC_CMD_MAX_ANGULAR_RPS=1.0
