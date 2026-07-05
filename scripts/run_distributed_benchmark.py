@@ -34,7 +34,7 @@ ZENOH_ARMS = {
 
 
 NODES = {
-    "wsl": {"kind": "wsl", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "host": "local", "ip": "100.78.124.117"},
+    "wsl": {"kind": "wsl", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "host": "local", "ip": "100.70.153.10"},
     "arancino": {"kind": "ssh", "alias": "arancino", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "ip": "10.186.13.53"},
     "arancina": {"kind": "ssh", "alias": "arancina", "distro": "jazzy", "root": "/home/rice/horus_connector", "ip": "10.186.13.39"},
     "poke": {"kind": "ssh", "alias": "poke", "distro": "humble", "root": "/home/rice/horus_connector", "ip": "100.73.164.13"},
@@ -54,12 +54,18 @@ RESOLUTIONS = {
 }
 
 PATHS = {
-    "lan": {"sender": "arancina", "receiver": "arancino", "target": "10.186.13.53", "clock_target": "10.186.13.53"},
-    "vpn": {"sender": "arancina", "receiver": "wsl", "target": "100.78.124.117", "clock_target": "100.78.124.117"},
+    "lan": {"sender": "arancina", "receiver": "arancino", "target": NODES["arancino"]["ip"], "clock_target": NODES["arancino"]["ip"]},
+    "vpn": {"sender": "arancina", "receiver": "wsl", "target": NODES["wsl"]["ip"], "clock_target": NODES["wsl"]["ip"]},
     "cloud": {"sender": "arancina", "receiver": "wsl", "target": NODES["cloud"]["ip"], "clock_target": NODES["cloud"]["ip"], "clock_hub": "cloud", "hub": "cloud"},
 }
 if os.environ.get("HORUS_BENCH_VPN_SENDER"):
     PATHS["vpn"]["sender"] = os.environ["HORUS_BENCH_VPN_SENDER"]
+if os.environ.get("HORUS_BENCH_VPN_RECEIVER"):
+    PATHS["vpn"]["receiver"] = os.environ["HORUS_BENCH_VPN_RECEIVER"]
+    PATHS["vpn"]["target"] = NODES[PATHS["vpn"]["receiver"]]["ip"]
+    PATHS["vpn"]["clock_target"] = NODES[PATHS["vpn"]["receiver"]]["ip"]
+if os.environ.get("HORUS_BENCH_LAN_SENDER"):
+    PATHS["lan"]["sender"] = os.environ["HORUS_BENCH_LAN_SENDER"]
 if os.environ.get("HORUS_BENCH_LAN_RECEIVER"):
     PATHS["lan"]["receiver"] = os.environ["HORUS_BENCH_LAN_RECEIVER"]
     PATHS["lan"]["target"] = NODES[PATHS["lan"]["receiver"]]["ip"]
