@@ -325,11 +325,13 @@ def stop_all(nodes: set[str] | None = None) -> None:
             "pkill -f '[g]st_webrtc_h264_' 2>/dev/null || true; "
             "pkill -f '[w]ebrtc_signal_relay.py' 2>/dev/null || true; "
             "pkill -f '[z]enoh-bridge-ros2dds' 2>/dev/null || true; "
+            "pkill -f '[h]orus-cloud-supervisor' 2>/dev/null || true; "
             "sleep 0.5; "
             "pkill -9 -f '[b]enchmark_camera_ros.py' 2>/dev/null || true; "
             "pkill -9 -f '[g]st_webrtc_h264_' 2>/dev/null || true; "
             "pkill -9 -f '[w]ebrtc_signal_relay.py' 2>/dev/null || true; "
-            "pkill -9 -f '[z]enoh-bridge-ros2dds' 2>/dev/null || true"
+            "pkill -9 -f '[z]enoh-bridge-ros2dds' 2>/dev/null || true; "
+            "pkill -9 -f '[h]orus-cloud-supervisor' 2>/dev/null || true"
         )
         try:
             node_cmd(
