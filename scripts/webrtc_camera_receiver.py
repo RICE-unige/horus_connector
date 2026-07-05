@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import csv
 import json
+import logging
 import statistics
 import time
 from pathlib import Path
@@ -14,6 +15,8 @@ from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSession
 
 from experiment_metrics import CsvMetricWriter, default_metrics_path
 from webrtc_common import candidate_summary, unpack_frame, wait_for_ice_gathering_complete
+
+logger = logging.getLogger(__name__)
 
 
 def percentile(values, pct):
@@ -237,6 +240,7 @@ async def run(args):
                     try:
                         ack = json.loads(message if isinstance(message, str) else message.decode("utf-8"))
                     except Exception:
+                        logger.debug("Ignoring malformed cmd_vel ack message: %r", message, exc_info=True)
                         return
                     if ack.get("type") == "cmd_vel_ack":
                         recorder.record_control_ack(ack)

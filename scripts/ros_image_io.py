@@ -3,6 +3,7 @@
 
 import threading
 import time
+import logging
 from array import array
 from typing import Optional, Tuple
 
@@ -10,6 +11,8 @@ import gi
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 ROS_TO_GST = {
@@ -73,6 +76,11 @@ def ensure_rclpy():
 
 def contiguous_image_bytes(data, step: int, expected_step: int, height: int) -> bytes:
     raw = memoryview(data)
+    if height <= 0 or expected_step <= 0 or step <= 0:
+        raise ValueError("image dimensions and step must be positive")
+    required_size = step * (height - 1) + expected_step
+    if len(raw) < required_size:
+        raise ValueError(f"image data too short: got {len(raw)} bytes, need at least {required_size}")
     expected_size = expected_step * height
     if step == expected_step:
         return bytes(raw[:expected_size])
@@ -139,7 +147,7 @@ class RosImageAppSrc:
                 try:
                     self.appsrc.set_property(name, value)
                 except Exception:
-                    pass
+                    logger.debug("Failed to configure appsrc property %s=%r", name, value, exc_info=True)
 
     def close(self):
         if self.executor is not None:
@@ -166,13 +174,20 @@ class RosImageAppSrc:
 
         width = int(msg.width)
         height = int(msg.height)
+        if width <= 0 or height <= 0:
+            print(f"dropping malformed ROS image: width={width}, height={height}", flush=True)
+            return
         expected_step = width * bytes_per_pixel
         step = int(msg.step or expected_step)
         if step < expected_step:
             print(f"dropping malformed ROS image: step={step}, expected at least {expected_step}", flush=True)
             return
 
-        payload = contiguous_image_bytes(msg.data, step, expected_step, height)
+        try:
+            payload = contiguous_image_bytes(msg.data, step, expected_step, height)
+        except ValueError as exc:
+            print(f"dropping malformed ROS image: {exc}", flush=True)
+            return
         caps = f"video/x-raw,format={gst_format},width={width},height={height},framerate={self.fps}/1"
         if caps != self.caps_string:
             self.appsrc.set_property("caps", Gst.Caps.from_string(caps))
@@ -260,6 +275,9 @@ class RosImagePublisher:
         structure = caps.get_structure(0)
         width = int(structure.get_value("width"))
         height = int(structure.get_value("height"))
+        if width <= 0 or height <= 0:
+            print(f"dropping decoded frame with invalid dimensions {width}x{height}", flush=True)
+            return False
         gst_format = structure.get_value("format")
         if gst_format != self.gst_format:
             print(f"dropping decoded frame with unexpected format {gst_format}", flush=True)
@@ -273,6 +291,10 @@ class RosImagePublisher:
             data = bytes(info.data)
         finally:
             buffer.unmap(info)
+        expected_size = width * height * self.bytes_per_pixel
+        if len(data) != expected_size:
+            print(f"dropping decoded frame with {len(data)} bytes, expected {expected_size}", flush=True)
+            return False
 
         msg = self.image_type()
         msg.header.stamp = self.node.get_clock().now().to_msg()

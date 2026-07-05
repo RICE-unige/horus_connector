@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Machine-side H.264 WebRTC receiver with cmd_vel DataChannel send."""
+"""Machine-side H.264 WebRTC video receiver."""
 
 import argparse
 from collections import deque
 import json
+import logging
 import os
+import signal
 import statistics
 import time
 from pathlib import Path
@@ -24,6 +26,8 @@ from ros_image_io import RosImagePublisher
 
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 class H264MachineReceiver:
@@ -46,6 +50,7 @@ class H264MachineReceiver:
         self.recovering = False
         self.answer_in_progress = False
         self.last_remote_offer_sdp = ""
+        self.stopped = False
         if self.args.video_output in {"ros2", "both"}:
             self.ros_image_publisher = RosImagePublisher(
                 self.args.ros_image_topic,
@@ -93,6 +98,8 @@ class H264MachineReceiver:
             self.webrtc.connect("on-data-channel", self._on_data_channel)
         except TypeError:
             print("WebRTC DataChannel unavailable in this GStreamer runtime; cmd_vel over WebRTC disabled", flush=True)
+        signal.signal(signal.SIGTERM, self._handle_stop_signal)
+        signal.signal(signal.SIGINT, self._handle_stop_signal)
         self.pipeline.set_state(Gst.State.PLAYING)
         if self.args.duration > 0:
             GLib.timeout_add_seconds(int(self.args.duration), self.stop)
@@ -101,7 +108,13 @@ class H264MachineReceiver:
         finally:
             self.stop()
 
+    def _handle_stop_signal(self, _signum, _frame):
+        GLib.idle_add(self.stop)
+
     def stop(self):
+        if self.stopped:
+            return False
+        self.stopped = True
         if self.video_frames:
             observed_sec = max((self.video_last_sec or 0.0) - (self.video_first_sec or 0.0), 0.001)
             payload = {
@@ -376,6 +389,7 @@ class H264MachineReceiver:
         try:
             message = json.loads(text)
         except Exception:
+            logger.debug("Ignoring malformed frame clock message: %s", text, exc_info=True)
             return
         if message.get("type") != "frame_clock" or "sent_ns" not in message:
             return
@@ -411,6 +425,7 @@ class H264MachineReceiver:
         try:
             ack = json.loads(text)
         except Exception:
+            logger.debug("Ignoring malformed cmd_vel ack message: %s", text, exc_info=True)
             return
         if ack.get("type") != "cmd_vel_ack":
             return

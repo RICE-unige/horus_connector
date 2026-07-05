@@ -9,7 +9,7 @@ from array import array
 
 try:
     import numpy as np
-except Exception:
+except ImportError:
     np = None
 
 import rclpy
@@ -41,7 +41,7 @@ def assign_uint8_sequence(msg, field_name: str, payload: bytearray):
         try:
             setattr(msg, field_name, value)
             return
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             continue
     setattr(msg, field_name, payload)
 
