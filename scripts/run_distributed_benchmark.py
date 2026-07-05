@@ -41,6 +41,13 @@ NODES = {
     "cloud": {"kind": "ssh", "alias": "googlecloud", "distro": "", "root": "/home/adebayoadekoya01/horus_connector", "ip": "34.7.220.13"},
 }
 
+for node_name, info in NODES.items():
+    prefix = f"HORUS_BENCH_{node_name.upper()}_"
+    info["root"] = os.environ.get(prefix + "ROOT", info["root"])
+    info["ip"] = os.environ.get(prefix + "IP", info["ip"])
+    if info["kind"] == "ssh":
+        info["alias"] = os.environ.get(prefix + "ALIAS", info["alias"])
+
 RESOLUTIONS = {
     "1080p30": (1920, 1080),
     "720p30": (1280, 720),
@@ -49,7 +56,7 @@ RESOLUTIONS = {
 PATHS = {
     "lan": {"sender": "arancina", "receiver": "arancino", "target": "10.186.13.53", "clock_target": "10.186.13.53"},
     "vpn": {"sender": "arancina", "receiver": "wsl", "target": "100.78.124.117", "clock_target": "100.78.124.117"},
-    "cloud": {"sender": "arancina", "receiver": "wsl", "target": "34.7.220.13", "clock_target": "100.78.124.117", "hub": "cloud"},
+    "cloud": {"sender": "arancina", "receiver": "wsl", "target": NODES["cloud"]["ip"], "clock_target": "100.78.124.117", "hub": "cloud"},
 }
 if os.environ.get("HORUS_BENCH_VPN_SENDER"):
     PATHS["vpn"]["sender"] = os.environ["HORUS_BENCH_VPN_SENDER"]
