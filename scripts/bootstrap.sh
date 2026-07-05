@@ -50,6 +50,41 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+trim_spaces() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+load_key_value_file() {
+  local file="$1"
+  local line key value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    line="$(trim_spaces "${line}")"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    if [[ "${line}" =~ ^export[[:space:]]+(.+)$ ]]; then
+      line="${BASH_REMATCH[1]}"
+    fi
+    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      log_warn "Ignoring invalid config line in ${file}: ${line}"
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="$(trim_spaces "${BASH_REMATCH[2]}")"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+
 machine_kind() {
   if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
     echo "wsl2"
@@ -78,6 +113,7 @@ hardware_kind() {
 APT_BASE_PACKAGES=(
   curl
   ca-certificates
+  openssl
   unzip
   python3
   python3-pip
@@ -333,19 +369,10 @@ check_ros2_runtime() {
   return 1
 }
 
-latest_zenoh_version() {
+resolve_zenoh_version() {
   if [[ -n "${ZENOH_VERSION:-}" ]]; then
     echo "${ZENOH_VERSION}"
     return
-  fi
-
-  if have curl; then
-    local latest
-    latest="$(curl -fsSL --connect-timeout 10 --max-time 20 https://api.github.com/repos/eclipse-zenoh/zenoh-plugin-ros2dds/releases/latest 2>/dev/null \
-      | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      | head -1 \
-      | sed 's/^v//')"
-    [[ -n "${latest}" ]] && echo "${latest}" && return
   fi
 
   echo "1.9.0"
@@ -360,12 +387,16 @@ rust_target() {
 }
 
 install_zenoh() {
-  local version target zip url
+  local version target archive zip download_base url sums_url sums_file expected_sha
   local check_log="${TMPDIR:-/tmp}/horus_connector_${UID}_zenoh_bridge_check.log"
-  version="$(latest_zenoh_version)"
+  version="$(resolve_zenoh_version)"
   target="$(rust_target)"
-  zip="${ROOT}/zenoh-plugin-ros2dds-${version}-${target}-standalone.zip"
-  url="https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases/download/${version}/zenoh-plugin-ros2dds-${version}-${target}-standalone.zip"
+  archive="zenoh-plugin-ros2dds-${version}-${target}-standalone.zip"
+  zip="${ROOT}/${archive}"
+  download_base="${ZENOH_DOWNLOAD_BASE:-https://download.eclipse.org/zenoh/zenoh-plugin-ros2dds/${version}}"
+  url="${download_base}/${archive}"
+  sums_url="${download_base}/sha256sums.txt"
+  sums_file="${ROOT}/sha256sums-${version}.txt"
 
   log_info "Zenoh bridge target: ${version} (${target})"
   if [[ -x "${ROOT}/zenoh-bridge-ros2dds" ]] && "${ROOT}/zenoh-bridge-ros2dds" --version 2>/dev/null | grep -q "${version}"; then
@@ -374,12 +405,21 @@ install_zenoh() {
     return
   fi
 
-  if ! have curl || ! have unzip; then
-    log_error "curl/unzip missing; cannot install Zenoh automatically."
+  if ! have curl || ! have unzip || ! have sha256sum; then
+    log_error "curl, unzip, and sha256sum are required to install Zenoh automatically."
     return 1
   fi
 
   curl -fL --retry 3 --connect-timeout 20 -o "${zip}.tmp" "${url}"
+  curl -fL --retry 3 --connect-timeout 20 -o "${sums_file}.tmp" "${sums_url}"
+  mv "${sums_file}.tmp" "${sums_file}"
+  expected_sha="$(awk -v archive="${archive}" '$2 == archive {print $1; exit}' "${sums_file}")"
+  if [[ -z "${expected_sha}" ]]; then
+    log_error "No checksum found for ${archive} in ${sums_url}."
+    rm -f "${zip}.tmp"
+    return 1
+  fi
+  echo "${expected_sha}  ${zip}.tmp" | sha256sum -c -
   mv "${zip}.tmp" "${zip}"
   unzip -o "${zip}" -d "${ROOT}"
   chmod +x "${ROOT}/zenoh-bridge-ros2dds" "${ROOT}/libzenoh_plugin_ros2dds.so" 2>/dev/null || true
@@ -452,10 +492,7 @@ configure_zenoh_docker_fallback() {
   log_warn "Zenoh binary is not compatible with this host; using Docker fallback."
   log_warn "Binary error: ${error//$'\n'/ }"
   if [[ "${mode}" == "sudo" ]]; then
-    if ! sudo -n docker pull "${image}"; then
-      image="eclipse/zenoh-bridge-ros2dds:latest"
-      sudo -n docker pull "${image}" || return 1
-    fi
+    sudo -n docker pull "${image}" || return 1
     write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using Docker fallback. Add the user to the docker group for passwordless launches."
   elif [[ "${mode}" == "sudo-unverified" ]]; then
     write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using sudo Docker fallback. Run sudo -v before launch, or add the user to the docker group."
@@ -463,10 +500,7 @@ configure_zenoh_docker_fallback() {
     log_info "Before launch, run: sudo -v"
     log_info "If the image is not cached yet, run: sudo docker pull ${image}"
   else
-    if ! docker pull "${image}"; then
-      image="eclipse/zenoh-bridge-ros2dds:latest"
-      docker pull "${image}" || return 1
-    fi
+    docker pull "${image}" || return 1
     write_zenoh_profile "docker" "0" "${image}" "Host binary incompatible; using Docker fallback."
   fi
   log_success "Configured Zenoh Docker fallback: ${image}"
@@ -479,10 +513,10 @@ if [[ ! -f .env ]]; then
   log_success "Created new config: ${BOLD}.env${RESET} (from .env.example)"
 fi
 
-set -a
-# shellcheck source=/dev/null
-source .env
-set +a
+load_key_value_file .env
+if [[ -f .zenoh_tls_profile.env ]]; then
+  load_key_value_file .zenoh_tls_profile.env
+fi
 
 if [[ -n "${ROLE_ARG}" && "${ROLE_ARG}" != "auto" ]]; then
   ROLE="${ROLE_ARG}"
@@ -510,6 +544,36 @@ echo ""
 
 check_ros2_runtime
 run_apt
+zenoh_quic_requested() {
+  case "${ZENOH_TRANSPORT:-auto}" in
+    quic) return 0 ;;
+    auto) [[ "${ZENOH_AUTO_ENABLE_QUIC:-0}" == "1" ]] && return 0 ;;
+  esac
+  return 1
+}
+
+prepare_zenoh_tls() {
+  zenoh_quic_requested || return 0
+  case "${ROLE}:${HORUS_TOPOLOGY:-hub}" in
+    cloud:*|machine:direct)
+      bash "${SCRIPT_DIR}/setup_zenoh_tls.sh" server
+      ;;
+    robot:*|machine:hub)
+      if [[ -n "${ZENOH_TLS_ROOT_CA:-}" && -f "${ZENOH_TLS_ROOT_CA/#\~/${HOME}}" ]]; then
+        log_success "Zenoh QUIC root certificate is installed."
+      elif [[ "${ZENOH_TRANSPORT:-auto}" == "quic" ]]; then
+        log_error "ZENOH_TRANSPORT=quic requires the hub/listener public cert on this machine."
+        log_warn "Run: ./horus quic install-cert <cert.pem>"
+        return 1
+      else
+        log_warn "Zenoh QUIC is enabled, but no root certificate is installed yet."
+        log_warn "Run './horus quic install-cert <cert.pem>' to activate QUIC; TCP fallback will be used until then."
+      fi
+      ;;
+  esac
+}
+
+prepare_zenoh_tls
 if [[ "${ROLE}" == "cloud" && "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
   bash "${SCRIPT_DIR}/setup_turn.sh"
 fi

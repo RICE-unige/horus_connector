@@ -25,6 +25,12 @@ TOPOLOGY_HELP = {
     "direct": "Use VPN, Tailscale, or LAN. No cloud is needed.",
 }
 
+ZENOH_TRANSPORT_HELP = {
+    "auto": "Use QUIC when TLS is configured, with TCP fallback. Recommended.",
+    "tcp": "Use TCP only. Most conservative.",
+    "quic": "Use QUIC only. Requires UDP access and Zenoh TLS certs.",
+}
+
 VIDEO_PRESETS = {
     "standard": (1280, 720, 30, 6000),
     "light": (960, 540, 30, 1600),
@@ -253,6 +259,25 @@ class Wizard:
         namespace = namespace_default
         print(f"Zenoh namespace: {self.color.paint(namespace or '-', 'green')}")
         print("  Robots use /robot_name. Machines and cloud usually stay empty.\n")
+        zenoh_transport = self.prompt_choice(
+            "Zenoh transport",
+            list(ZENOH_TRANSPORT_HELP),
+            self.args.zenoh_transport or valid_or(self.existing.get("ZENOH_TRANSPORT"), ZENOH_TRANSPORT_HELP, "auto"),
+            ZENOH_TRANSPORT_HELP,
+        )
+        existing_quic = self.existing.get("ZENOH_AUTO_ENABLE_QUIC", "0").lower() in {"1", "true", "yes", "on"}
+        if zenoh_transport == "tcp":
+            auto_enable_quic = False
+        elif self.args.enable_quic or zenoh_transport == "quic":
+            auto_enable_quic = True
+        elif zenoh_transport == "auto" and self.interactive:
+            auto_enable_quic = self.prompt_yes_no(
+                "Enable Zenoh QUIC fast path when TLS certs are available?",
+                existing_quic,
+                "HORUS will still keep TCP as fallback in auto mode.",
+            )
+        else:
+            auto_enable_quic = existing_quic
 
         self.section(6, total, "Camera and runtime")
         if role in {"robot", "machine"}:
@@ -354,6 +379,14 @@ class Wizard:
             "ROS_CMD_TOPIC": self.existing.get("ROS_CMD_TOPIC", "/cmd_vel"),
             "ZENOH_NAMESPACE": namespace,
             "ZENOH_CONFIG": "auto",
+            "ZENOH_TRANSPORT": zenoh_transport,
+            "ZENOH_AUTO_ENABLE_QUIC": "1" if auto_enable_quic else "0",
+            "ZENOH_QUIC_PARAMS": self.existing.get("ZENOH_QUIC_PARAMS", "multistream=1;mixed_rel=auto"),
+            "ZENOH_TLS_DIR": self.existing.get("ZENOH_TLS_DIR", ""),
+            "ZENOH_TLS_ROOT_CA": self.existing.get("ZENOH_TLS_ROOT_CA", ""),
+            "ZENOH_TLS_LISTEN_KEY": self.existing.get("ZENOH_TLS_LISTEN_KEY", ""),
+            "ZENOH_TLS_LISTEN_CERT": self.existing.get("ZENOH_TLS_LISTEN_CERT", ""),
+            "ZENOH_TLS_VERIFY_NAME": self.existing.get("ZENOH_TLS_VERIFY_NAME", "0"),
             "HORUS_ZENOH_ENABLED": "1",
             "WEBRTC_MEDIA_MODE": "h264",
             "HORUS_ALLOW_LEGACY_JPEG": "0",
@@ -380,6 +413,8 @@ class Wizard:
             "WEBRTC_MAX_BITRATE_KBIT": str(bitrate),
             "WEBRTC_ENCODER_PREFERENCE": encoder_preference,
             "WEBRTC_DECODER_PREFERENCE": encoder_preference,
+            "WEBRTC_CONTROL_ENABLED": "0",
+            "WEBRTC_ENABLE_CONTROL": "0",
             "FAKE_DATA_ROBOT_ID": room if role != "cloud" else "robot-a",
             "FAKE_ROS_IMAGE_TOPIC": camera_topic,
             "FAKE_ROS_IMAGE_QOS": "default",
@@ -526,6 +561,8 @@ class Wizard:
         if self.values.get("ROS_SETUP_PATH"):
             print(f"  ros setup  {self.values['ROS_SETUP_PATH']}")
         print(f"  namespace  {self.values['ZENOH_NAMESPACE'] or '-'}")
+        print(f"  transport  {self.values['ZENOH_TRANSPORT']}")
+        print(f"  quic       {'enabled' if self.values['ZENOH_AUTO_ENABLE_QUIC'] == '1' else 'disabled'}")
         if role == "cloud":
             turn_status = "enabled" if self.values["HORUS_CLOUD_RUN_TURN"] == "1" else "disabled"
             print(f"  turn       {turn_status}")
@@ -735,6 +772,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--machine-ip")
     parser.add_argument("--signal-ip")
     parser.add_argument("--namespace")
+    parser.add_argument("--zenoh-transport", choices=list(ZENOH_TRANSPORT_HELP))
+    parser.add_argument("--enable-quic", action="store_true")
     parser.add_argument("--ros-distro")
     parser.add_argument("--ros-domain-id")
     parser.add_argument("--ros-setup-path")

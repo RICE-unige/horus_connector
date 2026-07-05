@@ -30,7 +30,7 @@ def render_prometheus(root: Path, env: Path) -> str:
         for field, metric in (("cpu_percent", "horus_service_cpu_percent"), ("mem_percent", "horus_service_mem_percent")):
             try:
                 value = float(process[field])
-            except Exception:
+            except (TypeError, ValueError):
                 continue
             lines.append(f'{metric}{{service="{name}"}} {value}')
 

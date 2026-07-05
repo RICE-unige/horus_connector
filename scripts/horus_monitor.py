@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import select
@@ -19,6 +20,8 @@ import tty
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 RESET = "\033[0m"
@@ -108,6 +111,7 @@ def load_env_file(path: Path) -> Dict[str, str]:
 def load_env(root: Path, env_path: Path) -> Dict[str, str]:
     values = load_env_file(env_path)
     values.update(load_env_file(root / ".zenoh_profile.env"))
+    values.update(load_env_file(root / ".zenoh_tls_profile.env"))
     return values
 
 
@@ -115,6 +119,7 @@ def read_pid(path: Path) -> Optional[int]:
     try:
         return int(path.read_text(encoding="utf-8").strip())
     except Exception:
+        logger.debug("Failed to read pid file %s", path, exc_info=True)
         return None
 
 
@@ -142,6 +147,7 @@ def run_command(args: Sequence[str], timeout: float = 1.5) -> str:
         )
         return proc.stdout.strip()
     except Exception:
+        logger.debug("Command failed while collecting monitor state: %s", " ".join(args), exc_info=True)
         return ""
 
 
@@ -151,6 +157,7 @@ def process_state(run_dir: Path, name: str) -> ProcessState:
         try:
             pid = int(output.splitlines()[0])
         except Exception:
+            logger.debug("Failed to parse turnserver pid from pgrep output: %s", output, exc_info=True)
             return ProcessState(name=name, pid=None, running=False)
         state = ProcessState(name=name, pid=pid, running=pid_running(pid))
         if state.running:
@@ -191,6 +198,7 @@ def tail(path: Path, lines: int = 200) -> List[str]:
     try:
         data = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception:
+        logger.debug("Failed to read log tail from %s", path, exc_info=True)
         return []
     return [strip_ansi(line) for line in data[-lines:]]
 
@@ -278,6 +286,7 @@ def load_signal_members_state(path: Path, limit: int = 16) -> List[str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        logger.debug("Failed to load signaling member state from %s", path, exc_info=True)
         return []
     members: List[str] = []
     for peer in payload.get("peers", []):
@@ -535,6 +544,26 @@ def connection_target(env: Dict[str, str]) -> str:
     return ""
 
 
+def zenoh_transport_name(env: Dict[str, str]) -> str:
+    mode = env.get("ZENOH_TRANSPORT", "auto").strip().lower()
+    if mode not in {"auto", "tcp", "quic"}:
+        mode = "auto"
+    if mode == "auto":
+        quic_enabled = env.get("ZENOH_AUTO_ENABLE_QUIC", "0").strip().lower() in {"1", "true", "yes", "on"}
+        has_root = path_exists(env.get("ZENOH_TLS_ROOT_CA", ""))
+        has_listener = path_exists(env.get("ZENOH_TLS_LISTEN_KEY", "")) and path_exists(env.get("ZENOH_TLS_LISTEN_CERT", ""))
+        if quic_enabled and (has_root or has_listener):
+            return "quic+tcp"
+        return "tcp"
+    return mode
+
+
+def path_exists(value: str) -> bool:
+    if not value:
+        return False
+    return Path(os.path.expanduser(value)).exists()
+
+
 def build_services(state: Dict[str, object]) -> List[ServiceState]:
     env = state["env"]
     role = str(state["role"])
@@ -561,9 +590,11 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
         peers = ", ".join(named_zenoh_members(state)) or f"{len(bridge_members)} ROS bridge peer(s)"
         services.append(ServiceState("Zenoh", "OK", f"connected: {peers}", "ok"))
     elif topology == "direct" and role == "machine" and ports["zenoh"] in listeners:
-        services.append(ServiceState("Zenoh", "LISTEN", f"waiting on tcp/0.0.0.0:{ports['zenoh']}", "info"))
+        services.append(
+            ServiceState("Zenoh", "LISTEN", f"waiting on {zenoh_transport_name(env)}/0.0.0.0:{ports['zenoh']}", "info")
+        )
     elif state["target"] and target_ports.get(ports["zenoh"]) is True:
-        services.append(ServiceState("Zenoh", "OPEN", f"target tcp/{state['target']}:{ports['zenoh']} reachable", "info"))
+        services.append(ServiceState("Zenoh", "OPEN", f"TCP fallback reachable at {state['target']}:{ports['zenoh']}", "info"))
     else:
         services.append(ServiceState("Zenoh", "RUN", f"pid {zenoh.pid}, uptime {zenoh.etime}", "info"))
 
@@ -846,7 +877,7 @@ def route_detail(state: Dict[str, object], env: Dict[str, str]) -> str:
         signal = target_ports.get(ports["signal"]) if processes["webrtc"].running else None
         webrtc = "connected" if signal is True else "reconnecting" if signal is False else "stopped"
     detail = (
-        f"zenoh tcp/{ports['zenoh']} {zenoh}   "
+        f"zenoh {zenoh_transport_name(env)}/{ports['zenoh']} {zenoh}   "
         f"webrtc ws/{ports['signal']} {webrtc}   "
         f"domain {env.get('ROS_DOMAIN_ID', '0')}   namespace {env.get('ZENOH_NAMESPACE', '/') or '/'}"
     )
@@ -1207,6 +1238,7 @@ def is_wsl() -> bool:
     try:
         release = Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8", errors="ignore").lower()
     except Exception:
+        logger.debug("Failed to detect WSL environment", exc_info=True)
         return False
     return "microsoft" in release or "wsl" in release
 
