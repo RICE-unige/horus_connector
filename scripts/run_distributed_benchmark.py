@@ -56,7 +56,7 @@ RESOLUTIONS = {
 PATHS = {
     "lan": {"sender": "arancina", "receiver": "arancino", "target": "10.186.13.53", "clock_target": "10.186.13.53"},
     "vpn": {"sender": "arancina", "receiver": "wsl", "target": "100.78.124.117", "clock_target": "100.78.124.117"},
-    "cloud": {"sender": "arancina", "receiver": "wsl", "target": NODES["cloud"]["ip"], "clock_target": "100.78.124.117", "hub": "cloud"},
+    "cloud": {"sender": "arancina", "receiver": "wsl", "target": NODES["cloud"]["ip"], "clock_target": NODES["cloud"]["ip"], "clock_hub": "cloud", "hub": "cloud"},
 }
 if os.environ.get("HORUS_BENCH_VPN_SENDER"):
     PATHS["vpn"]["sender"] = os.environ["HORUS_BENCH_VPN_SENDER"]
@@ -378,15 +378,67 @@ def run_clock_probe(name: str, phase: str, sender: str, receiver: str, receiver_
     return payload
 
 
-def prepare_clock_file(name: str, sender: str, receiver: str, receiver_ip: str) -> tuple[dict, str]:
-    pre = run_clock_probe(name, "pre", sender, receiver, receiver_ip)
+def run_hub_clock_probe(name: str, phase: str, sender: str, receiver: str, hub: str, hub_ip: str) -> dict:
+    label = f"{name}_clock_{phase}_hub"
+    start_bg(
+        hub,
+        label,
+        f"python3 scripts/clock_offset_probe.py --server --host 0.0.0.0 --port {CLOCK_PORT}",
+        domain=0,
+        localhost_only=1,
+    )
+    time.sleep(1.0)
+    try:
+        sender_output = checked(
+            sender,
+            f"cd {shlex.quote(NODES[sender]['root'])}; "
+            f"python3 scripts/clock_offset_probe.py --host {shlex.quote(hub_ip)} --port {CLOCK_PORT} --samples {CLOCK_SAMPLES}",
+            timeout=max(20, CLOCK_SAMPLES * 0.2),
+        )
+        receiver_output = checked(
+            receiver,
+            f"cd {shlex.quote(NODES[receiver]['root'])}; "
+            f"python3 scripts/clock_offset_probe.py --host {shlex.quote(hub_ip)} --port {CLOCK_PORT} --samples {CLOCK_SAMPLES}",
+            timeout=max(20, CLOCK_SAMPLES * 0.2),
+        )
+    finally:
+        stop_label(hub, label)
+    sender_to_hub = parse_json_output(sender_output)
+    receiver_to_hub = parse_json_output(receiver_output)
+    offset = float(sender_to_hub["offset_ms"]) - float(receiver_to_hub["offset_ms"])
+    payload = {
+        "phase": phase,
+        "method": "hub_reference_clock_offset_probe",
+        "offset_ms": offset,
+        "sender": sender,
+        "receiver": receiver,
+        "hub": hub,
+        "hub_ip": hub_ip,
+        "sender_to_hub": sender_to_hub,
+        "receiver_to_hub": receiver_to_hub,
+        "best_rtt_ms": max(float(sender_to_hub.get("best_rtt_ms", 0.0)), float(receiver_to_hub.get("best_rtt_ms", 0.0))),
+    }
+    write_local_json(f"{name}_clock_{phase}.json", payload)
+    return payload
+
+
+def prepare_clock_file(name: str, sender: str, receiver: str, receiver_ip: str, *, clock_hub: str | None = None) -> tuple[dict, str]:
+    pre = (
+        run_hub_clock_probe(name, "pre", sender, receiver, clock_hub, receiver_ip)
+        if clock_hub
+        else run_clock_probe(name, "pre", sender, receiver, receiver_ip)
+    )
     remote_path = f"{BENCH_REMOTE}/{name}_clock_pre.json"
     put_text(receiver, remote_path, json.dumps(pre, indent=2, sort_keys=True))
     return pre, remote_path
 
 
-def finish_clock_file(name: str, sender: str, receiver: str, receiver_ip: str, pre: dict) -> dict:
-    post = run_clock_probe(name, "post", sender, receiver, receiver_ip)
+def finish_clock_file(name: str, sender: str, receiver: str, receiver_ip: str, pre: dict, *, clock_hub: str | None = None) -> dict:
+    post = (
+        run_hub_clock_probe(name, "post", sender, receiver, clock_hub, receiver_ip)
+        if clock_hub
+        else run_clock_probe(name, "post", sender, receiver, receiver_ip)
+    )
     offset = (float(pre["offset_ms"]) + float(post["offset_ms"])) / 2.0
     drift = abs(float(pre["offset_ms"]) - float(post["offset_ms"]))
     payload = {
@@ -394,6 +446,7 @@ def finish_clock_file(name: str, sender: str, receiver: str, receiver_ip: str, p
         "drift_ms": drift,
         "drift_limit_ms": CLOCK_DRIFT_LIMIT_MS,
         "method": "mean_of_pre_and_post_clock_offset_probes",
+        "clock_topology": "hub_reference" if clock_hub else "direct_pair",
         "pre": pre,
         "post": post,
         "sender": sender,
@@ -523,11 +576,12 @@ def ros_pair(
     target: str | None = None,
     cloud: str | None = None,
     clock_target: str,
+    clock_hub: str | None = None,
     zenoh_arm: str = "tcp",
 ) -> None:
     print(f"\n=== {name} ===", flush=True)
     labels: list[tuple[str, str]] = []
-    pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target)
+    pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target, clock_hub=clock_hub)
     try:
         if transport == "zenoh":
             if zenoh_arm not in ZENOH_ARMS:
@@ -603,17 +657,17 @@ def ros_pair(
         fetch(sender, f"{BENCH_REMOTE}/{name}_pub.json", f"{name}_pub.json")
         fetch(receiver, f"{BENCH_REMOTE}/{name}_sub.json", f"{name}_sub.json")
         fetch(receiver, f"{BENCH_REMOTE}/{name}_sub.samples.json", f"{name}_sub.samples.json")
-        clock = finish_clock_file(name, sender, receiver, clock_target, pre_clock)
+        clock = finish_clock_file(name, sender, receiver, clock_target, pre_clock, clock_hub=clock_hub)
         apply_ros_clock_correction(name, clock)
     finally:
         for node, label in reversed(labels):
             stop_label(node, label)
 
 
-def webrtc_pair(name: str, sender: str, receiver: str, width: int, height: int, domain: int, *, target: str, clock_target: str, cloud: str | None = None) -> None:
+def webrtc_pair(name: str, sender: str, receiver: str, width: int, height: int, domain: int, *, target: str, clock_target: str, clock_hub: str | None = None, cloud: str | None = None) -> None:
     print(f"\n=== {name} ===", flush=True)
     labels: list[tuple[str, str]] = []
-    pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target)
+    pre_clock, clock_path = prepare_clock_file(name, sender, receiver, clock_target, clock_hub=clock_hub)
     signal_py = "python3"
     venv_nodes = {"wsl", "arancino"}
     machine_py = ".venv-webrtc/bin/python" if receiver in venv_nodes else "python3"
@@ -667,7 +721,7 @@ def webrtc_pair(name: str, sender: str, receiver: str, width: int, height: int, 
         labels.append((sender, f"{name}_robot"))
         time.sleep(DURATION + 15)
         fetch(receiver, f"{BENCH_REMOTE}/{name}_latency.json", f"{name}_latency.json")
-        clock = finish_clock_file(name, sender, receiver, clock_target, pre_clock)
+        clock = finish_clock_file(name, sender, receiver, clock_target, pre_clock, clock_hub=clock_hub)
         apply_webrtc_clock_correction(name, clock)
     finally:
         for node, label in reversed(labels):
@@ -725,6 +779,7 @@ def main() -> None:
             receiver = info["receiver"]
             target = info["target"]
             clock_target = info["clock_target"]
+            clock_hub = info.get("clock_hub")
             if path != "cloud" and "dds" in selected_transports:
                 conditions.append(
                     {
@@ -739,6 +794,7 @@ def main() -> None:
                         "transport": "dds",
                         "target": target,
                         "clock_target": clock_target,
+                        "clock_hub": clock_hub,
                     }
                 )
                 domain += 10
@@ -757,6 +813,7 @@ def main() -> None:
                         "transport": "zenoh",
                         "target": target,
                         "clock_target": clock_target,
+                        "clock_hub": clock_hub,
                         "cloud": cloud,
                         "zenoh_arm": zenoh_arm,
                     }
@@ -774,6 +831,7 @@ def main() -> None:
                         "domain": domain,
                         "target": target,
                         "clock_target": clock_target,
+                        "clock_hub": clock_hub,
                         "cloud": cloud,
                     }
                 )
@@ -798,6 +856,7 @@ def main() -> None:
                         target=condition.get("target"),
                         cloud=condition.get("cloud"),
                         clock_target=condition["clock_target"],
+                        clock_hub=condition.get("clock_hub"),
                         zenoh_arm=condition.get("zenoh_arm", "tcp"),
                     )
                 else:
@@ -810,6 +869,7 @@ def main() -> None:
                         condition["domain"] + rep,
                         target=condition["target"],
                         clock_target=condition["clock_target"],
+                        clock_hub=condition.get("clock_hub"),
                         cloud=condition.get("cloud"),
                     )
     finally:
