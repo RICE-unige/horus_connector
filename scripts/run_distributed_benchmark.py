@@ -1024,7 +1024,7 @@ def control_pair(
         localhost_only = 0 if transport == "dds" else 1
         robot_cmd = (
             f"python3 scripts/benchmark_cmd_vel_ros.py robot --cmd-topic /benchmark/cmd_vel "
-            f"--ack-topic /benchmark/cmd_vel_ack --duration {DURATION + 15:.0f} --qos-depth {QOS_DEPTH} "
+            f"--ack-topic /benchmark/cmd_vel_ack --duration {DURATION + 7:.0f} --qos-depth {QOS_DEPTH} "
             f"--json {BENCH_REMOTE}/{name}_robot_ack.json"
         )
         machine_cmd = (
