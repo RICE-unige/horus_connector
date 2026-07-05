@@ -87,8 +87,17 @@ ZENOH_PUB_CONFIG = """{
   },
   scouting: { multicast: { enabled: false }, gossip: { enabled: false } },
   transport: {
-    unicast: { qos: { enabled: true } },
-    link: { tx: { queue: { batching: { enabled: false }, congestion_control: { drop: { wait_before_drop: 0 } } } } },
+    unicast: {
+      qos: { enabled: true },
+    },
+    link: {
+      tx: {
+        queue: {
+          batching: { enabled: false },
+          congestion_control: { drop: { wait_before_drop: 0 } },
+        },
+      },
+    },
   },
 }
 """
@@ -112,8 +121,17 @@ ZENOH_SUB_CONFIG = """{
   },
   scouting: { multicast: { enabled: false }, gossip: { enabled: false } },
   transport: {
-    unicast: { qos: { enabled: true } },
-    link: { tx: { queue: { batching: { enabled: false }, congestion_control: { drop: { wait_before_drop: 0 } } } } },
+    unicast: {
+      qos: { enabled: true },
+    },
+    link: {
+      tx: {
+        queue: {
+          batching: { enabled: false },
+          congestion_control: { drop: { wait_before_drop: 0 } },
+        },
+      },
+    },
   },
 }
 """
@@ -135,8 +153,17 @@ ZENOH_CLOUD_CONFIG = """{
   },
   scouting: { multicast: { enabled: false }, gossip: { enabled: false } },
   transport: {
-    unicast: { qos: { enabled: true } },
-    link: { tx: { queue: { batching: { enabled: false }, congestion_control: { drop: { wait_before_drop: 0 } } } } },
+    unicast: {
+      qos: { enabled: true },
+    },
+    link: {
+      tx: {
+        queue: {
+          batching: { enabled: false },
+          congestion_control: { drop: { wait_before_drop: 0 } },
+        },
+      },
+    },
   },
 }
 """
