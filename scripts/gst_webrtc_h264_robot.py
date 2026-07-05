@@ -516,6 +516,7 @@ class H264RobotSender:
             "type": "frame_clock",
             "seq": self.frame_clock_seq,
             "sent_ns": time.time_ns(),
+            "stage": "rtp_payloader_handoff",
         }
         self.frame_clock_channel.emit("send-string", json.dumps(payload, separators=(",", ":")))
         self.frame_clock_seq += 1

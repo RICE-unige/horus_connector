@@ -122,7 +122,7 @@ Advanced configuration is documented in [docs/configuration.md](docs/configurati
 
 ![Camera transport benchmark](docs/transport_benchmark.svg)
 
-The benchmark compares practical camera transport paths using fresh-frame delivery and latency. WebRTC is used for camera streams; Zenoh remains focused on robot state.
+The benchmark compares practical camera transport paths using fresh-frame delivery and latency. See [docs/benchmark_methodology.md](docs/benchmark_methodology.md) before publishing or rerunning results.
 
 ## Network
 

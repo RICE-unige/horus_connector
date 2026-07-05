@@ -5,6 +5,7 @@ import argparse
 from collections import deque
 import json
 import logging
+import math
 import os
 import signal
 import statistics
@@ -30,6 +31,27 @@ from gi.repository import GLib  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    values = sorted(values)
+    pos = (len(values) - 1) * q
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return values[lo]
+    return values[lo] * (hi - pos) + values[hi] * (pos - lo)
+
+
+def load_clock_offset(path: str | None) -> tuple[float, str]:
+    if not path:
+        return 0.0, "none"
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "offset_ms" not in payload:
+        raise ValueError(f"{path} does not contain offset_ms")
+    return float(payload["offset_ms"]), f"clock_offset_probe:{Path(path).name}"
+
+
 class H264MachineReceiver:
     def __init__(self, args):
         self.args = args
@@ -46,6 +68,8 @@ class H264MachineReceiver:
         self.video_last_sec = None
         self.frame_clock = deque()
         self.frame_latency_samples = []
+        self.frame_clock_dropped = 0
+        self.frame_clock_overflow_dropped = 0
         self.ros_image_publisher = None
         self.recovering = False
         self.answer_in_progress = False
@@ -124,23 +148,27 @@ class H264MachineReceiver:
             }
             if self.frame_latency_samples:
                 latencies = [sample["latency_ms"] for sample in self.frame_latency_samples]
-                fresh_count = sum(1 for sample in self.frame_latency_samples if sample["latency_ms"] <= self.args.fresh_deadline_ms)
+                fresh_count = sum(1 for sample in self.frame_latency_samples if sample["fresh"])
+                stale_count = max(0, len(self.frame_latency_samples) - fresh_count)
                 payload.update(
                     {
                         "video_latency_samples": len(self.frame_latency_samples),
                         "video_latency_ms_median": statistics.median(latencies),
-                        "video_latency_ms_p95": sorted(latencies)[
-                            min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.95)))
-                        ],
-                        "video_latency_ms_p99": sorted(latencies)[
-                            min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.99)))
-                        ],
+                        "video_latency_ms_p50": percentile(latencies, 0.50),
+                        "video_latency_ms_p95": percentile(latencies, 0.95),
+                        "video_latency_ms_p99": percentile(latencies, 0.99),
                         "fresh_deadline_ms": self.args.fresh_deadline_ms,
                         "fresh_latency_samples": fresh_count,
+                        "stale_latency_samples": stale_count,
                         "fresh_sample_sla": fresh_count / len(self.frame_latency_samples),
                         "fresh_fps_estimate": (self.video_frames / observed_sec)
                         * (fresh_count / len(self.frame_latency_samples)),
                         "clock_offset_ms": self.args.clock_offset_ms,
+                        "clock_offset_source": self.args.clock_offset_source,
+                        "frame_clock_dropped": self.frame_clock_dropped,
+                        "frame_clock_overflow_dropped": self.frame_clock_overflow_dropped,
+                        "freshest_frame_policy": "appsink_max_buffers_1_drop_true_and_frame_clock_keep_last_1",
+                        "latency_method": "WebRTC sender frame-clock timestamp corrected by measured clock offset; no percentile-baseline subtraction",
                     }
                 )
             print(
@@ -336,18 +364,7 @@ class H264MachineReceiver:
             self.video_first_sec = now
         self.video_last_sec = now
         self.video_frames += 1
-        if self.frame_clock:
-            sent = self.frame_clock.pop()
-            self.frame_clock.clear()
-            raw_latency_ms = (time.time_ns() - int(sent["sent_ns"])) / 1_000_000.0
-            self.frame_latency_samples.append(
-                {
-                    "seq": sent.get("seq"),
-                    "t_sec": now - (self.video_first_sec or now),
-                    "latency_ms": raw_latency_ms - self.args.clock_offset_ms,
-                    "raw_latency_ms": raw_latency_ms,
-                }
-            )
+        self._record_frame_latency(now, "display")
 
     def _on_ros_image_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -360,19 +377,35 @@ class H264MachineReceiver:
         self.video_frames += 1
         if self.ros_image_publisher is not None:
             self.ros_image_publisher.publish_sample(sample)
-        if self.frame_clock:
-            sent = self.frame_clock.pop()
-            self.frame_clock.clear()
-            raw_latency_ms = (time.time_ns() - int(sent["sent_ns"])) / 1_000_000.0
-            self.frame_latency_samples.append(
-                {
-                    "seq": sent.get("seq"),
-                    "t_sec": now - (self.video_first_sec or now),
-                    "latency_ms": raw_latency_ms - self.args.clock_offset_ms,
-                    "raw_latency_ms": raw_latency_ms,
-                }
-            )
+        self._record_frame_latency(now, "ros2")
         return Gst.FlowReturn.OK
+
+    def _record_frame_latency(self, now: float, output_stage: str):
+        if not self.frame_clock:
+            return
+        dropped = max(0, len(self.frame_clock) - 1)
+        if dropped:
+            self.frame_clock_dropped += dropped
+        sent = self.frame_clock.pop()
+        self.frame_clock.clear()
+        receive_wall_ns = time.time_ns()
+        raw_latency_ms = (receive_wall_ns - int(sent["sent_ns"])) / 1_000_000.0
+        latency_ms = raw_latency_ms - self.args.clock_offset_ms
+        is_fresh = latency_ms <= self.args.fresh_deadline_ms
+        self.frame_latency_samples.append(
+            {
+                "seq": sent.get("seq"),
+                "output_stage": output_stage,
+                "receive_t_sec": now - (self.video_first_sec or now),
+                "latency_ms": latency_ms,
+                "raw_latency_ms": raw_latency_ms,
+                "send_wall_ns": int(sent["sent_ns"]),
+                "receive_wall_ns": receive_wall_ns,
+                "fresh": is_fresh,
+                "stale": not is_fresh,
+                "dropped_before_sample": dropped,
+            }
+        )
 
     def _on_data_channel(self, _webrtc, channel):
         print(f"DataChannel received: {channel.props.label}", flush=True)
@@ -395,6 +428,7 @@ class H264MachineReceiver:
             return
         self.frame_clock.append(message)
         while len(self.frame_clock) > 600:
+            self.frame_clock_overflow_dropped += 1
             self.frame_clock.popleft()
 
     def _on_cmd_channel_open(self, _channel):
@@ -454,10 +488,16 @@ def parse_args():
     parser.add_argument("--cmd-linear-x", type=float, default=0.0)
     parser.add_argument("--cmd-angular-z", type=float, default=0.0)
     parser.add_argument("--duration", type=float, default=0.0)
-    parser.add_argument("--clock-offset-ms", type=float, default=0.0)
+    parser.add_argument("--clock-offset-ms", type=float, default=None)
+    parser.add_argument("--clock-offset-json", default="")
     parser.add_argument("--fresh-deadline-ms", type=float, default=150.0)
     parser.add_argument("--latency-json", default="")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.clock_offset_ms is None:
+        args.clock_offset_ms, args.clock_offset_source = load_clock_offset(args.clock_offset_json)
+    else:
+        args.clock_offset_source = "manual"
+    return args
 
 
 def main():
