@@ -413,7 +413,18 @@ install_zenoh() {
   curl -fL --retry 3 --connect-timeout 20 -o "${zip}.tmp" "${url}"
   curl -fL --retry 3 --connect-timeout 20 -o "${sums_file}.tmp" "${sums_url}"
   mv "${sums_file}.tmp" "${sums_file}"
-  expected_sha="$(awk -v archive="${archive}" '$2 == archive {print $1; exit}' "${sums_file}")"
+  expected_sha="$(
+    awk -v archive="${archive}" '
+      {
+        path = $2
+        n = split(path, parts, "/")
+        if (path == archive || parts[n] == archive) {
+          print $1
+          exit
+        }
+      }
+    ' "${sums_file}"
+  )"
   if [[ -z "${expected_sha}" ]]; then
     log_error "No checksum found for ${archive} in ${sums_url}."
     rm -f "${zip}.tmp"
