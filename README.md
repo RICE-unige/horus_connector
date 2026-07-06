@@ -118,12 +118,6 @@ Most users should use:
 
 Advanced configuration is documented in [docs/configuration.md](docs/configuration.md), including environment variables, Zenoh topic filters, priorities, QUIC/TLS, TURN, hardware codec preferences, and fleet examples.
 
-## Benchmark
-
-![Camera transport benchmark](docs/transport_benchmark.svg)
-
-The benchmark compares practical camera transport paths using fresh-frame delivery and latency. See [docs/benchmark_methodology.md](docs/benchmark_methodology.md) before publishing or rerunning results.
-
 ## Network
 
 - Zenoh: TCP `7447`; optional QUIC on UDP `7447`
