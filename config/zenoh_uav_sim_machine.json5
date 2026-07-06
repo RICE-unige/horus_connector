@@ -1,0 +1,131 @@
+{
+  plugins: {
+    ros2dds: {
+      ros_localhost_only: true,
+      ros_automatic_discovery_range: "LOCALHOST",
+
+      allow: {
+        publishers: [
+          "^/uav_sim/goal$",
+          "^/uav_sim/goal_2d$",
+          "^/uav_sim/command$",
+          "^/uav_sim/cmd_vel$",
+          "^/uav_sim/teleop/cmd_vel$",
+          "^/horus/registration$",
+          "^/horus/multi_operator/sdk_registry_replay_begin$",
+          "^/horus/multi_operator/sdk_registry_replay_item$",
+          "^/horus/multi_operator/sdk_registry_replay_end$",
+          "^/horus/robot_description/chunk_begin$",
+          "^/horus/robot_description/chunk_item$",
+          "^/horus/robot_description/chunk_end$",
+        ],
+        subscribers: [
+          "^/tf$",
+          "^/tf_static$",
+          "^/drone1/state/pose$",
+          "^/drone1/state/twist$",
+          "^/uav_sim/path$",
+          "^/uav_sim/status$",
+          "^/projected_map$",
+          "^/uav_sim/octomap_binary$",
+          "^/horus/registration_ack$",
+          "^/horus/heartbeat$",
+          "^/horus/multi_operator_presence$",
+          "^/horus/multi_operator/sdk_registration_replay_request$",
+          "^/horus/robot_description/request$",
+          "^/horus/teleop/runtime_state$",
+        ],
+        service_servers: [],
+        service_clients: [],
+        action_servers: [],
+        action_clients: [],
+      },
+
+      pub_max_frequencies: [
+        "^/uav_sim/cmd_vel$=30",
+        "^/uav_sim/teleop/cmd_vel$=30",
+        "^/uav_sim/goal$=2",
+        "^/uav_sim/goal_2d$=2",
+        "^/uav_sim/command$=5",
+        "^/horus/registration$=1",
+        "^/horus/multi_operator/sdk_registry_replay_begin$=1",
+        "^/horus/multi_operator/sdk_registry_replay_item$=20",
+        "^/horus/multi_operator/sdk_registry_replay_end$=1",
+        "^/horus/robot_description/chunk_begin$=1",
+        "^/horus/robot_description/chunk_item$=50",
+        "^/horus/robot_description/chunk_end$=1",
+      ],
+
+      pub_priorities: [
+        "^/uav_sim/cmd_vel$=2:express",
+        "^/uav_sim/teleop/cmd_vel$=2:express",
+        "^/uav_sim/goal$=3:express",
+        "^/uav_sim/goal_2d$=3:express",
+        "^/uav_sim/command$=3:express",
+        "^/horus/registration$=3:express",
+        "^/horus/multi_operator/sdk_registry_replay_begin$=3:express",
+        "^/horus/multi_operator/sdk_registry_replay_item$=4",
+        "^/horus/multi_operator/sdk_registry_replay_end$=3:express",
+        "^/horus/robot_description/chunk_begin$=3:express",
+        "^/horus/robot_description/chunk_item$=4",
+        "^/horus/robot_description/chunk_end$=3:express",
+      ],
+
+      reliable_routes_blocking: true,
+      transient_local_cache_multiplier: 1,
+      queries_timeout: {
+        default: 5.0,
+        transient_local_subscribers: 30.0,
+        services: 1.0,
+        actions: {
+          send_goal: 1.0,
+          cancel_goal: 1.0,
+          get_result: 30.0,
+        },
+      },
+    },
+  },
+
+  scouting: {
+    multicast: { enabled: false },
+    gossip: { enabled: false },
+  },
+
+  transport: {
+    unicast: {
+      qos: { enabled: true },
+      compression: { enabled: true },
+    },
+    link: {
+      tx: {
+        threads: 2,
+        batch_size: 65535,
+        queue: {
+          size: {
+            control: 16,
+            real_time: 16,
+            interactive_high: 16,
+            interactive_low: 16,
+            data_high: 16,
+            data: 16,
+            data_low: 16,
+            background: 16,
+          },
+          batching: { enabled: true, time_limit: 1000 },
+          congestion_control: {
+            drop: { wait_before_drop: 100000 },
+            block: { wait_before_close: 5000000 },
+          },
+        },
+      },
+      rx: {
+        buffer_size: 1048576,
+        max_message_size: 1073741824,
+      },
+      tcp: {
+        so_sndbuf: 8388608,
+        so_rcvbuf: 8388608,
+      },
+    },
+  },
+}

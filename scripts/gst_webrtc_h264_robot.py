@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Robot-side H.264 WebRTC sender with cmd_vel DataChannel receive."""
+"""Robot-side H.264 WebRTC video sender."""
 
 import argparse
 import json
+import logging
+import math
 import os
 import time
 
@@ -18,14 +20,19 @@ from gst_webrtc_common import (
     make_session_description,
 )
 from ros_image_io import RosImageAppSrc, ensure_rclpy
+from webrtc_control import command_authorized
 
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
 
+logger = logging.getLogger(__name__)
+
 
 class RosCmdPublisher:
-    def __init__(self, topic: str):
+    def __init__(self, topic: str, max_linear_mps: float, max_angular_rps: float):
         self.topic = topic
+        self.max_linear_mps = max(0.0, float(max_linear_mps))
+        self.max_angular_rps = max(0.0, float(max_angular_rps))
         self.node = None
         self.publisher = None
         self.rclpy = None
@@ -47,16 +54,29 @@ class RosCmdPublisher:
             print(f"ROS cmd_vel publishing disabled: {exc}", flush=True)
             self.close()
 
+    @staticmethod
+    def _bounded_float(command: dict, key: str, limit: float) -> float:
+        value = float(command.get(key, 0.0))
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite")
+        if limit > 0.0:
+            value = max(-limit, min(limit, value))
+        return value
+
     def publish(self, command: dict) -> bool:
         if self.publisher is None:
             return False
         msg = self.twist_type()
-        msg.linear.x = float(command.get("linear_x", 0.0))
-        msg.linear.y = float(command.get("linear_y", 0.0))
-        msg.linear.z = float(command.get("linear_z", 0.0))
-        msg.angular.x = float(command.get("angular_x", 0.0))
-        msg.angular.y = float(command.get("angular_y", 0.0))
-        msg.angular.z = float(command.get("angular_z", 0.0))
+        try:
+            msg.linear.x = self._bounded_float(command, "linear_x", self.max_linear_mps)
+            msg.linear.y = self._bounded_float(command, "linear_y", self.max_linear_mps)
+            msg.linear.z = self._bounded_float(command, "linear_z", self.max_linear_mps)
+            msg.angular.x = self._bounded_float(command, "angular_x", self.max_angular_rps)
+            msg.angular.y = self._bounded_float(command, "angular_y", self.max_angular_rps)
+            msg.angular.z = self._bounded_float(command, "angular_z", self.max_angular_rps)
+        except (TypeError, ValueError) as exc:
+            print(f"dropping invalid cmd_vel command: {exc}", flush=True)
+            return False
         self.publisher.publish(msg)
         return True
 
@@ -74,11 +94,20 @@ class H264RobotSender:
         if self.args.max_bitrate_kbit < self.args.min_bitrate_kbit:
             self.args.max_bitrate_kbit = self.args.min_bitrate_kbit
         self.profile = load_env_file(args.profile)
+        if self.args.enable_control and not self.args.control_token and not self.args.allow_unauthenticated_control:
+            raise SystemExit(
+                "WEBRTC_CONTROL_ENABLED requires HORUS_WEBRTC_CONTROL_TOKEN. "
+                "Set WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL=1 only for trusted lab tests."
+            )
         self.loop = GLib.MainLoop()
         self.webrtc = None
         self.pipeline = None
         self.encoder = None
-        self.control = RosCmdPublisher(args.ros_cmd_topic)
+        self.control = RosCmdPublisher(
+            args.ros_cmd_topic if args.enable_control else "",
+            args.cmd_max_linear_mps,
+            args.cmd_max_angular_rps,
+        )
         self.ros_image_source = None
         self.frame_clock_channel = None
         self.frame_clock_open = False
@@ -96,9 +125,13 @@ class H264RobotSender:
         self.last_adaptive_error_count = 0
         self.current_bitrate_kbit = max(1, args.video_bitrate_kbit)
         self.recovering = False
+        self.negotiation_in_progress = False
         self.offer_pending = False
+        self.last_remote_answer_sdp = ""
         self.last_peer_ready_recovery = 0.0
         self.signaling = self._make_signaling()
+        if self.args.enable_control:
+            self._publish_zero_command("startup")
 
     def _make_signaling(self):
         if self.args.signaling_url:
@@ -160,7 +193,7 @@ class H264RobotSender:
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
         if self.webrtc is None:
             raise RuntimeError("failed to create webrtcbin")
-        configure_webrtcbin(self.webrtc, self.args.ice_servers)
+        configure_webrtcbin(self.webrtc, self.args.ice_servers, self.args.ice_transport_policy)
         media = Gst.parse_bin_from_description(self._media_bin_description(), True)
         if self.args.video_source == "ros2":
             appsrc = media.get_by_name("ros_image_src")
@@ -235,7 +268,7 @@ class H264RobotSender:
                 self.frame_clock_channel.connect("on-open", self._on_frame_clock_open)
             else:
                 print("frame latency DataChannel unavailable; continuing without latency samples", flush=True)
-        if self.args.ros_cmd_topic and self.data_channels_supported:
+        if self.args.enable_control and self.args.ros_cmd_topic and self.data_channels_supported:
             control_channel = self.webrtc.emit("create-data-channel", "cmd-vel", None)
             if control_channel is not None:
                 self._attach_control_channel(control_channel)
@@ -243,11 +276,13 @@ class H264RobotSender:
                 print("cmd-vel DataChannel unavailable; continuing with video only", flush=True)
 
     def _ensure_watchdog(self):
-        if not self.args.ros_cmd_topic or self.watchdog_source_id is not None:
+        if not self.args.enable_control or not self.args.ros_cmd_topic or self.watchdog_source_id is not None:
             return
         self.watchdog_source_id = GLib.timeout_add(100, self._watchdog_check)
 
     def stop(self):
+        if self.args.enable_control:
+            self._publish_zero_command("shutdown")
         if self.ros_image_source is not None:
             self.ros_image_source.close()
             self.ros_image_source = None
@@ -261,7 +296,17 @@ class H264RobotSender:
         return False
 
     def _on_negotiation_needed(self, _element):
+        if self.webrtc is None:
+            self.offer_pending = True
+            return
+        if not self.signaling.connected.is_set():
+            self.offer_pending = True
+            return
+        if self.negotiation_in_progress:
+            self.offer_pending = True
+            return
         self.offer_pending = False
+        self.negotiation_in_progress = True
         promise = Gst.Promise.new_with_change_func(self._on_offer_created, None)
         self.webrtc.emit("create-offer", None, promise)
 
@@ -270,6 +315,7 @@ class H264RobotSender:
         reply = promise.get_reply()
         offer = reply.get_value("offer") if reply is not None else None
         if offer is None:
+            self.negotiation_in_progress = False
             detail = reply.to_string() if reply is not None else "no promise reply"
             print(f"failed to create WebRTC offer: {detail}", flush=True)
             self.stop()
@@ -332,6 +378,8 @@ class H264RobotSender:
             self.encoder = None
             self.frame_clock_channel = None
             self.frame_clock_open = False
+            self.negotiation_in_progress = False
+            self.last_remote_answer_sdp = ""
             self._start_pipeline()
             self.recovering = False
             print("Robot GStreamer pipeline recovered", flush=True)
@@ -341,6 +389,8 @@ class H264RobotSender:
         return False
 
     def _on_ice_candidate(self, _element, mlineindex, candidate):
+        if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+            print(f"Local ICE candidate: {candidate}", flush=True)
         self.signaling.send({"type": "ice", "sdpMLineIndex": int(mlineindex), "candidate": candidate})
 
     def _handle_signaling_message(self, message: dict):
@@ -353,9 +403,17 @@ class H264RobotSender:
             self._recover_for_peer_ready()
             return False
         if kind == "answer":
-            answer = make_session_description("answer", message["sdp"])
+            sdp = message.get("sdp", "")
+            if not sdp or sdp == self.last_remote_answer_sdp:
+                return False
+            self.last_remote_answer_sdp = sdp
+            answer = make_session_description("answer", sdp)
             self.webrtc.emit("set-remote-description", answer, Gst.Promise.new())
+            self.negotiation_in_progress = False
+            self.offer_pending = False
         elif kind == "ice":
+            if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+                print(f"Remote ICE candidate: {message.get('candidate', '')}", flush=True)
             self.webrtc.emit("add-ice-candidate", int(message["sdpMLineIndex"]), message["candidate"])
         return False
 
@@ -383,21 +441,46 @@ class H264RobotSender:
         print(f"DataChannel received: {label}", flush=True)
         if label != "cmd-vel":
             return
+        if not self.args.enable_control:
+            print("Ignoring cmd-vel DataChannel because WebRTC control is disabled", flush=True)
+            return
         self._attach_control_channel(channel)
 
     def _attach_control_channel(self, channel):
         if channel is None:
             return
-        channel.connect("on-open", lambda _channel: print("cmd-vel DataChannel open", flush=True))
+        channel.connect("on-open", self._on_control_channel_open)
+        channel.connect("on-close", self._on_control_channel_close)
+        channel.connect("on-error", self._on_control_channel_error)
         channel.connect("on-message-string", self._on_control_message)
+
+    def _on_control_channel_open(self, _channel):
+        print("cmd-vel DataChannel open", flush=True)
+        self._publish_zero_command("cmd_vel channel open")
+
+    def _on_control_channel_close(self, _channel):
+        print("cmd-vel DataChannel closed", flush=True)
+        self._publish_zero_command("cmd_vel channel close")
+
+    def _on_control_channel_error(self, _channel, error):
+        print(f"cmd-vel DataChannel error: {error}", flush=True)
+        self._publish_zero_command("cmd_vel channel error")
 
     def _on_control_message(self, channel, text):
         receive_ns = time.time_ns()
         try:
             command = json.loads(text)
         except Exception:
+            logger.debug("Ignoring malformed cmd_vel command message: %s", text, exc_info=True)
             return
         if command.get("type") != "cmd_vel":
+            return
+        if not command_authorized(
+            command,
+            expected_token=self.args.control_token,
+            allow_unauthenticated=bool(self.args.allow_unauthenticated_control),
+        ):
+            print("dropping unauthorized cmd_vel command", flush=True)
             return
         now = time.monotonic()
         if self.args.cmd_rate_limit_hz > 0:
@@ -433,6 +516,7 @@ class H264RobotSender:
             "type": "frame_clock",
             "seq": self.frame_clock_seq,
             "sent_ns": time.time_ns(),
+            "stage": "rtp_payloader_handoff",
         }
         self.frame_clock_channel.emit("send-string", json.dumps(payload, separators=(",", ":")))
         self.frame_clock_seq += 1
@@ -502,7 +586,23 @@ def parse_args():
     parser.add_argument("--room", default="default")
     parser.add_argument("--profile", default=".webrtc_profile.env")
     parser.add_argument("--ice-servers", default="stun:stun.l.google.com:19302")
+    parser.add_argument("--ice-transport-policy", choices=["all", "relay"], default=os.environ.get("WEBRTC_ICE_TRANSPORT_POLICY", "all"))
+    parser.add_argument(
+        "--enable-control",
+        type=int,
+        choices=[0, 1],
+        default=int(os.environ.get("WEBRTC_CONTROL_ENABLED", os.environ.get("WEBRTC_ENABLE_CONTROL", "0"))),
+    )
+    parser.add_argument("--control-token", default=os.environ.get("HORUS_WEBRTC_CONTROL_TOKEN", ""))
+    parser.add_argument(
+        "--allow-unauthenticated-control",
+        type=int,
+        choices=[0, 1],
+        default=int(os.environ.get("WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL", "0")),
+    )
     parser.add_argument("--ros-cmd-topic", default="/cmd_vel")
+    parser.add_argument("--cmd-max-linear-mps", type=float, default=float(os.environ.get("WEBRTC_CMD_MAX_LINEAR_MPS", "0.5")))
+    parser.add_argument("--cmd-max-angular-rps", type=float, default=float(os.environ.get("WEBRTC_CMD_MAX_ANGULAR_RPS", "1.0")))
     parser.add_argument("--cmd-watchdog-timeout", type=float, default=float(os.environ.get("WEBRTC_CMD_WATCHDOG_TIMEOUT", "0.3")))
     parser.add_argument("--cmd-rate-limit-hz", type=float, default=float(os.environ.get("WEBRTC_CMD_RATE_LIMIT_HZ", "100.0")))
     parser.add_argument("--video-bitrate-kbit", type=int, default=int(os.environ.get("VIDEO_BITRATE_KBIT", "6000")))

@@ -1,31 +1,31 @@
 {
   plugins: {
     ros2dds: {
-      // Machine profile: import remote robot state from Zenoh only.
+      // Machine profile: import remote robot state from Zenoh and export
+      // operator command topics back to the selected robot.
       ros_localhost_only: true,
       ros_automatic_discovery_range: "LOCALHOST",
 
       allow: {
-        publishers: [],
+        publishers: [
+          // Keep machine-side export narrow. Robot state flows toward the
+          // machine, but velocity commands flow back toward the robot.
+          "^/cmd_vel$",
+          "^/.*/cmd_vel$",
+        ],
         subscribers: [
-          "^/tf$",
-          "^/.*/tf$",
-          "^/tf_static$",
-          "^/.*/tf_static$",
-          "^/odom$",
-          "^/.*/odom$",
-          "^/joint_states$",
-          "^/.*/joint_states$",
-          "^/scan$",
-          "^/.*/scan$",
-          "^/points$",
-          "^/.*/points$",
+          // Import any remote topic that this machine explicitly subscribes to.
+          "^/.*$",
         ],
         service_servers: [],
         service_clients: [],
         action_servers: [],
         action_clients: [],
       },
+
+      pub_priorities: [
+        ".*/cmd_vel$=1:express",
+      ],
 
       reliable_routes_blocking: false,
       transient_local_cache_multiplier: 1,

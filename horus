@@ -58,6 +58,7 @@ usage() {
   echo -e "  ${FG_GREEN}status${RESET} ${FG_CYAN}[--json]${RESET}                  Show service state and runtime settings"
   echo -e "  ${FG_GREEN}monitor${RESET} ${FG_CYAN}[--once]${RESET}                  Interactive live console"
   echo -e "  ${FG_GREEN}doctor${RESET} ${FG_CYAN}[role]${RESET}                    Check connectivity and listeners"
+  echo -e "  ${FG_GREEN}quic${RESET} ${FG_CYAN}[setup-server|install-cert|status]${RESET} Configure Zenoh QUIC TLS"
   echo -e "  ${FG_GREEN}logs${RESET} ${FG_CYAN}[service]${RESET}                   Stream a service log"
   echo -e "  ${FG_GREEN}metrics${RESET} ${FG_CYAN}[--port 9418]${RESET}             Export Prometheus metrics and status JSON"
   echo -e "  ${FG_GREEN}fleet${RESET} ${FG_CYAN}[launch|stop|status] <file>${RESET} Start multiple rooms from one config"
@@ -67,7 +68,7 @@ usage() {
   echo -e "${BOLD}Roles${RESET}"
   echo -e "  ${BOLD}robot${RESET}     Robot-side system. Sends camera/state and receives velocity commands"
   echo -e "  ${BOLD}machine${RESET}   Operator/local machine. Receives camera/state and sends commands"
-  echo -e "  ${BOLD}cloud${RESET}     Shared Zenoh router + WebRTC signaling relay"
+  echo -e "  ${BOLD}cloud${RESET}     Shared Zenoh router + WebRTC signaling relay, optionally TURN"
   echo ""
 
   echo -e "${BOLD}Topologies${RESET}"
@@ -78,19 +79,53 @@ usage() {
   echo -e "${FG_MUTED}Start with ${BOLD}./horus setup${RESET}${FG_MUTED}, then run ${BOLD}./horus bootstrap <role>${RESET}${FG_MUTED} and ${BOLD}./horus launch <role>${RESET}${FG_MUTED}.${RESET}\n"
 }
 
+trim_spaces() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "${value}"
+}
+
+load_key_value_file() {
+  local file="$1"
+  local line key value
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    line="$(trim_spaces "${line}")"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    if [[ "${line}" =~ ^export[[:space:]]+(.+)$ ]]; then
+      line="${BASH_REMATCH[1]}"
+    fi
+    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      log_warn "Ignoring invalid config line in ${file}: ${line}"
+      continue
+    fi
+    key="${BASH_REMATCH[1]}"
+    value="$(trim_spaces "${BASH_REMATCH[2]}")"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+
 load_env() {
   if [[ ! -f "${ENV_FILE}" ]]; then
     echo "Missing ${ENV_FILE}. Run ./horus init first." >&2
     exit 1
   fi
-  set -a
-  # shellcheck source=/dev/null
-  source "${ENV_FILE}"
+  load_key_value_file "${ENV_FILE}"
   if [[ -f "${ROOT}/.zenoh_profile.env" ]]; then
-    # shellcheck source=/dev/null
-    source "${ROOT}/.zenoh_profile.env"
+    load_key_value_file "${ROOT}/.zenoh_profile.env"
   fi
-  set +a
+  if [[ -f "${ROOT}/.zenoh_tls_profile.env" ]]; then
+    load_key_value_file "${ROOT}/.zenoh_tls_profile.env"
+  fi
 }
 
 source_ros() {
@@ -171,14 +206,31 @@ PY
   echo "python3"
 }
 
-ice_args() {
-  local args=()
+build_ice_args() {
+  local -n output_ref="$1"
   local ice="${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}"
   IFS=',' read -ra servers <<< "${ice}"
   for server in "${servers[@]}"; do
-    [[ -n "${server}" ]] && args+=(--ice-server "${server}")
+    [[ -n "${server}" ]] && output_ref+=(--ice-server "${server}")
   done
-  printf '%q ' "${args[@]}"
+}
+
+build_webrtc_latency_probe_args() {
+  local -n output_ref="$1"
+  if [[ "${WEBRTC_LATENCY_PROBE:-0}" == "1" ]]; then
+    output_ref+=(--latency-probe --latency-probe-rate "${WEBRTC_LATENCY_PROBE_RATE:-60.0}")
+  fi
+}
+
+build_webrtc_latency_receiver_args() {
+  local -n output_ref="$1"
+  output_ref+=(
+    --clock-offset-ms "${WEBRTC_CLOCK_OFFSET_MS:-0.0}"
+    --fresh-deadline-ms "${WEBRTC_FRESH_DEADLINE_MS:-150.0}"
+  )
+  if [[ "${WEBRTC_LATENCY_PROBE:-0}" == "1" || -n "${WEBRTC_LATENCY_JSON:-}" ]]; then
+    output_ref+=(--latency-json "${WEBRTC_LATENCY_JSON:-${RUN_DIR}/webrtc_latency.json}")
+  fi
 }
 
 required_value() {
@@ -203,14 +255,216 @@ zenoh_config_path() {
   echo "${ROOT}/${configured}"
 }
 
-zenoh_common_args() {
+zenoh_runtime_config_path() {
+  local base="$1"
+  local out="${RUN_DIR}/zenoh_runtime_${HORUS_ROLE:-default}.json5"
+  local render_args=(--base "${base}" --out "${out}")
+
+  if zenoh_tls_file_exists "${ZENOH_TLS_ROOT_CA:-}"; then
+    render_args+=(--root-ca "${ZENOH_TLS_ROOT_CA/#\~/${HOME}}")
+    render_args+=(--verify-name-on-connect "${ZENOH_TLS_VERIFY_NAME:-0}")
+  fi
+  if zenoh_tls_file_exists "${ZENOH_TLS_LISTEN_KEY:-}" && zenoh_tls_file_exists "${ZENOH_TLS_LISTEN_CERT:-}"; then
+    render_args+=(
+      --listen-private-key "${ZENOH_TLS_LISTEN_KEY/#\~/${HOME}}"
+      --listen-certificate "${ZENOH_TLS_LISTEN_CERT/#\~/${HOME}}"
+    )
+  fi
+
+  if [[ "${#render_args[@]}" -gt 4 ]]; then
+    python3 "${ROOT}/scripts/render_zenoh_config.py" "${render_args[@]}"
+    echo "${out}"
+  else
+    echo "${base}"
+  fi
+}
+
+build_zenoh_common_args() {
+  local -n output_ref="$1"
   local config
   config="$(zenoh_config_path)"
   [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
-  printf '%q ' -c "${config}"
-  if [[ -n "${ZENOH_NAMESPACE:-}" ]]; then
-    printf '%q ' -n "${ZENOH_NAMESPACE}"
+  if zenoh_quic_active; then
+    config="$(zenoh_runtime_config_path "${config}")"
   fi
+  output_ref+=(-c "${config}")
+  if [[ -n "${ZENOH_NAMESPACE:-}" ]]; then
+    output_ref+=(-n "${ZENOH_NAMESPACE}")
+  fi
+}
+
+zenoh_transport() {
+  local mode="${ZENOH_TRANSPORT:-auto}"
+  mode="${mode,,}"
+  case "${mode}" in
+    auto|tcp|quic) echo "${mode}" ;;
+    *)
+      log_warn "Unknown ZENOH_TRANSPORT=${ZENOH_TRANSPORT}; using auto."
+      echo "auto"
+      ;;
+  esac
+}
+
+zenoh_transport_label() {
+  case "$(zenoh_transport)" in
+    auto)
+      if zenoh_quic_ready_any; then
+        echo "auto (quic + tcp fallback)"
+      elif zenoh_auto_quic_enabled; then
+        echo "auto (tcp; quic TLS missing)"
+      else
+        echo "auto (tcp; quic not enabled)"
+      fi
+      ;;
+    quic) echo "quic" ;;
+    tcp) echo "tcp" ;;
+  esac
+}
+
+zenoh_auto_quic_enabled() {
+  case "${ZENOH_AUTO_ENABLE_QUIC:-0}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+zenoh_quic_active() {
+  [[ "$(zenoh_transport)" == "quic" ]] || { [[ "$(zenoh_transport)" == "auto" ]] && zenoh_auto_quic_enabled && zenoh_quic_ready_any; }
+}
+
+zenoh_tls_file_exists() {
+  local value="$1"
+  [[ -n "${value}" && -f "${value/#\~/${HOME}}" ]]
+}
+
+zenoh_quic_client_ready() {
+  zenoh_tls_file_exists "${ZENOH_TLS_ROOT_CA:-}"
+}
+
+zenoh_quic_listener_ready() {
+  zenoh_tls_file_exists "${ZENOH_TLS_LISTEN_KEY:-}" && zenoh_tls_file_exists "${ZENOH_TLS_LISTEN_CERT:-}"
+}
+
+zenoh_quic_ready_any() {
+  zenoh_quic_client_ready || zenoh_quic_listener_ready
+}
+
+zenoh_quic_params() {
+  local params="${ZENOH_QUIC_PARAMS:-multistream=1;mixed_rel=auto}"
+  [[ -n "${params}" ]] && echo "?${params}"
+}
+
+zenoh_quic_endpoint() {
+  local host="$1"
+  local port="${ZENOH_PORT:-7447}"
+  echo "quic/${host}:${port}$(zenoh_quic_params)"
+}
+
+zenoh_require_quic_client() {
+  zenoh_quic_client_ready && return 0
+  if [[ "$(zenoh_transport)" == "quic" ]]; then
+    log_error "ZENOH_TRANSPORT=quic needs ZENOH_TLS_ROOT_CA."
+    echo "Run './horus quic install-cert <hub-cert.pem>' on this machine, or use ZENOH_TRANSPORT=auto/tcp." >&2
+    exit 2
+  fi
+  return 1
+}
+
+zenoh_require_quic_listener() {
+  zenoh_quic_listener_ready && return 0
+  if [[ "$(zenoh_transport)" == "quic" ]]; then
+    log_error "ZENOH_TRANSPORT=quic needs ZENOH_TLS_LISTEN_KEY and ZENOH_TLS_LISTEN_CERT."
+    echo "Run './horus quic setup-server' on the listening hub/machine, or use ZENOH_TRANSPORT=auto/tcp." >&2
+    exit 2
+  fi
+  return 1
+}
+
+zenoh_connect_endpoints() {
+  local -n output_ref="$1"
+  local host="$2"
+  local port="${ZENOH_PORT:-7447}"
+  case "$(zenoh_transport)" in
+    auto)
+      if zenoh_auto_quic_enabled && zenoh_require_quic_client; then
+        output_ref+=("$(zenoh_quic_endpoint "${host}")" "tcp/${host}:${port}")
+      else
+        output_ref+=("tcp/${host}:${port}")
+      fi
+      ;;
+    quic)
+      zenoh_require_quic_client
+      output_ref+=("$(zenoh_quic_endpoint "${host}")")
+      ;;
+    tcp) output_ref+=("tcp/${host}:${port}") ;;
+  esac
+}
+
+zenoh_listen_endpoints() {
+  local -n output_ref="$1"
+  local bind="${ZENOH_BIND:-0.0.0.0}"
+  local port="${ZENOH_PORT:-7447}"
+  case "$(zenoh_transport)" in
+    auto)
+      if zenoh_auto_quic_enabled && zenoh_require_quic_listener; then
+        output_ref+=("$(zenoh_quic_endpoint "${bind}")" "tcp/${bind}:${port}")
+      else
+        output_ref+=("tcp/${bind}:${port}")
+      fi
+      ;;
+    quic)
+      zenoh_require_quic_listener
+      output_ref+=("$(zenoh_quic_endpoint "${bind}")")
+      ;;
+    tcp) output_ref+=("tcp/${bind}:${port}") ;;
+  esac
+}
+
+append_zenoh_connect_args() {
+  local -n output_ref="$1"
+  local target="$2"
+  local endpoints=()
+  local endpoint
+  zenoh_connect_endpoints endpoints "${target}"
+  for endpoint in "${endpoints[@]}"; do
+    output_ref+=(-e "${endpoint}")
+  done
+}
+
+append_zenoh_listen_args() {
+  local -n output_ref="$1"
+  local endpoints=()
+  local endpoint
+  zenoh_listen_endpoints endpoints
+  for endpoint in "${endpoints[@]}"; do
+    output_ref+=(-l "${endpoint}")
+  done
+}
+
+join_by_comma() {
+  local IFS=", "
+  echo "$*"
+}
+
+zenoh_connect_summary() {
+  local target="$1"
+  local endpoints=()
+  zenoh_connect_endpoints endpoints "${target}"
+  join_by_comma "${endpoints[@]}"
+}
+
+zenoh_listen_summary() {
+  local endpoints=()
+  zenoh_listen_endpoints endpoints
+  join_by_comma "${endpoints[@]}"
+}
+
+webrtc_control_enabled() {
+  local enabled="${WEBRTC_CONTROL_ENABLED:-${WEBRTC_ENABLE_CONTROL:-0}}"
+  case "${enabled,,}" in
+    1|true|yes|on) echo "1" ;;
+    *) echo "0" ;;
+  esac
 }
 
 zenoh_docker_cmd() {
@@ -230,6 +484,36 @@ zenoh_docker_name() {
 
 zenoh_uses_docker() {
   [[ "${ZENOH_BRIDGE_RUNTIME:-binary}" == "docker" ]]
+}
+
+append_unique_mount_dir() {
+  local -n output_ref="$1"
+  local file="$2"
+  local dir mount
+  [[ -n "${file}" ]] || return 0
+  file="${file/#\~/${HOME}}"
+  [[ -e "${file}" ]] || return 0
+  dir="$(dirname "${file}")"
+  mount="${dir}:${dir}:ro"
+  local existing
+  for existing in "${output_ref[@]}"; do
+    [[ "${existing}" == "${mount}" ]] && return 0
+  done
+  output_ref+=("${mount}")
+}
+
+zenoh_docker_tls_mount_args() {
+  local -n output_ref="$1"
+  local mounts=()
+  local mount
+  append_unique_mount_dir mounts "${ZENOH_TLS_ROOT_CA:-}"
+  append_unique_mount_dir mounts "${ZENOH_TLS_LISTEN_KEY:-}"
+  append_unique_mount_dir mounts "${ZENOH_TLS_LISTEN_CERT:-}"
+  append_unique_mount_dir mounts "${ZENOH_TLS_CONNECT_KEY:-}"
+  append_unique_mount_dir mounts "${ZENOH_TLS_CONNECT_CERT:-}"
+  for mount in "${mounts[@]}"; do
+    output_ref+=(-v "${mount}")
+  done
 }
 
 check_zenoh_docker_access() {
@@ -318,6 +602,77 @@ tcp_probe() {
   return 1
 }
 
+turn_enabled() {
+  [[ "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]
+}
+
+turn_service_name() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files coturn.service >/dev/null 2>&1; then
+    echo "coturn"
+  elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files turnserver.service >/dev/null 2>&1; then
+    echo "turnserver"
+  else
+    echo "coturn"
+  fi
+}
+
+run_root_available() {
+  [[ "$(id -u)" -eq 0 ]] || sudo -n true >/dev/null 2>&1
+}
+
+run_root_cmd() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+turn_running() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --quiet is-active "$(turn_service_name)" >/dev/null 2>&1 && return 0
+  fi
+  pgrep -x turnserver >/dev/null 2>&1
+}
+
+start_turn_relay() {
+  turn_enabled || return 0
+  if ! command -v turnserver >/dev/null 2>&1; then
+    log_error "TURN is enabled but coturn is not installed. Run ./horus bootstrap cloud."
+    return 1
+  fi
+  if run_root_available; then
+    bash "${ROOT}/scripts/setup_turn.sh"
+    return
+  fi
+  if turn_running; then
+    log_success "TURN relay is already running."
+    return
+  fi
+  log_warn "TURN is enabled but cannot be started without sudo. Run ./horus bootstrap cloud on the hub."
+}
+
+stop_turn_relay() {
+  turn_enabled || return 0
+  if command -v systemctl >/dev/null 2>&1 && run_root_available; then
+    run_root_cmd systemctl stop "$(turn_service_name)" >/dev/null 2>&1 || true
+  fi
+}
+
+status_turn() {
+  if ! turn_enabled; then
+    printf "  %-10s %b\n" "turn" "${FG_MUTED}disabled${RESET}"
+    return
+  fi
+  local service
+  service="$(turn_service_name)"
+  if turn_running; then
+    printf "  %-10s %b\n" "turn" "${FG_GREEN}running${RESET} ${FG_MUTED}${service}, udp/tcp ${TURN_PORT:-3478}, relay ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}${RESET}"
+  else
+    printf "  %-10s %b\n" "turn" "${FG_RED}stopped${RESET} ${FG_MUTED}${service}${RESET}"
+  fi
+}
+
 doctor() {
   local role="$1"
   local target=""
@@ -332,14 +687,19 @@ doctor() {
   case "${role}:${HORUS_TOPOLOGY:-hub}" in
     robot:direct)
       target="$(zenoh_connect_target robot)"
+      echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
       echo -e "  target     ${target}"
       echo -en "  zenoh      "
       tcp_probe "${target}" "${ZENOH_PORT:-7447}" || true
+      if zenoh_quic_active; then
+        echo -e "  zenoh udp  ${FG_MUTED}udp/${target}:${ZENOH_PORT:-7447} must be reachable for QUIC${RESET}"
+      fi
       echo -en "  signaling  "
       tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
       ;;
     machine:direct)
       echo -e "  mode       listening for direct robot connections"
+      echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
       echo -e "  addresses"
       local ips
       ips=$(hostname -I 2>/dev/null || true)
@@ -348,7 +708,7 @@ doctor() {
           echo -e "    ${ip}"
         fi
       done
-      echo -e "  expected   tcp/0.0.0.0:${ZENOH_PORT:-7447}, tcp/0.0.0.0:${WEBRTC_SIGNAL_PORT:-8765}"
+      echo -e "  expected   $(zenoh_listen_summary), tcp/0.0.0.0:${WEBRTC_SIGNAL_PORT:-8765}"
       local active_listeners
       active_listeners=$(ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true)
       if [[ -n "${active_listeners}" ]]; then
@@ -362,16 +722,24 @@ doctor() {
       ;;
     robot:hub|machine:hub)
       target="$(zenoh_connect_target "${role}")"
+      echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
       echo -e "  cloud      ${target}"
       echo -en "  zenoh      "
       tcp_probe "${target}" "${ZENOH_PORT:-7447}" || true
+      if zenoh_quic_active; then
+        echo -e "  zenoh udp  ${FG_MUTED}udp/${target}:${ZENOH_PORT:-7447} must be reachable for QUIC${RESET}"
+      fi
       echo -en "  signaling  "
       tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
+      if [[ "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ]]; then
+        echo -e "  turn       ${FG_GREEN}configured${RESET} ${FG_MUTED}${WEBRTC_ICE_SERVERS#*,}${RESET}"
+      fi
       ;;
     cloud:*)
       echo -e "  mode       listening for robot and machine connections"
+      echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
       local active_listeners
-      active_listeners=$(ss -ltnp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765})" || true)
+      active_listeners=$(ss -ltunp 2>/dev/null | grep -E ":(${ZENOH_PORT:-7447}|${WEBRTC_SIGNAL_PORT:-8765}|${TURN_PORT:-3478})" || true)
       if [[ -n "${active_listeners}" ]]; then
         echo -e "  listeners"
         while read -r line; do
@@ -379,6 +747,9 @@ doctor() {
         done <<< "${active_listeners}"
       else
         echo -e "  listeners  ${FG_MUTED}none detected${RESET}"
+      fi
+      if turn_enabled; then
+        echo -e "  turn       ${FG_GREEN}enabled${RESET} udp/tcp ${TURN_PORT:-3478}, relay udp ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}"
       fi
       ;;
   esac
@@ -528,7 +899,6 @@ get_pid_stats() {
       if [[ -n "${stats}" ]]; then
         local cpu mem etimes uptime_str
         cpu=$(echo "${stats}" | awk '{print $1}')
-        mem=$(echo "${stats}" | awk '{2}') # Avoid printing empty
         mem=$(echo "${stats}" | awk '{print $2}')
         etimes=$(echo "${stats}" | awk '{print $3}')
 
@@ -597,13 +967,21 @@ launch_zenoh_client() {
   local bridge="${ROOT}/zenoh-bridge-ros2dds"
   local config
   local docker_cmd=(docker)
+  local docker_mount_args=()
   local namespace_args=()
+  local zenoh_args=()
+  local endpoint_args=()
+  append_zenoh_connect_args endpoint_args "${target}"
   if zenoh_uses_docker; then
     check_zenoh_docker_access
     [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
     [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
     config="$(zenoh_config_path)"
     [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+    if zenoh_quic_active; then
+      config="$(zenoh_runtime_config_path "${config}")"
+      zenoh_docker_tls_mount_args docker_mount_args
+    fi
     "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${role}")" >/dev/null 2>&1 || true
     start_bg zenoh "${docker_cmd[@]}" run --rm \
       --name "$(zenoh_docker_name "${role}")" \
@@ -611,14 +989,15 @@ launch_zenoh_client() {
       -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
       -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
       -v "${config}:/horus_zenoh.json5:ro" \
-      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-latest}}" \
+      "${docker_mount_args[@]}" \
+      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-1.9.0}}" \
       -c /horus_zenoh.json5 "${namespace_args[@]}" \
-      --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
+      --no-multicast-scouting "${endpoint_args[@]}" client
   else
     [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
     source_ros_required
-    # shellcheck disable=SC2086
-    start_bg zenoh "${bridge}" $(zenoh_common_args) --no-multicast-scouting -e "tcp/${target}:${ZENOH_PORT:-7447}" client
+    build_zenoh_common_args zenoh_args
+    start_bg zenoh "${bridge}" "${zenoh_args[@]}" --no-multicast-scouting "${endpoint_args[@]}" client
   fi
 }
 
@@ -627,13 +1006,21 @@ launch_zenoh_router() {
   local bridge="${ROOT}/zenoh-bridge-ros2dds"
   local config
   local docker_cmd=(docker)
+  local docker_mount_args=()
   local namespace_args=()
+  local zenoh_args=()
+  local endpoint_args=()
+  append_zenoh_listen_args endpoint_args
   if zenoh_uses_docker; then
     check_zenoh_docker_access
     [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
     [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
     config="$(zenoh_config_path)"
     [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+    if zenoh_quic_active; then
+      config="$(zenoh_runtime_config_path "${config}")"
+      zenoh_docker_tls_mount_args docker_mount_args
+    fi
     "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${role}")" >/dev/null 2>&1 || true
     start_bg zenoh "${docker_cmd[@]}" run --rm \
       --name "$(zenoh_docker_name "${role}")" \
@@ -641,9 +1028,10 @@ launch_zenoh_router() {
       -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
       -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
       -v "${config}:/horus_zenoh.json5:ro" \
-      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-latest}}" \
+      "${docker_mount_args[@]}" \
+      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-1.9.0}}" \
       -c /horus_zenoh.json5 "${namespace_args[@]}" \
-      -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
+      "${endpoint_args[@]}" router
   else
     [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
     if [[ "${role}" == "cloud" ]]; then
@@ -651,38 +1039,52 @@ launch_zenoh_router() {
     else
       source_ros_required
     fi
-    # shellcheck disable=SC2086
-    start_bg zenoh "${bridge}" $(zenoh_common_args) -l "tcp/0.0.0.0:${ZENOH_PORT:-7447}" router
+    build_zenoh_common_args zenoh_args
+    start_bg zenoh "${bridge}" "${zenoh_args[@]}" "${endpoint_args[@]}" router
   fi
 }
 
 launch_webrtc_robot() {
   local py
   local target
+  local optional_args=()
+  local control_enabled
   ensure_webrtc_media_supported
   py="$(python_bin)"
   target="$(webrtc_signal_target)"
+  control_enabled="$(webrtc_control_enabled)"
   source_ros_required
   if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
-    # shellcheck disable=SC2086
+    build_ice_args optional_args
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_sender.py" \
       --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
       --duration "${WEBRTC_DURATION:-86400}" \
       --camera-fps-scale "${CAMERA_FPS_SCALE:-1.0}" \
       --quality-scale "${CAMERA_QUALITY_SCALE:-1.0}" \
       --max-buffer-bytes "${WEBRTC_MAX_BUFFER_BYTES:-2000000}" \
+      --enable-control "${control_enabled}" \
       --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
-      $(ice_args) \
+      --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
+      --allow-unauthenticated-control "${WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL:-0}" \
+      --cmd-max-linear-mps "${WEBRTC_CMD_MAX_LINEAR_MPS:-0.5}" \
+      --cmd-max-angular-rps "${WEBRTC_CMD_MAX_ANGULAR_RPS:-1.0}" \
+      "${optional_args[@]}" \
       --json "${RUN_DIR}/webrtc_robot_summary.json"
   else
     "${ROOT}/scripts/detect_video_stack.sh" --role robot --out "${ROOT}/.webrtc_profile.env" >/dev/null
-    # shellcheck disable=SC2086
+    build_webrtc_latency_probe_args optional_args
     start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
       --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
       --room "${HORUS_ROOM:-default}" \
       --profile "${ROOT}/.webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+      --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
+      --enable-control "${control_enabled}" \
       --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
+      --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
+      --allow-unauthenticated-control "${WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL:-0}" \
+      --cmd-max-linear-mps "${WEBRTC_CMD_MAX_LINEAR_MPS:-0.5}" \
+      --cmd-max-angular-rps "${WEBRTC_CMD_MAX_ANGULAR_RPS:-1.0}" \
       --cmd-watchdog-timeout "${WEBRTC_CMD_WATCHDOG_TIMEOUT:-0.3}" \
       --cmd-rate-limit-hz "${WEBRTC_CMD_RATE_LIMIT_HZ:-100.0}" \
       --video-bitrate-kbit "${VIDEO_BITRATE_KBIT:-6000}" \
@@ -698,6 +1100,7 @@ launch_webrtc_robot() {
       --width "${WEBRTC_VIDEO_WIDTH:-1280}" \
       --height "${WEBRTC_VIDEO_HEIGHT:-720}" \
       --fps "${WEBRTC_VIDEO_FPS:-30}" \
+      "${optional_args[@]}" \
       --duration "${WEBRTC_DURATION:-86400}"
   fi
 }
@@ -705,58 +1108,68 @@ launch_webrtc_robot() {
 launch_webrtc_receiver() {
   local role="$1"
   local py
+  local target
+  local optional_args=()
+  local cmd_rate
   ensure_webrtc_media_supported
   py="$(python_bin)"
   source_ros_required
+  target="$(webrtc_signal_target)"
+  cmd_rate="${CMD_RATE:-0}"
+  if [[ "$(webrtc_control_enabled)" != "1" ]]; then
+    cmd_rate="0"
+  fi
   if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
-    # shellcheck disable=SC2086
+    build_ice_args optional_args
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_receiver.py" \
       --host 0.0.0.0 \
       --port "${WEBRTC_SIGNAL_PORT:-8765}" \
       --duration "${WEBRTC_DURATION:-86400}" \
-      --cmd-rate "${CMD_RATE:-0}" \
+      --cmd-rate "${cmd_rate}" \
       --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
       --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
-      $(ice_args) \
+      "${optional_args[@]}" \
       --json "${RUN_DIR}/webrtc_${role}_summary.json" \
       --csv "${RUN_DIR}/webrtc_${role}_latency.csv"
   else
     "${ROOT}/scripts/detect_video_stack.sh" --role "${role}" --out "${ROOT}/.webrtc_profile.env" >/dev/null
+    build_webrtc_latency_receiver_args optional_args
     if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
-      required_value HORUS_CLOUD_IP "${HORUS_CLOUD_IP:-}"
-      # shellcheck disable=SC2086
       start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
-        --signaling-url "ws://${HORUS_CLOUD_IP}:${WEBRTC_SIGNAL_PORT:-8765}" \
+        --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
         --room "${HORUS_ROOM:-default}" \
         --profile "${ROOT}/.webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
         --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
         --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
         --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
         --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
         --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
-        --cmd-rate "${CMD_RATE:-0}" \
+        --cmd-rate "${cmd_rate}" \
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+        "${optional_args[@]}" \
         --duration "${WEBRTC_DURATION:-86400}"
     else
-      # shellcheck disable=SC2086
       start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
         --host 0.0.0.0 \
         --port "${WEBRTC_SIGNAL_PORT:-8765}" \
         --room "${HORUS_ROOM:-default}" \
         --profile "${ROOT}/.webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
         --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
         --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
         --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
         --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
         --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
-        --cmd-rate "${CMD_RATE:-0}" \
+        --cmd-rate "${cmd_rate}" \
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+        "${optional_args[@]}" \
         --duration "${WEBRTC_DURATION:-86400}"
     fi
   fi
@@ -764,11 +1177,18 @@ launch_webrtc_receiver() {
 
 launch_signal_relay() {
   local py
+  local relay_auth_args=()
   py="$(signal_python_bin)"
+  if [[ -n "${HORUS_WEBRTC_RELAY_TOKEN:-}" ]]; then
+    relay_auth_args+=(--auth-token "${HORUS_WEBRTC_RELAY_TOKEN}")
+  elif [[ "${HORUS_WEBRTC_RELAY_ALLOW_UNAUTHENTICATED:-0}" == "1" ]]; then
+    relay_auth_args+=(--allow-unauthenticated)
+  fi
   start_bg signal "${py}" "${ROOT}/scripts/webrtc_signal_relay.py" \
     --host 0.0.0.0 \
     --port "${WEBRTC_SIGNAL_PORT:-8765}" \
-    --state-file "${RUN_DIR}/signal_members.json"
+    --state-file "${RUN_DIR}/signal_members.json" \
+    "${relay_auth_args[@]}"
 }
 
 launch_metrics() {
@@ -871,11 +1291,26 @@ case "${cmd}" in
     echo -e "  config     ${ENV_FILE}"
     zenoh_target="$(zenoh_connect_target "${role}")"
     if [[ -n "${zenoh_target}" ]]; then
-      echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, tcp/${zenoh_target}:${FG_CYAN}${ZENOH_PORT:-7447}${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
+      echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, ${FG_CYAN}$(zenoh_connect_summary "${zenoh_target}")${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
     else
-      echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, listening tcp/0.0.0.0:${FG_CYAN}${ZENOH_PORT:-7447}${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
+      echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, listening ${FG_CYAN}$(zenoh_listen_summary)${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
     fi
+    echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
     echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    if [[ "${role}" == "cloud" ]]; then
+      if turn_enabled; then
+        echo -e "  turn       ${FG_CYAN}enabled${RESET}, udp/tcp ${TURN_PORT:-3478}, relay ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}"
+      else
+        echo -e "  turn       ${FG_MUTED}disabled${RESET}"
+      fi
+    elif [[ "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ]]; then
+      echo -e "  turn       ${FG_CYAN}fallback configured${RESET}"
+    fi
+    if [[ "$(webrtc_control_enabled)" == "1" ]]; then
+      echo -e "  control    ${FG_YELLOW}WebRTC DataChannel enabled${RESET}, ROS topic ${ROS_CMD_TOPIC:-/cmd_vel}"
+    else
+      echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}, WebRTC video only"
+    fi
     echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
     if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720}${RESET} @ ${FG_CYAN}${WEBRTC_VIDEO_FPS:-30} fps${RESET}, source ${WEBRTC_VIDEO_SOURCE:-ros2}"
@@ -915,6 +1350,7 @@ case "${cmd}" in
         if [[ "${HORUS_CLOUD_RUN_SIGNALING:-1}" == "1" ]]; then
           launch_signal_relay
         fi
+        start_turn_relay
         ;;
       *)
         echo "Unknown launch role: ${role}" >&2
@@ -953,6 +1389,17 @@ case "${cmd}" in
     stop_one_styled webrtc
     stop_one_styled signal
     rm -f "${RUN_DIR}/signal_members.json"
+    if turn_enabled; then
+      echo -e "  turn        stopping $(turn_service_name)"
+      stop_turn_relay
+      if turn_running; then
+        echo -e "  turn        ${FG_YELLOW}still running${RESET}"
+      else
+        echo -e "  turn        ${FG_GREEN}stopped${RESET}"
+      fi
+    else
+      echo -e "  turn        ${FG_MUTED}disabled${RESET}"
+    fi
     stop_one_styled metrics
     stop_one_styled fake-data
 
@@ -992,6 +1439,11 @@ case "${cmd}" in
     ns="${ZENOH_NAMESPACE:-/}"
     echo -e "  ros        ${FG_CYAN}${distro}${RESET}, domain ${FG_CYAN}${domain}${RESET}, namespace ${FG_CYAN}${ns}${RESET}"
     echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
+    if [[ "$(webrtc_control_enabled)" == "1" ]]; then
+      echo -e "  control    ${FG_YELLOW}WebRTC DataChannel${RESET}"
+    else
+      echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}"
+    fi
     if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720} @ ${WEBRTC_VIDEO_FPS:-30} fps${RESET}"
       echo -e "  source     ${FG_CYAN}${WEBRTC_VIDEO_SOURCE:-ros2}${RESET}"
@@ -1001,16 +1453,14 @@ case "${cmd}" in
     fi
     zenoh_target="$(zenoh_connect_target "${HORUS_ROLE:-robot}")"
     if [[ -n "${zenoh_target}" ]]; then
-      echo -e "  zenoh      tcp/${zenoh_target}:${ZENOH_PORT:-7447}"
+      echo -e "  zenoh      $(zenoh_connect_summary "${zenoh_target}")"
     else
-      echo -e "  zenoh      listening tcp/0.0.0.0:${ZENOH_PORT:-7447}"
+      echo -e "  zenoh      listening $(zenoh_listen_summary)"
     fi
+    echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
     echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
     if [[ -f "${ROOT}/.webrtc_profile.env" ]]; then
-      set -a
-      # shellcheck source=/dev/null
-      source "${ROOT}/.webrtc_profile.env"
-      set +a
+      load_key_value_file "${ROOT}/.webrtc_profile.env"
       encoder="${GST_H264_ENCODER_NAME:-unknown}"
       decoder="${GST_H264_DECODER_NAME:-unknown}"
       accel="${VIDEO_ENCODER_ACCEL:-${VIDEO_DECODER_ACCEL:-auto}}"
@@ -1020,6 +1470,7 @@ case "${cmd}" in
     echo -e "${BOLD}Services${RESET}"
     status_zenoh
     status_one signal
+    status_turn
     status_one webrtc
     status_one metrics
     status_one fake-data
@@ -1056,9 +1507,58 @@ case "${cmd}" in
     role="${2:-${HORUS_ROLE:-robot}}"
     doctor "${role}"
     ;;
+  quic)
+    load_env
+    action="${2:-status}"
+    case "${action}" in
+      setup-server|server)
+        "${ROOT}/scripts/setup_zenoh_tls.sh" server
+        ;;
+      install-cert|client)
+        "${ROOT}/scripts/setup_zenoh_tls.sh" client "${3:-}"
+        ;;
+      status)
+        "${ROOT}/scripts/setup_zenoh_tls.sh" status
+        ;;
+      export-cert)
+        if [[ -n "${ZENOH_TLS_LISTEN_CERT:-}" && -f "${ZENOH_TLS_LISTEN_CERT/#\~/${HOME}}" ]]; then
+          echo "${ZENOH_TLS_LISTEN_CERT/#\~/${HOME}}"
+        else
+          log_error "No local Zenoh listener certificate found. Run './horus quic setup-server' on the hub/listener."
+          exit 1
+        fi
+        ;;
+      *)
+        log_error "Invalid quic action."
+        echo -e "${BOLD}Usage:${RESET}"
+        echo -e "  ./horus quic ${FG_GREEN}setup-server${RESET}"
+        echo -e "  ./horus quic ${FG_GREEN}install-cert <cert.pem>${RESET}"
+        echo -e "  ./horus quic ${FG_GREEN}status${RESET}"
+        echo -e "  ./horus quic ${FG_GREEN}export-cert${RESET}\n"
+        exit 2
+        ;;
+    esac
+    ;;
   logs)
     service="${2:-}"
     case "${service}" in
+      turn)
+        print_banner
+        echo -e "${BOLD}${FG_CYAN}Log stream: turn${RESET}"
+        echo -e "  service    $(turn_service_name)"
+        echo -e "  control    Press ${BOLD}Ctrl+C${RESET} to stop"
+        echo ""
+        if command -v journalctl >/dev/null 2>&1; then
+          journalctl -u "$(turn_service_name)" -n 80 -f
+        elif [[ -r /var/log/turnserver.log ]]; then
+          tail -f /var/log/turnserver.log
+        elif sudo -n test -r /var/log/turnserver.log >/dev/null 2>&1; then
+          sudo -n tail -f /var/log/turnserver.log
+        else
+          log_error "TURN log is not readable. Try: sudo journalctl -u $(turn_service_name) -f"
+          exit 1
+        fi
+        ;;
       zenoh|webrtc|signal|metrics|fake-data)
       print_banner
         log_file="${RUN_DIR}/${service}.log"
@@ -1094,7 +1594,7 @@ case "${cmd}" in
       *)
         log_error "Invalid service specified."
         echo -e "${BOLD}Usage:${RESET}"
-        echo -e "  ./horus logs ${FG_GREEN}[zenoh|webrtc|signal|metrics|fake-data]${RESET}\n" >&2
+        echo -e "  ./horus logs ${FG_GREEN}[zenoh|webrtc|signal|turn|metrics|fake-data]${RESET}\n" >&2
         exit 2
         ;;
     esac

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Machine-side H.264 WebRTC receiver with cmd_vel DataChannel send."""
+"""Machine-side H.264 WebRTC video receiver."""
 
 import argparse
 from collections import deque
 import json
+import logging
+import math
+import os
+import signal
 import statistics
 import time
 from pathlib import Path
@@ -24,6 +28,29 @@ from ros_image_io import RosImagePublisher
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
 
+logger = logging.getLogger(__name__)
+
+
+def percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    values = sorted(values)
+    pos = (len(values) - 1) * q
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return values[lo]
+    return values[lo] * (hi - pos) + values[hi] * (pos - lo)
+
+
+def load_clock_offset(path: str | None) -> tuple[float, str]:
+    if not path:
+        return 0.0, "none"
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "offset_ms" not in payload:
+        raise ValueError(f"{path} does not contain offset_ms")
+    return float(payload["offset_ms"]), f"clock_offset_probe:{Path(path).name}"
+
 
 class H264MachineReceiver:
     def __init__(self, args):
@@ -41,8 +68,13 @@ class H264MachineReceiver:
         self.video_last_sec = None
         self.frame_clock = deque()
         self.frame_latency_samples = []
+        self.frame_clock_dropped = 0
+        self.frame_clock_overflow_dropped = 0
         self.ros_image_publisher = None
         self.recovering = False
+        self.answer_in_progress = False
+        self.last_remote_offer_sdp = ""
+        self.stopped = False
         if self.args.video_output in {"ros2", "both"}:
             self.ros_image_publisher = RosImagePublisher(
                 self.args.ros_image_topic,
@@ -71,7 +103,7 @@ class H264MachineReceiver:
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtc")
         if self.webrtc is None:
             raise RuntimeError("failed to create webrtcbin")
-        configure_webrtcbin(self.webrtc, self.args.ice_servers)
+        configure_webrtcbin(self.webrtc, self.args.ice_servers, self.args.ice_transport_policy)
         pipeline.add(self.webrtc)
         return pipeline
 
@@ -90,6 +122,8 @@ class H264MachineReceiver:
             self.webrtc.connect("on-data-channel", self._on_data_channel)
         except TypeError:
             print("WebRTC DataChannel unavailable in this GStreamer runtime; cmd_vel over WebRTC disabled", flush=True)
+        signal.signal(signal.SIGTERM, self._handle_stop_signal)
+        signal.signal(signal.SIGINT, self._handle_stop_signal)
         self.pipeline.set_state(Gst.State.PLAYING)
         if self.args.duration > 0:
             GLib.timeout_add_seconds(int(self.args.duration), self.stop)
@@ -98,7 +132,13 @@ class H264MachineReceiver:
         finally:
             self.stop()
 
+    def _handle_stop_signal(self, _signum, _frame):
+        GLib.idle_add(self.stop)
+
     def stop(self):
+        if self.stopped:
+            return False
+        self.stopped = True
         if self.video_frames:
             observed_sec = max((self.video_last_sec or 0.0) - (self.video_first_sec or 0.0), 0.001)
             payload = {
@@ -108,23 +148,27 @@ class H264MachineReceiver:
             }
             if self.frame_latency_samples:
                 latencies = [sample["latency_ms"] for sample in self.frame_latency_samples]
-                fresh_count = sum(1 for sample in self.frame_latency_samples if sample["latency_ms"] <= self.args.fresh_deadline_ms)
+                fresh_count = sum(1 for sample in self.frame_latency_samples if sample["fresh"])
+                stale_count = max(0, len(self.frame_latency_samples) - fresh_count)
                 payload.update(
                     {
                         "video_latency_samples": len(self.frame_latency_samples),
                         "video_latency_ms_median": statistics.median(latencies),
-                        "video_latency_ms_p95": sorted(latencies)[
-                            min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.95)))
-                        ],
-                        "video_latency_ms_p99": sorted(latencies)[
-                            min(len(latencies) - 1, int(round((len(latencies) - 1) * 0.99)))
-                        ],
+                        "video_latency_ms_p50": percentile(latencies, 0.50),
+                        "video_latency_ms_p95": percentile(latencies, 0.95),
+                        "video_latency_ms_p99": percentile(latencies, 0.99),
                         "fresh_deadline_ms": self.args.fresh_deadline_ms,
                         "fresh_latency_samples": fresh_count,
+                        "stale_latency_samples": stale_count,
                         "fresh_sample_sla": fresh_count / len(self.frame_latency_samples),
                         "fresh_fps_estimate": (self.video_frames / observed_sec)
                         * (fresh_count / len(self.frame_latency_samples)),
                         "clock_offset_ms": self.args.clock_offset_ms,
+                        "clock_offset_source": self.args.clock_offset_source,
+                        "frame_clock_dropped": self.frame_clock_dropped,
+                        "frame_clock_overflow_dropped": self.frame_clock_overflow_dropped,
+                        "freshest_frame_policy": "appsink_max_buffers_1_drop_true_and_frame_clock_keep_last_1",
+                        "latency_method": "WebRTC sender frame-clock timestamp corrected by measured clock offset; no percentile-baseline subtraction",
                     }
                 )
             print(
@@ -167,6 +211,8 @@ class H264MachineReceiver:
         return False
 
     def _on_ice_candidate(self, _element, mlineindex, candidate):
+        if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+            print(f"Local ICE candidate: {candidate}", flush=True)
         self.signaling.send({"type": "ice", "sdpMLineIndex": int(mlineindex), "candidate": candidate})
 
     def _handle_signaling_message(self, message):
@@ -175,11 +221,18 @@ class H264MachineReceiver:
     def _handle_signaling_message_in_loop(self, message):
         kind = message.get("type")
         if kind == "offer":
-            offer = make_session_description("offer", message["sdp"])
+            sdp = message.get("sdp", "")
+            if not sdp or sdp == self.last_remote_offer_sdp:
+                return False
+            self.last_remote_offer_sdp = sdp
+            self.answer_in_progress = True
+            offer = make_session_description("offer", sdp)
             self.webrtc.emit("set-remote-description", offer, Gst.Promise.new())
             promise = Gst.Promise.new_with_change_func(self._on_answer_created, None)
             self.webrtc.emit("create-answer", None, promise)
         elif kind == "ice":
+            if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+                print(f"Remote ICE candidate: {message.get('candidate', '')}", flush=True)
             self.webrtc.emit("add-ice-candidate", int(message["sdpMLineIndex"]), message["candidate"])
         return False
 
@@ -188,12 +241,14 @@ class H264MachineReceiver:
         reply = promise.get_reply()
         answer = reply.get_value("answer") if reply is not None else None
         if answer is None:
+            self.answer_in_progress = False
             detail = reply.to_string() if reply is not None else "no promise reply"
             print(f"failed to create WebRTC answer: {detail}", flush=True)
             self.stop()
             return
         self.webrtc.emit("set-local-description", answer, Gst.Promise.new())
         self.signaling.send({"type": "answer", "sdp": answer.sdp.as_text()})
+        self.answer_in_progress = False
 
     def _on_bus_message(self, _bus, message):
         if message.type == Gst.MessageType.ERROR:
@@ -216,6 +271,8 @@ class H264MachineReceiver:
             self.webrtc = None
             self.cmd_channel = None
             self.frame_clock.clear()
+            self.answer_in_progress = False
+            self.last_remote_offer_sdp = ""
 
             # Rebuild pipeline
             self.pipeline = self._build_pipeline()
@@ -307,18 +364,7 @@ class H264MachineReceiver:
             self.video_first_sec = now
         self.video_last_sec = now
         self.video_frames += 1
-        if self.frame_clock:
-            sent = self.frame_clock.pop()
-            self.frame_clock.clear()
-            raw_latency_ms = (time.time_ns() - int(sent["sent_ns"])) / 1_000_000.0
-            self.frame_latency_samples.append(
-                {
-                    "seq": sent.get("seq"),
-                    "t_sec": now - (self.video_first_sec or now),
-                    "latency_ms": raw_latency_ms - self.args.clock_offset_ms,
-                    "raw_latency_ms": raw_latency_ms,
-                }
-            )
+        self._record_frame_latency(now, "display")
 
     def _on_ros_image_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -331,19 +377,35 @@ class H264MachineReceiver:
         self.video_frames += 1
         if self.ros_image_publisher is not None:
             self.ros_image_publisher.publish_sample(sample)
-        if self.frame_clock:
-            sent = self.frame_clock.pop()
-            self.frame_clock.clear()
-            raw_latency_ms = (time.time_ns() - int(sent["sent_ns"])) / 1_000_000.0
-            self.frame_latency_samples.append(
-                {
-                    "seq": sent.get("seq"),
-                    "t_sec": now - (self.video_first_sec or now),
-                    "latency_ms": raw_latency_ms - self.args.clock_offset_ms,
-                    "raw_latency_ms": raw_latency_ms,
-                }
-            )
+        self._record_frame_latency(now, "ros2")
         return Gst.FlowReturn.OK
+
+    def _record_frame_latency(self, now: float, output_stage: str):
+        if not self.frame_clock:
+            return
+        dropped = max(0, len(self.frame_clock) - 1)
+        if dropped:
+            self.frame_clock_dropped += dropped
+        sent = self.frame_clock.pop()
+        self.frame_clock.clear()
+        receive_wall_ns = time.time_ns()
+        raw_latency_ms = (receive_wall_ns - int(sent["sent_ns"])) / 1_000_000.0
+        latency_ms = raw_latency_ms - self.args.clock_offset_ms
+        is_fresh = latency_ms <= self.args.fresh_deadline_ms
+        self.frame_latency_samples.append(
+            {
+                "seq": sent.get("seq"),
+                "output_stage": output_stage,
+                "receive_t_sec": now - (self.video_first_sec or now),
+                "latency_ms": latency_ms,
+                "raw_latency_ms": raw_latency_ms,
+                "send_wall_ns": int(sent["sent_ns"]),
+                "receive_wall_ns": receive_wall_ns,
+                "fresh": is_fresh,
+                "stale": not is_fresh,
+                "dropped_before_sample": dropped,
+            }
+        )
 
     def _on_data_channel(self, _webrtc, channel):
         print(f"DataChannel received: {channel.props.label}", flush=True)
@@ -360,11 +422,13 @@ class H264MachineReceiver:
         try:
             message = json.loads(text)
         except Exception:
+            logger.debug("Ignoring malformed frame clock message: %s", text, exc_info=True)
             return
         if message.get("type") != "frame_clock" or "sent_ns" not in message:
             return
         self.frame_clock.append(message)
         while len(self.frame_clock) > 600:
+            self.frame_clock_overflow_dropped += 1
             self.frame_clock.popleft()
 
     def _on_cmd_channel_open(self, _channel):
@@ -395,6 +459,7 @@ class H264MachineReceiver:
         try:
             ack = json.loads(text)
         except Exception:
+            logger.debug("Ignoring malformed cmd_vel ack message: %s", text, exc_info=True)
             return
         if ack.get("type") != "cmd_vel_ack":
             return
@@ -412,6 +477,7 @@ def parse_args():
     parser.add_argument("--room", default="default")
     parser.add_argument("--profile", default=".webrtc_profile.env")
     parser.add_argument("--ice-servers", default="stun:stun.l.google.com:19302")
+    parser.add_argument("--ice-transport-policy", choices=["all", "relay"], default="all")
     parser.add_argument("--video-sink", default="fakesink")
     parser.add_argument("--video-output", choices=["ros2", "display", "both"], default="display")
     parser.add_argument("--ros-image-topic", default="/camera/webrtc/image_raw")
@@ -422,10 +488,16 @@ def parse_args():
     parser.add_argument("--cmd-linear-x", type=float, default=0.0)
     parser.add_argument("--cmd-angular-z", type=float, default=0.0)
     parser.add_argument("--duration", type=float, default=0.0)
-    parser.add_argument("--clock-offset-ms", type=float, default=0.0)
+    parser.add_argument("--clock-offset-ms", type=float, default=None)
+    parser.add_argument("--clock-offset-json", default="")
     parser.add_argument("--fresh-deadline-ms", type=float, default=150.0)
     parser.add_argument("--latency-json", default="")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.clock_offset_ms is None:
+        args.clock_offset_ms, args.clock_offset_source = load_clock_offset(args.clock_offset_json)
+    else:
+        args.clock_offset_source = "manual"
+    return args
 
 
 def main():

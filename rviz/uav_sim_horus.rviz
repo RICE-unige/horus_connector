@@ -1,0 +1,183 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Toolbars:
+  toolButtonStyle: 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.35
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 160
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Name: Ground Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 40
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Scale: 0.35
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Update Interval: 0
+      Value: true
+    - Alpha: 1
+      Axes Length: 0.8
+      Axes Radius: 0.04
+      Class: rviz_default_plugins/Pose
+      Color: 0; 170; 255
+      Enabled: true
+      Head Length: 0.25
+      Head Radius: 0.08
+      Name: Drone Pose
+      Shaft Length: 0.8
+      Shaft Radius: 0.03
+      Shape: Axes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /drone1/state/pose
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 255; 180; 0
+      Enabled: true
+      Head Diameter: 0.25
+      Head Length: 0.2
+      Length: 0.2
+      Line Style: Lines
+      Line Width: 0.06
+      Name: Planned Path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 0
+      Pose Style: Axes
+      Radius: 0.05
+      Shaft Diameter: 0.08
+      Shaft Length: 0.2
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /uav_sim/path
+      Value: true
+    - Class: octomap_rviz_plugins/OccupancyGrid
+      Enabled: true
+      Name: OctoMap Voxel Mesh
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /uav_sim/octomap_binary
+      Value: true
+      Voxel Alpha: 0.95
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: Occupied Voxels
+    - Alpha: 0.25
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: true
+      Enabled: false
+      Name: Projected 2D Map
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /projected_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map_updates
+      Value: false
+    - Class: rviz_default_plugins/Image
+      Enabled: false
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: WebRTC Front Camera
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /drone1/front_camera/webrtc/image_raw
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 20; 24; 28
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /uav_sim/goal_2d
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 32
+      Focal Point:
+        X: 1.25
+        Y: 3.6
+        Z: 1.9
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Orbit
+      Near Clip Distance: 0.01
+      Pitch: 0.85
+      Target Frame: map
+      Value: Orbit
+      Yaw: 0.65
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: ""
+  Views:
+    collapsed: true
+  Width: 1500
+  X: 120
+  Y: 80

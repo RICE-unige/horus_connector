@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import csv
 import json
+import logging
 import statistics
 import time
 from pathlib import Path
@@ -12,7 +13,10 @@ from pathlib import Path
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 
+from experiment_metrics import CsvMetricWriter, default_metrics_path
 from webrtc_common import candidate_summary, unpack_frame, wait_for_ice_gathering_complete
+
+logger = logging.getLogger(__name__)
 
 
 def percentile(values, pct):
@@ -130,6 +134,39 @@ class Recorder:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(self.summary(), indent=2, sort_keys=True), encoding="utf-8")
 
+    def write_standard_metrics(self, path):
+        target = Path(path) if path else default_metrics_path("webrtc_metrics.csv")
+        if target is None:
+            return
+        summary = self.summary()
+        fields = (
+            "role",
+            "stream",
+            "count",
+            "observed_sec",
+            "mbps_received",
+            "latency_ms_median",
+            "latency_ms_p95",
+            "latency_ms_p99",
+            "control_count",
+            "control_rtt_ms_p95",
+        )
+        with CsvMetricWriter(target, fieldnames=fields) as writer:
+            writer.write(
+                {
+                    "role": "receiver",
+                    "stream": "webrtc_camera",
+                    "count": summary.get("count"),
+                    "observed_sec": summary.get("observed_sec"),
+                    "mbps_received": summary.get("mbps_received"),
+                    "latency_ms_median": summary.get("latency_ms_median"),
+                    "latency_ms_p95": summary.get("latency_ms_p95"),
+                    "latency_ms_p99": summary.get("latency_ms_p99"),
+                    "control_count": summary.get("control", {}).get("count"),
+                    "control_rtt_ms_p95": summary.get("control", {}).get("rtt_ms_p95"),
+                }
+            )
+
     def record_control_ack(self, ack):
         receive_ns = time.time_ns()
         sent_ns = int(ack.get("sent_ns", 0))
@@ -203,6 +240,7 @@ async def run(args):
                     try:
                         ack = json.loads(message if isinstance(message, str) else message.decode("utf-8"))
                     except Exception:
+                        logger.debug("Ignoring malformed cmd_vel ack message: %r", message, exc_info=True)
                         return
                     if ack.get("type") == "cmd_vel_ack":
                         recorder.record_control_ack(ack)
@@ -231,6 +269,7 @@ async def run(args):
                 await pc.close()
             recorder.write_csv(args.csv)
             recorder.write_json(args.json)
+            recorder.write_standard_metrics(args.metrics_csv)
             print(json.dumps(recorder.summary(), indent=2, sort_keys=True), flush=True)
 
 
@@ -248,6 +287,7 @@ def parse_args():
     parser.add_argument("--cmd-max-buffer-bytes", type=int, default=64_000)
     parser.add_argument("--json", default="webrtc_camera_latency.json")
     parser.add_argument("--csv", default="webrtc_camera_latency.csv")
+    parser.add_argument("--metrics-csv", default=None)
     return parser.parse_args()
 
 

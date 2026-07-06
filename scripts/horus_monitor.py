@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import select
@@ -19,6 +20,8 @@ import tty
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 
 RESET = "\033[0m"
@@ -108,6 +111,7 @@ def load_env_file(path: Path) -> Dict[str, str]:
 def load_env(root: Path, env_path: Path) -> Dict[str, str]:
     values = load_env_file(env_path)
     values.update(load_env_file(root / ".zenoh_profile.env"))
+    values.update(load_env_file(root / ".zenoh_tls_profile.env"))
     return values
 
 
@@ -115,6 +119,7 @@ def read_pid(path: Path) -> Optional[int]:
     try:
         return int(path.read_text(encoding="utf-8").strip())
     except Exception:
+        logger.debug("Failed to read pid file %s", path, exc_info=True)
         return None
 
 
@@ -123,6 +128,8 @@ def pid_running(pid: Optional[int]) -> bool:
         return False
     try:
         os.kill(pid, 0)
+        return True
+    except PermissionError:
         return True
     except OSError:
         return False
@@ -140,10 +147,28 @@ def run_command(args: Sequence[str], timeout: float = 1.5) -> str:
         )
         return proc.stdout.strip()
     except Exception:
+        logger.debug("Command failed while collecting monitor state: %s", " ".join(args), exc_info=True)
         return ""
 
 
 def process_state(run_dir: Path, name: str) -> ProcessState:
+    if name == "turn":
+        output = run_command(["pgrep", "-xo", "turnserver"], timeout=1.0)
+        try:
+            pid = int(output.splitlines()[0])
+        except Exception:
+            logger.debug("Failed to parse turnserver pid from pgrep output: %s", output, exc_info=True)
+            return ProcessState(name=name, pid=None, running=False)
+        state = ProcessState(name=name, pid=pid, running=pid_running(pid))
+        if state.running:
+            stats = run_command(["ps", "-p", str(pid), "-o", "etimes=,pcpu=,pmem="], timeout=1.0)
+            parts = stats.split()
+            if len(parts) >= 3:
+                state.etime = format_elapsed(int(float(parts[0])))
+                state.cpu = parts[1]
+                state.mem = parts[2]
+        return state
+
     pid = read_pid(run_dir / f"{name}.pid")
     running = pid_running(pid)
     state = ProcessState(name=name, pid=pid, running=running)
@@ -173,6 +198,7 @@ def tail(path: Path, lines: int = 200) -> List[str]:
     try:
         data = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except Exception:
+        logger.debug("Failed to read log tail from %s", path, exc_info=True)
         return []
     return [strip_ansi(line) for line in data[-lines:]]
 
@@ -260,6 +286,7 @@ def load_signal_members_state(path: Path, limit: int = 16) -> List[str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+        logger.debug("Failed to load signaling member state from %s", path, exc_info=True)
         return []
     members: List[str] = []
     for peer in payload.get("peers", []):
@@ -351,7 +378,7 @@ def webrtc_signaling_state(lines: Sequence[str]) -> Optional[bool]:
 
 
 def local_listeners(ports: Sequence[int]) -> Dict[int, str]:
-    output = run_command(["ss", "-ltnp"], timeout=1.0)
+    output = run_command(["ss", "-ltunp"], timeout=1.0)
     result: Dict[int, str] = {}
     for line in output.splitlines():
         for port in ports:
@@ -451,17 +478,18 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
     topology = env.get("HORUS_TOPOLOGY", "hub")
     zenoh_port = int(env.get("ZENOH_PORT", "7447") or 7447)
     signal_port = int(env.get("WEBRTC_SIGNAL_PORT", "8765") or 8765)
+    turn_port = int(env.get("TURN_PORT", "3478") or 3478)
 
     processes = {
         name: process_state(run_dir, name)
-        for name in ("zenoh", "webrtc", "signal")
+        for name in ("zenoh", "webrtc", "signal", "turn")
     }
     logs = {
         "zenoh": tail(run_dir / "zenoh.log", lines=2000),
         "webrtc": tail(run_dir / "webrtc.log", lines=1000),
         "signal": tail(run_dir / "signal.log", lines=1000),
     }
-    listeners = local_listeners([zenoh_port, signal_port])
+    listeners = local_listeners([zenoh_port, signal_port, turn_port])
     topics = ros_topics(env, root, cache, force_refresh)
 
     bridge_members = active_bridge_members(logs["zenoh"])
@@ -486,7 +514,7 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
         "env": env,
         "role": role,
         "topology": topology,
-        "ports": {"zenoh": zenoh_port, "signal": signal_port},
+        "ports": {"zenoh": zenoh_port, "signal": signal_port, "turn": turn_port},
         "processes": processes,
         "logs": logs,
         "listeners": listeners,
@@ -516,6 +544,26 @@ def connection_target(env: Dict[str, str]) -> str:
     return ""
 
 
+def zenoh_transport_name(env: Dict[str, str]) -> str:
+    mode = env.get("ZENOH_TRANSPORT", "auto").strip().lower()
+    if mode not in {"auto", "tcp", "quic"}:
+        mode = "auto"
+    if mode == "auto":
+        quic_enabled = env.get("ZENOH_AUTO_ENABLE_QUIC", "0").strip().lower() in {"1", "true", "yes", "on"}
+        has_root = path_exists(env.get("ZENOH_TLS_ROOT_CA", ""))
+        has_listener = path_exists(env.get("ZENOH_TLS_LISTEN_KEY", "")) and path_exists(env.get("ZENOH_TLS_LISTEN_CERT", ""))
+        if quic_enabled and (has_root or has_listener):
+            return "quic+tcp"
+        return "tcp"
+    return mode
+
+
+def path_exists(value: str) -> bool:
+    if not value:
+        return False
+    return Path(os.path.expanduser(value)).exists()
+
+
 def build_services(state: Dict[str, object]) -> List[ServiceState]:
     env = state["env"]
     role = str(state["role"])
@@ -542,9 +590,11 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
         peers = ", ".join(named_zenoh_members(state)) or f"{len(bridge_members)} ROS bridge peer(s)"
         services.append(ServiceState("Zenoh", "OK", f"connected: {peers}", "ok"))
     elif topology == "direct" and role == "machine" and ports["zenoh"] in listeners:
-        services.append(ServiceState("Zenoh", "LISTEN", f"waiting on tcp/0.0.0.0:{ports['zenoh']}", "info"))
+        services.append(
+            ServiceState("Zenoh", "LISTEN", f"waiting on {zenoh_transport_name(env)}/0.0.0.0:{ports['zenoh']}", "info")
+        )
     elif state["target"] and target_ports.get(ports["zenoh"]) is True:
-        services.append(ServiceState("Zenoh", "OPEN", f"target tcp/{state['target']}:{ports['zenoh']} reachable", "info"))
+        services.append(ServiceState("Zenoh", "OPEN", f"TCP fallback reachable at {state['target']}:{ports['zenoh']}", "info"))
     else:
         services.append(ServiceState("Zenoh", "RUN", f"pid {zenoh.pid}, uptime {zenoh.etime}", "info"))
 
@@ -582,6 +632,19 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
         services.append(ServiceState("WebRTC", "OPEN", f"target ws://{state['target']}:{ports['signal']} reachable", "info"))
     else:
         services.append(ServiceState("WebRTC", "RUN", f"pid {webrtc.pid}, uptime {webrtc.etime}", "info"))
+
+    if role == "cloud":
+        turn = processes["turn"]
+        turn_enabled = env.get("HORUS_CLOUD_RUN_TURN", "0") == "1"
+        turn_range = f"{env.get('TURN_MIN_PORT', '49152')}-{env.get('TURN_MAX_PORT', '65535')}"
+        if not turn_enabled:
+            services.append(ServiceState("TURN", "OFF", "media relay fallback is disabled", "idle"))
+        elif turn.running and ports["turn"] in listeners:
+            services.append(ServiceState("TURN", "OK", f"relay listening on udp/tcp {ports['turn']}, ports {turn_range}", "ok"))
+        elif turn.running:
+            services.append(ServiceState("TURN", "WARN", f"turnserver running, but port {ports['turn']} was not detected", "warn"))
+        else:
+            services.append(ServiceState("TURN", "DOWN", "media relay fallback is enabled but not running", "down"))
 
     if role == "cloud":
         services.append(ServiceState("ROS 2", "N/A", "cloud relay does not need local ROS 2 nodes", "idle"))
@@ -813,11 +876,18 @@ def route_detail(state: Dict[str, object], env: Dict[str, str]) -> str:
         zenoh = "stopped" if not processes["zenoh"].running else "open" if target_ports.get(ports["zenoh"]) is True else "closed"
         signal = target_ports.get(ports["signal"]) if processes["webrtc"].running else None
         webrtc = "connected" if signal is True else "reconnecting" if signal is False else "stopped"
-    return (
-        f"zenoh tcp/{ports['zenoh']} {zenoh}   "
+    detail = (
+        f"zenoh {zenoh_transport_name(env)}/{ports['zenoh']} {zenoh}   "
         f"webrtc ws/{ports['signal']} {webrtc}   "
         f"domain {env.get('ROS_DOMAIN_ID', '0')}   namespace {env.get('ZENOH_NAMESPACE', '/') or '/'}"
     )
+    if role == "cloud":
+        if env.get("HORUS_CLOUD_RUN_TURN", "0") == "1":
+            turn = "listening" if processes["turn"].running and ports.get("turn") in listeners else "stopped"
+            detail += f"   turn udp/tcp/{ports.get('turn', 3478)} {turn}"
+        else:
+            detail += "   turn off"
+    return detail
 
 
 def service_line(
@@ -1168,6 +1238,7 @@ def is_wsl() -> bool:
     try:
         release = Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8", errors="ignore").lower()
     except Exception:
+        logger.debug("Failed to detect WSL environment", exc_info=True)
         return False
     return "microsoft" in release or "wsl" in release
 

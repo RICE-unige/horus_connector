@@ -1,30 +1,21 @@
 {
   plugins: {
     ros2dds: {
-      // Robot profile: export local robot state to Zenoh only.
+      // Robot profile: export local robot ROS topics to Zenoh and import
+      // command topics from the operator machine.
       ros_localhost_only: true,
       ros_automatic_discovery_range: "LOCALHOST",
 
       allow: {
-        publishers: [
-          "^/tf$",
-          "^/.*/tf$",
-          "^/tf_static$",
-          "^/.*/tf_static$",
-          "^/odom$",
-          "^/.*/odom$",
-          "^/joint_states$",
-          "^/.*/joint_states$",
-          "^/scan$",
-          "^/.*/scan$",
-          "^/points$",
-          "^/.*/points$",
+        publishers: ["^/.*$"],
+        subscribers: [
+          "^/cmd_vel$",
+          "^/.*/cmd_vel$",
         ],
-        subscribers: [],
-        service_servers: [],
-        service_clients: [],
-        action_servers: [],
-        action_clients: [],
+        service_servers: ["^/.*$"],
+        service_clients: ["^/.*$"],
+        action_servers: ["^/.*$"],
+        action_clients: ["^/.*$"],
       },
 
       pub_max_frequencies: [
@@ -37,6 +28,7 @@
       ],
 
       pub_priorities: [
+        ".*/cmd_vel$=1:express",
         ".*/tf$=2:express",
         ".*/tf_static$=2:express",
         ".*/odom$=3:express",

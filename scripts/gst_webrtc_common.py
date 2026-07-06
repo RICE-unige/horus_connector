@@ -2,6 +2,8 @@
 """Shared helpers for GStreamer WebRTC media scripts."""
 
 import json
+import logging
+import os
 import queue
 import threading
 import time
@@ -13,19 +15,21 @@ import gi
 try:
     from websockets.sync.client import connect
     from websockets.sync.server import serve
-except Exception:
+except ImportError:
     connect = None
     serve = None
 
 try:
     import websocket
-except Exception:
+except ImportError:
     websocket = None
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 from gi.repository import Gst, GstSdp, GstWebRTC  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def load_env_file(path: Optional[str]) -> Dict[str, str]:
@@ -69,8 +73,16 @@ def turn_property(servers: str) -> str:
     return "turn://" + server[len("turn:") :]
 
 
-def webrtcbin_properties(ice_servers: str) -> str:
+def normalize_ice_transport_policy(value: str) -> str:
+    policy = (value or "all").strip().lower()
+    return policy if policy in {"all", "relay"} else "all"
+
+
+def webrtcbin_properties(ice_servers: str, ice_transport_policy: str = "all") -> str:
     props = ["bundle-policy=max-bundle"]
+    policy = normalize_ice_transport_policy(ice_transport_policy)
+    if policy != "all":
+        props.append(f"ice-transport-policy={policy}")
     stun = stun_property(ice_servers)
     turn = turn_property(ice_servers)
     if stun:
@@ -80,15 +92,33 @@ def webrtcbin_properties(ice_servers: str) -> str:
     return " ".join(props)
 
 
-def configure_webrtcbin(element, ice_servers: str):
+def configure_webrtcbin(element, ice_servers: str, ice_transport_policy: str = "all"):
     if element.find_property("bundle-policy"):
         element.set_property("bundle-policy", "max-bundle")
+    policy = normalize_ice_transport_policy(ice_transport_policy)
+    if element.find_property("ice-transport-policy"):
+        element.set_property("ice-transport-policy", policy)
     stun = stun_property(ice_servers)
     turn = turn_property(ice_servers)
+    turn_added = None
     if stun and element.find_property("stun-server"):
         element.set_property("stun-server", stun)
     if turn and element.find_property("turn-server"):
-        element.set_property("turn-server", turn)
+        turn_added = False
+        try:
+            turn_added = bool(element.emit("add-turn-server", turn))
+        except Exception:
+            logger.debug("Failed to add TURN server through webrtcbin signal; falling back to property", exc_info=True)
+            turn_added = False
+        if not turn_added:
+            element.set_property("turn-server", turn)
+    if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
+        print(
+            "WebRTC ICE config: "
+            f"policy={policy} stun={'on' if stun else 'off'} "
+            f"turn={'on' if turn else 'off'} turn_registered={turn_added}",
+            flush=True,
+        )
 
 
 def ensure_webrtc_runtime():
@@ -119,6 +149,13 @@ def make_session_description(kind: str, sdp_text: str):
     return GstWebRTC.WebRTCSessionDescription.new(sdp_type, sdp)
 
 
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
 class JsonSignaling:
     def __init__(self, on_message, on_connected=None):
         self.on_message = on_message
@@ -127,7 +164,7 @@ class JsonSignaling:
         self.connected = threading.Event()
         self.closed = threading.Event()
         self.send_lock = threading.Lock()
-        self.pending: queue.Queue[str] = queue.Queue()
+        self.pending: queue.Queue[str] = queue.Queue(maxsize=env_int("HORUS_WEBRTC_SIGNAL_PENDING_MAX", 256))
 
     @staticmethod
     def _log_control_message(message):
@@ -151,10 +188,22 @@ class JsonSignaling:
     def send(self, payload: dict):
         text = json.dumps(payload, separators=(",", ":"))
         if not self.connected.wait(timeout=30):
-            self.pending.put(text)
+            self._queue_pending(text)
             return
         with self.send_lock:
             self.ws.send(text)
+
+    def _queue_pending(self, text: str):
+        if self.pending.full():
+            try:
+                self.pending.get_nowait()
+            except queue.Empty:
+                pass
+            print("dropping oldest pending WebRTC signaling message", flush=True)
+        try:
+            self.pending.put_nowait(text)
+        except queue.Full:
+            print("dropping WebRTC signaling message because pending queue is full", flush=True)
 
     def _flush_pending(self):
         while not self.pending.empty():
@@ -186,6 +235,13 @@ class ClientSignaling(JsonSignaling):
         self.role = role
         self.room = room
 
+    def _registration_text(self) -> str:
+        payload = {"type": "register", "role": self.role, "room": self.room}
+        token = os.environ.get("HORUS_WEBRTC_RELAY_TOKEN", "").strip()
+        if token:
+            payload["token"] = token
+        return json.dumps(payload, separators=(",", ":"))
+
     def start(self):
         if connect is None and websocket is None:
             raise RuntimeError("Install websockets>=12 or websocket-client for WebRTC signaling.")
@@ -195,7 +251,7 @@ class ClientSignaling(JsonSignaling):
                 try:
                     if connect is not None:
                         self.ws = connect(self.url, open_timeout=10)
-                        self.ws.send(json.dumps({"type": "register", "role": self.role, "room": self.room}))
+                        self.ws.send(self._registration_text())
                         print(
                             f"WebRTC signaling connected: role={self.role} room={self.room} url={self.url}",
                             flush=True,
@@ -204,7 +260,7 @@ class ClientSignaling(JsonSignaling):
                     else:
                         self.ws = websocket.create_connection(self.url, timeout=10)
                         self.ws.settimeout(None)
-                        self.ws.send(json.dumps({"type": "register", "role": self.role, "room": self.room}))
+                        self.ws.send(self._registration_text())
                         print(
                             f"WebRTC signaling connected: role={self.role} room={self.room} url={self.url}",
                             flush=True,

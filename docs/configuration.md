@@ -33,7 +33,14 @@ Use `./horus setup` for normal configuration. Edit `.env` directly only when you
 | `ZENOH_PORT` | Zenoh TCP port. Default: `7447`. |
 | `ZENOH_VERSION` | Bridge version installed by bootstrap. |
 | `ZENOH_CONFIG` | `auto` selects the role config, or set a custom JSON5 path. |
-| `ZENOH_NAMESPACE` | Optional namespace for robot topics, for example `/robot-a`. |
+| `ZENOH_TRANSPORT` | `auto`, `tcp`, or `quic`. Default: `auto`. |
+| `ZENOH_AUTO_ENABLE_QUIC` | Set `1` to let `auto` try QUIC first when TLS is configured, with TCP fallback. |
+| `ZENOH_QUIC_PARAMS` | QUIC endpoint options. Default: `multistream=1;mixed_rel=auto`. |
+| `ZENOH_TLS_ROOT_CA` | Hub/listener public cert trusted by robot and machine clients. Usually written by `./horus quic install-cert`. |
+| `ZENOH_TLS_LISTEN_KEY` | Listener private key for cloud or direct machine. Usually written by `./horus quic setup-server`. |
+| `ZENOH_TLS_LISTEN_CERT` | Listener certificate for cloud or direct machine. Usually written by `./horus quic setup-server`. |
+| `ZENOH_TLS_VERIFY_NAME` | `0` by default to avoid IP/DNS certificate mismatch during lab testing. |
+| `ZENOH_NAMESPACE` | Optional namespace for robot topics, for example `/robot_a`. |
 | `HORUS_ZENOH_ENABLED` | Set `0` to disable Zenoh for a run. |
 
 Role configs:
@@ -44,18 +51,29 @@ Role configs:
 | `machine` | `config/zenoh_machine.json5` |
 | `cloud` | `config/zenoh_cloud.json5` |
 
-The default robot profile exports only state topics:
+The default robot profile exports robot ROS topics through Zenoh and imports command topics from the operator machine. The machine profile imports robot topics and exports only command topics:
 
 ```text
-/tf
-/tf_static
-/odom
-/joint_states
-/scan
-/points
+/cmd_vel
+/<robot>/cmd_vel
 ```
 
-Camera and `/cmd_vel` are intentionally excluded from Zenoh. Camera uses WebRTC media; `/cmd_vel` uses the WebRTC DataChannel.
+The operator camera path uses WebRTC media. ROS image topics can still cross Zenoh when the robot profile is left open for experiments, but that is not required for the low-latency camera view. For bandwidth-limited runs, use a custom `ZENOH_CONFIG` to filter high-rate image topics.
+
+`ZENOH_TRANSPORT=auto` uses QUIC first only when the local TLS profile is ready; TCP remains available as fallback. Use `ZENOH_TRANSPORT=tcp` to force the conservative path. Use `ZENOH_TRANSPORT=quic` only when you want the launch to fail if QUIC TLS is missing.
+
+QUIC setup:
+
+```bash
+# Cloud hub or direct-mode machine listener
+./horus quic setup-server
+./horus quic export-cert
+
+# Robot and hub-mode machine clients
+./horus quic install-cert <hub-cert.pem>
+```
+
+The generated profile is local and ignored by git.
 
 To add a state topic, update both the robot `allow.publishers` list and the machine `allow.subscribers` list. Add throttling and priority on the robot side when needed:
 
@@ -79,6 +97,8 @@ Zenoh priority `1` is highest, `7` is lowest. `:express` reduces latency for sma
 | `WEBRTC_SIGNAL_PORT` | WebRTC signaling port. Default: `8765`. |
 | `WEBRTC_DURATION` | Runtime duration in seconds. Use `86400` for long runs. |
 | `WEBRTC_ICE_SERVERS` | Comma-separated STUN/TURN servers. |
+| `WEBRTC_ICE_TRANSPORT_POLICY` | `all` for normal direct-first behavior, or `relay` to force TURN validation. |
+| `HORUS_WEBRTC_DEBUG_ICE` | Set `1` to log sanitized ICE candidate exchange while debugging connectivity. |
 | `WEBRTC_VIDEO_WIDTH` | Camera output width. |
 | `WEBRTC_VIDEO_HEIGHT` | Camera output height. |
 | `WEBRTC_VIDEO_FPS` | Camera FPS. |
@@ -92,6 +112,14 @@ Zenoh priority `1` is highest, `7` is lowest. `:express` reduces latency for sma
 | `WEBRTC_ROS_IMAGE_QOS` | `auto` is recommended. |
 | `VIDEO_BITRATE_KBIT` | Starting H.264 bitrate. |
 | `WEBRTC_ADAPTIVE_BITRATE` | Enable adaptive bitrate control. Default: `1`. |
+| `WEBRTC_CONTROL_ENABLED` | Legacy/debug option for WebRTC DataChannel publishing to `ROS_CMD_TOPIC`. Keep `0` for normal runs. Default: `0`. |
+| `WEBRTC_ENABLE_CONTROL` | Legacy alias for `WEBRTC_CONTROL_ENABLED`. |
+| `HORUS_WEBRTC_CONTROL_TOKEN` | Shared token required on robot and authorized operator paths when WebRTC control is enabled. |
+| `WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL` | Allow WebRTC control commands without a token for trusted lab tests only. Default: `0`. |
+| `WEBRTC_CMD_MAX_LINEAR_MPS` | Clamp each linear Twist component. Default: `0.5`. |
+| `WEBRTC_CMD_MAX_ANGULAR_RPS` | Clamp each angular Twist component. Default: `1.0`. |
+| `HORUS_WEBRTC_RELAY_TOKEN` | Shared token required by public hub signaling relays. |
+| `HORUS_WEBRTC_RELAY_ALLOW_UNAUTHENTICATED` | Allow a public signaling relay without a token for trusted test networks. Default: `0`. |
 | `WEBRTC_MIN_BITRATE_KBIT` | Minimum adaptive bitrate. |
 | `WEBRTC_MAX_BITRATE_KBIT` | Maximum adaptive bitrate. |
 | `WEBRTC_H264_KEY_INT_MAX` | H.264 keyframe interval. |
@@ -125,11 +153,12 @@ TURN is optional. Use it when WebRTC cannot establish media through NAT/firewall
 |---|---|
 | `HORUS_CLOUD_RUN_TURN` | Set `1` on cloud to install/configure TURN. |
 | `TURN_PORT` | TURN listening port. Default: `3478`. |
-| `TURN_MIN_PORT` | Minimum relay UDP port. |
-| `TURN_MAX_PORT` | Maximum relay UDP port. |
+| `TURN_MIN_PORT` | Minimum relay UDP port. Default: `49152`. |
+| `TURN_MAX_PORT` | Maximum relay UDP port. Default: `65535`. |
 | `TURN_REALM` | TURN realm. |
 | `TURN_USER` | TURN username. |
 | `TURN_PASSWORD` | TURN password. |
+| `TURN_PRIVATE_IP` | Optional VM/private IP for cloud NAT mapping. Auto-detected during bootstrap when empty. |
 
 Example:
 
@@ -140,6 +169,16 @@ TURN_PASSWORD=<password>
 WEBRTC_ICE_SERVERS=stun:stun.l.google.com:19302,turn://horus:<password>@cloud.example.com:3478
 ./horus bootstrap cloud
 ```
+
+Cloud firewall requirements:
+
+```text
+tcp/3478
+udp/3478
+udp/49152-65535
+```
+
+Robot and machine roles do not run TURN. They only need the same `WEBRTC_ICE_SERVERS` value that points to the cloud relay.
 
 ## Synthetic Data
 
@@ -185,6 +224,6 @@ Each robot still runs a normal robot launch with its own room:
 
 ```bash
 HORUS_ROOM=robot-a
-ZENOH_NAMESPACE=/robot-a
+ZENOH_NAMESPACE=/robot_a
 ./horus launch robot
 ```

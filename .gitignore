@@ -5,6 +5,7 @@
 .venv-webrtc/
 .webrtc_profile.env
 .zenoh_profile.env
+.zenoh_tls_profile.env
 __pycache__/
 *.pyc
 *.log

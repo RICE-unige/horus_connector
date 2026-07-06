@@ -5,16 +5,28 @@ import argparse
 import asyncio
 import io
 import json
+import logging
+import math
+import os
 import statistics
 import time
 from pathlib import Path
 
 import numpy as np
 import websockets
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from PIL import Image
+try:
+    from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+    AIORTC_IMPORT_ERROR = None
+except ImportError as exc:
+    RTCConfiguration = RTCIceServer = RTCPeerConnection = RTCSessionDescription = None
+    AIORTC_IMPORT_ERROR = exc
 
+from experiment_metrics import CsvMetricWriter, default_metrics_path
+from webrtc_control import command_authorized
 from webrtc_common import camera_specs, candidate_summary, pack_frame, wait_for_ice_gathering_complete
+
+logger = logging.getLogger(__name__)
 
 
 def percentile(values, pct):
@@ -89,9 +101,44 @@ def write_summary(path, payload):
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def write_standard_metrics(path, payload):
+    target = Path(path) if path else default_metrics_path("webrtc_metrics.csv")
+    if target is None:
+        return
+
+    fields = (
+        "role",
+        "stream",
+        "camera",
+        "generated",
+        "sent",
+        "dropped",
+        "mbps_sent",
+        "encode_ms_median",
+        "encode_ms_p95",
+    )
+    with CsvMetricWriter(target, fieldnames=fields) as writer:
+        for camera, stats in sorted(payload.get("cameras", {}).items()):
+            writer.write(
+                {
+                    "role": "sender",
+                    "stream": "webrtc_camera",
+                    "camera": camera,
+                    "generated": stats.get("generated"),
+                    "sent": stats.get("sent"),
+                    "dropped": stats.get("dropped"),
+                    "mbps_sent": stats.get("mbps_sent"),
+                    "encode_ms_median": stats.get("encode_ms_median"),
+                    "encode_ms_p95": stats.get("encode_ms_p95"),
+                }
+            )
+
+
 class RosCmdPublisher:
-    def __init__(self, topic):
+    def __init__(self, topic, max_linear_mps=0.5, max_angular_rps=1.0):
         self.topic = topic
+        self.max_linear_mps = max(0.0, float(max_linear_mps))
+        self.max_angular_rps = max(0.0, float(max_angular_rps))
         self.node = None
         self.publisher = None
         self.rclpy = None
@@ -114,16 +161,29 @@ class RosCmdPublisher:
             print(f"ROS cmd_vel publishing disabled: {exc}", flush=True)
             self.close()
 
+    @staticmethod
+    def _bounded_float(command, key, limit):
+        value = float(command.get(key, 0.0))
+        if not math.isfinite(value):
+            raise ValueError(f"{key} must be finite")
+        if limit > 0.0:
+            value = max(-limit, min(limit, value))
+        return value
+
     def publish(self, command):
         if self.publisher is None:
             return False
         msg = self.twist_type()
-        msg.linear.x = float(command.get("linear_x", 0.0))
-        msg.linear.y = float(command.get("linear_y", 0.0))
-        msg.linear.z = float(command.get("linear_z", 0.0))
-        msg.angular.x = float(command.get("angular_x", 0.0))
-        msg.angular.y = float(command.get("angular_y", 0.0))
-        msg.angular.z = float(command.get("angular_z", 0.0))
+        try:
+            msg.linear.x = self._bounded_float(command, "linear_x", self.max_linear_mps)
+            msg.linear.y = self._bounded_float(command, "linear_y", self.max_linear_mps)
+            msg.linear.z = self._bounded_float(command, "linear_z", self.max_linear_mps)
+            msg.angular.x = self._bounded_float(command, "angular_x", self.max_angular_rps)
+            msg.angular.y = self._bounded_float(command, "angular_y", self.max_angular_rps)
+            msg.angular.z = self._bounded_float(command, "angular_z", self.max_angular_rps)
+        except (TypeError, ValueError) as exc:
+            print(f"dropping invalid cmd_vel command: {exc}", flush=True)
+            return False
         self.publisher.publish(msg)
         return True
 
@@ -135,14 +195,34 @@ class RosCmdPublisher:
             try:
                 self.rclpy.shutdown()
             except Exception:
-                pass
+                logger.debug("Failed to shut down ROS 2 control publisher context", exc_info=True)
             self.rclpy = None
 
 
-def attach_control_channel(channel, ros_publisher):
+def publish_zero_command(ros_publisher, reason: str):
+    if ros_publisher.publish(
+        {
+            "linear_x": 0.0,
+            "linear_y": 0.0,
+            "linear_z": 0.0,
+            "angular_x": 0.0,
+            "angular_y": 0.0,
+            "angular_z": 0.0,
+        }
+    ):
+        print(f"{reason}: zero /cmd_vel published", flush=True)
+
+
+def attach_control_channel(channel, ros_publisher, control_token="", allow_unauthenticated_control=False):
     @channel.on("open")
     def on_open():
-        print("Control DataChannel open; waiting for cmd_vel messages", flush=True)
+        print("Control DataChannel open; publishing zero before cmd_vel messages", flush=True)
+        publish_zero_command(ros_publisher, "cmd_vel channel open")
+
+    @channel.on("close")
+    def on_close():
+        print("Control DataChannel closed", flush=True)
+        publish_zero_command(ros_publisher, "cmd_vel channel close")
 
     @channel.on("message")
     def on_message(message):
@@ -153,6 +233,13 @@ def attach_control_channel(channel, ros_publisher):
             print(f"Ignoring invalid control message: {exc}", flush=True)
             return
         if command.get("type") != "cmd_vel":
+            return
+        if not command_authorized(
+            command,
+            expected_token=control_token,
+            allow_unauthenticated=bool(allow_unauthenticated_control),
+        ):
+            print("dropping unauthorized cmd_vel command", flush=True)
             return
         published = ros_publisher.publish(command)
         ack = {
@@ -207,12 +294,30 @@ async def run_camera(channel, spec, duration, args, stats):
 
 
 async def run(args):
+    if AIORTC_IMPORT_ERROR is not None:
+        raise RuntimeError(f"aiortc is required for legacy JPEG WebRTC sender: {AIORTC_IMPORT_ERROR}")
+    if args.enable_control and not args.control_token and not args.allow_unauthenticated_control:
+        raise SystemExit(
+            "Control publishing requires --control-token or HORUS_WEBRTC_CONTROL_TOKEN. "
+            "Use --allow-unauthenticated-control 1 only for trusted lab tests."
+        )
+
     ice_servers = [RTCIceServer(urls=url) for url in args.ice_server]
     pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
     channel = pc.createDataChannel("camera-jpeg", ordered=False, maxRetransmits=0)
-    control_channel = pc.createDataChannel("cmd-vel", ordered=False, maxRetransmits=0)
-    ros_publisher = RosCmdPublisher(args.ros_cmd_topic)
-    attach_control_channel(control_channel, ros_publisher)
+    ros_publisher = RosCmdPublisher(
+        args.ros_cmd_topic if args.enable_control else "",
+        args.cmd_max_linear_mps,
+        args.cmd_max_angular_rps,
+    )
+    if args.enable_control and args.ros_cmd_topic:
+        control_channel = pc.createDataChannel("cmd-vel", ordered=False, maxRetransmits=0)
+        attach_control_channel(
+            control_channel,
+            ros_publisher,
+            control_token=args.control_token,
+            allow_unauthenticated_control=args.allow_unauthenticated_control,
+        )
     opened = asyncio.Event()
     closed = asyncio.Event()
 
@@ -252,6 +357,7 @@ async def run(args):
         summary = stats.summary()
         print(json.dumps(summary, indent=2, sort_keys=True), flush=True)
         write_summary(args.json, summary)
+        write_standard_metrics(args.metrics_csv, summary)
         channel.close()
         await asyncio.sleep(0.5)
     ros_publisher.close()
@@ -269,8 +375,19 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--ice-timeout", type=float, default=30.0)
     parser.add_argument("--ice-server", action="append", default=["stun:stun.l.google.com:19302"])
+    parser.add_argument("--enable-control", type=int, choices=[0, 1], default=0)
     parser.add_argument("--ros-cmd-topic", default="", help="If set, publish incoming WebRTC cmd_vel commands to this ROS Twist topic.")
+    parser.add_argument("--control-token", default=os.environ.get("HORUS_WEBRTC_CONTROL_TOKEN", ""))
+    parser.add_argument(
+        "--allow-unauthenticated-control",
+        type=int,
+        choices=[0, 1],
+        default=int(os.environ.get("WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL", "0")),
+    )
+    parser.add_argument("--cmd-max-linear-mps", type=float, default=0.5)
+    parser.add_argument("--cmd-max-angular-rps", type=float, default=1.0)
     parser.add_argument("--json", default=None)
+    parser.add_argument("--metrics-csv", default=None)
     return parser.parse_args()
 
 

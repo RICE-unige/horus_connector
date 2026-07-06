@@ -56,48 +56,69 @@ def rounded(value: float | None, digits: int = 1) -> float | None:
     return None if value is None else round(float(value), digits)
 
 
-def load_latency_samples(path: Path) -> list[float]:
+def load_samples_payload(path: Path) -> dict:
     payload = read_json(path)
     if not payload:
-        return []
-    return [float(sample["latency_ms"]) for sample in payload.get("samples", []) if sample.get("latency_ms") is not None]
+        return {"samples": []}
+    return payload
 
 
-def normalized_stats(latencies: list[float]) -> dict:
-    baseline = percentile(latencies, 0.01)
-    if baseline is None:
-        return {
-            "clock_baseline_ms": None,
-            "fresh_samples": 0,
-            "fresh_sample_ratio": 0.0,
-            "latency_ms_p50": None,
-            "latency_ms_p95": None,
-            "latency_ms_p99": None,
-        }
-    normalized = [value - baseline for value in latencies]
-    fresh = sum(1 for value in normalized if value <= DEADLINE_MS)
+def corrected_stats(samples: list[dict]) -> dict:
+    latencies = [float(sample["latency_ms"]) for sample in samples if sample.get("latency_ms") is not None]
+    fresh = 0
+    for sample in samples:
+        if sample.get("fresh") is True:
+            fresh += 1
+            continue
+        latency = sample.get("latency_ms")
+        if latency is not None and float(latency) <= DEADLINE_MS:
+            fresh += 1
     return {
-        "clock_baseline_ms": rounded(baseline),
         "fresh_samples": fresh,
-        "fresh_sample_ratio": fresh / len(normalized) if normalized else 0.0,
-        "latency_ms_p50": rounded(percentile(normalized, 0.50)),
-        "latency_ms_p95": rounded(percentile(normalized, 0.95)),
-        "latency_ms_p99": rounded(percentile(normalized, 0.99)),
+        "fresh_sample_ratio": fresh / len(latencies) if latencies else 0.0,
+        "latency_ms_p50": rounded(percentile(latencies, 0.50)),
+        "latency_ms_p95": rounded(percentile(latencies, 0.95)),
+        "latency_ms_p99": rounded(percentile(latencies, 0.99)),
     }
+
+
+def has_measured_clock_offset(*sources: object) -> bool:
+    for source in sources:
+        value = str(source or "").strip().lower()
+        if value and value not in {"none", "unknown", "unmeasured"}:
+            return True
+    return False
 
 
 def ros_result(resolution: str, path: str, transport: str) -> dict | None:
     name = f"modeb_{resolution}_{path}_{transport}"
     pub = read_json(RUN_DIR / f"{name}_pub.json")
     sub = read_json(RUN_DIR / f"{name}_sub.json")
-    samples = load_latency_samples(RUN_DIR / f"{name}_sub.samples.json")
+    samples_payload = load_samples_payload(RUN_DIR / f"{name}_sub.samples.json")
+    samples = samples_payload.get("samples", [])
     if not pub or not sub:
         return None
-    stats = normalized_stats(samples)
-    published = int(pub.get("messages") or round(DURATION_SEC * TARGET_FPS))
+    if not sub.get("latency_method"):
+        return {
+            "resolution": resolution,
+            "path": path,
+            "transport": transport,
+            "status": "legacy_method",
+            "reason": "Run artifact predates fresh-frame SLA and measured clock-offset metadata; rerun before publication.",
+        }
+    if not has_measured_clock_offset(sub.get("clock_offset_source"), samples_payload.get("clock_offset_source")):
+        return {
+            "resolution": resolution,
+            "path": path,
+            "transport": transport,
+            "status": "unmeasured_clock_offset",
+            "reason": "Cross-host benchmark artifact has no measured clock-offset source.",
+        }
+    stats = corrected_stats(samples)
+    published = int(sub.get("estimated_published_frames") or pub.get("messages") or round(DURATION_SEC * TARGET_FPS))
     received = int(sub.get("messages") or 0)
-    fresh = min(stats["fresh_samples"], received)
-    fresh_sla = fresh / published if published else 0.0
+    fresh = int(sub.get("fresh_messages") if sub.get("fresh_messages") is not None else min(stats["fresh_samples"], received))
+    fresh_sla = float(sub.get("fresh_frame_sla") if sub.get("fresh_frame_sla") is not None else (fresh / published if published else 0.0))
     observed = float(sub.get("observed_sec") or DURATION_SEC)
     return {
         "resolution": resolution,
@@ -109,10 +130,15 @@ def ros_result(resolution: str, path: str, transport: str) -> dict | None:
         "delivery_ratio": rounded(received / published if published else 0.0, 3),
         "fresh_frames": fresh,
         "fresh_frame_sla_percent": rounded(fresh_sla * 100.0),
-        "usable_fps": rounded(fresh / observed if observed else 0.0),
+        "usable_fps": rounded(float(sub.get("usable_fps") if sub.get("usable_fps") is not None else (fresh / observed if observed else 0.0))),
         "decoded_or_received_fps": rounded(float(sub.get("fps") or 0.0)),
         "received_mbps": rounded(float(sub.get("mbps") or 0.0)),
         "payload_bytes": int(pub.get("payload_bytes") or 0),
+        "stale_frames": int(sub.get("stale_messages") or 0),
+        "dropped_or_skipped_frames": int(sub.get("dropped_or_skipped_frames") or max(0, published - received)),
+        "clock_offset_ms": rounded(float(sub.get("clock_offset_ms") or samples_payload.get("clock_offset_ms") or 0.0)),
+        "clock_offset_source": sub.get("clock_offset_source") or samples_payload.get("clock_offset_source") or "unknown",
+        "freshest_frame_policy": sub.get("freshest_frame_policy") or samples_payload.get("freshest_frame_policy") or "best_effort_keep_last",
         **stats,
     }
 
@@ -122,12 +148,29 @@ def webrtc_result(resolution: str, path: str) -> dict | None:
     payload = read_json(RUN_DIR / f"{name}_latency.json")
     if not payload:
         return None
+    if not payload.get("latency_method"):
+        return {
+            "resolution": resolution,
+            "path": path,
+            "transport": "webrtc",
+            "status": "legacy_method",
+            "reason": "Run artifact predates fresh-frame SLA and measured clock-offset metadata; rerun before publication.",
+        }
+    if not has_measured_clock_offset(payload.get("clock_offset_source")):
+        return {
+            "resolution": resolution,
+            "path": path,
+            "transport": "webrtc",
+            "status": "unmeasured_clock_offset",
+            "reason": "Cross-host benchmark artifact has no measured clock-offset source.",
+        }
     samples = [float(sample["latency_ms"]) for sample in payload.get("samples", [])]
-    stats = normalized_stats(samples)
+    stats = corrected_stats(payload.get("samples", []))
     expected = int(round(DURATION_SEC * TARGET_FPS))
     received = int(payload.get("video_frames") or 0)
     delivery_ratio = min(received / expected, 1.0) if expected else 0.0
-    fresh_sla = delivery_ratio * stats["fresh_sample_ratio"]
+    fresh_samples = int(payload.get("fresh_latency_samples") if payload.get("fresh_latency_samples") is not None else stats["fresh_samples"])
+    fresh_sla = min(fresh_samples / expected, 1.0) if expected else 0.0
     return {
         "resolution": resolution,
         "path": path,
@@ -136,12 +179,17 @@ def webrtc_result(resolution: str, path: str) -> dict | None:
         "published_frames": expected,
         "received_frames": received,
         "delivery_ratio": rounded(delivery_ratio, 3),
-        "fresh_frames": int(round(expected * fresh_sla)),
+        "fresh_frames": fresh_samples,
         "fresh_frame_sla_percent": rounded(fresh_sla * 100.0),
-        "usable_fps": rounded(TARGET_FPS * fresh_sla),
+        "usable_fps": rounded(float(payload.get("fresh_fps_estimate") if payload.get("fresh_fps_estimate") is not None else TARGET_FPS * fresh_sla)),
         "decoded_or_received_fps": rounded(float(payload.get("video_decoded_fps") or 0.0)),
         "received_mbps": None,
         "payload_bytes": None,
+        "stale_frames": int(payload.get("stale_latency_samples") or max(0, len(samples) - fresh_samples)),
+        "dropped_or_skipped_frames": int(payload.get("frame_clock_dropped") or max(0, expected - received)),
+        "clock_offset_ms": rounded(float(payload.get("clock_offset_ms") or 0.0)),
+        "clock_offset_source": payload.get("clock_offset_source") or "unknown",
+        "freshest_frame_policy": payload.get("freshest_frame_policy") or "webrtc_jitter_buffer_keep_last",
         **stats,
     }
 
@@ -181,12 +229,19 @@ def build_results() -> dict:
             "duration_sec": DURATION_SEC,
             "target_fps": TARGET_FPS,
             "fresh_deadline_ms": DEADLINE_MS,
-            "latency_normalization": "p01 latency baseline subtracted per run to remove unsynchronized host clock offset",
+            "clock_correction": "Sender/receiver clock offset is measured with scripts/clock_offset_probe.py and applied to each sample when available; no percentile-baseline subtraction is used.",
+            "decision_metric": "Fresh-frame SLA: fresh decoded/received frames under the deadline divided by captured frames. Dropped and stale frames both count as failures.",
+            "camera_qos_policy": "Camera-like ROS paths use best-effort keep-last QoS, normally depth 1, to model newest-frame semantics.",
             "camera_paths": {
                 "dds": "sensor_msgs/CompressedImage over ROS 2 DDS, best-effort keep-last QoS",
                 "zenoh": "sensor_msgs/CompressedImage over zenoh-bridge-ros2dds with camera-throughput profile",
                 "webrtc": "H.264 video over WebRTC using the detected low-latency GStreamer profile",
             },
+            "research_basis": [
+                "ROS 2 QoS sensor-data guidance: favor latest samples over guaranteed delivery for sensor streams.",
+                "W3C WebRTC statistics: dropped/rendered frames, jitter-buffer delay, and processing delay are standard media diagnostics.",
+                "Teleoperation benchmarks should vary bandwidth, latency, jitter, and loss while reporting video freshness, quality, and task-impacting delay.",
+            ],
             "topologies": {
                 "lan": "WSL robot to remote machine over local LAN",
                 "vpn": "WSL robot to remote machine over Tailscale",
@@ -295,6 +350,21 @@ def draw_panel(data: dict, resolution: str, metric: str, title: str, note: str, 
         parts.append(text(px, plot_y + plot_h + 28, PATH_LABELS[path], size=12, fill="#667085", weight=700, anchor="middle"))
     parts.append(line(plot_x, plot_y + plot_h, plot_x + plot_w, plot_y + plot_h, stroke="#D0D5DD", width=1.2))
 
+    if not panel_values(data, resolution, metric):
+        parts.append(text(plot_x + plot_w / 2, plot_y + plot_h / 2 - 8, "Rerun required", size=18, fill="#667085", weight=800, anchor="middle"))
+        parts.append(
+            text(
+                plot_x + plot_w / 2,
+                plot_y + plot_h / 2 + 18,
+                "Legacy artifacts are not plotted",
+                size=12,
+                fill="#98A2B3",
+                weight=600,
+                anchor="middle",
+            )
+        )
+        return parts
+
     label_offsets = {"dds": -16, "zenoh": 13, "webrtc": 29}
     for transport in TRANSPORTS:
         points = []
@@ -334,7 +404,7 @@ def render_svg(data: dict) -> str:
     top = 204
     metrics = [
         ("fresh_frame_sla_percent", "Fresh-frame SLA", f"Higher is better. Deadline {DEADLINE_MS:.0f} ms."),
-        ("latency_ms_p95", "P95 latency", "Lower is better. Clock-normalized."),
+        ("latency_ms_p95", "P95 latency", "Lower is better. Offset-corrected."),
         ("usable_fps", "Usable FPS", "Higher is better. Target is 30 FPS."),
     ]
     parts = [
@@ -375,7 +445,7 @@ def render_svg(data: dict) -> str:
         text(
             margin,
             height - 42,
-            "Fresh-frame SLA = frames received under the 150 ms normalized deadline divided by captured frames. DDS cloud is not applicable in the hub topology.",
+            "Fresh-frame SLA = frames received under the 150 ms deadline divided by captured frames. Stale and dropped frames count as failures.",
             size=12,
             fill="#667085",
         )
@@ -384,7 +454,7 @@ def render_svg(data: dict) -> str:
         text(
             margin,
             height - 22,
-            "Clock normalization subtracts the p01 latency baseline per run because these hosts were not hardware-clock synchronized.",
+            "Clock offset is measured before each run with the probe artifact when available; the renderer does not subtract a percentile baseline.",
             size=12,
             fill="#667085",
         )
