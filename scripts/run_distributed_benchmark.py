@@ -255,6 +255,29 @@ def write_local_json(name: str, payload: dict) -> None:
     (BENCH_WIN / name).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def condition_complete(name: str, kind: str, has_video_load: bool = False) -> bool:
+    if kind == "ros":
+        required = [f"{name}_pub.json", f"{name}_sub.json", f"{name}_sub.samples.json"]
+    elif kind == "webrtc":
+        required = [f"{name}_latency.json"]
+    else:
+        required = [f"{name}_robot_ack.json", f"{name}_cmd.json", f"{name}_cmd.samples.json"]
+        if has_video_load:
+            required.extend([f"{name}_load_pub.json", f"{name}_load_sub.json", f"{name}_load_sub.samples.json"])
+    return all((BENCH_WIN / artifact).exists() for artifact in required)
+
+
+def write_failure(name: str, condition: dict, exc: BaseException) -> None:
+    write_local_json(
+        f"{name}_failure.json",
+        {
+            "condition": condition,
+            "error": str(exc),
+            "failed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    )
+
+
 def network_profile_suffix(profile_name: str) -> str:
     return "" if profile_name == "unconstrained" else f"_{profile_name}"
 
@@ -1119,16 +1142,19 @@ def control_pair(
 
 def main() -> None:
     BENCH_WIN.mkdir(parents=True, exist_ok=True)
-    for artifact in BENCH_WIN.glob("modeb_*"):
-        artifact.unlink()
-    for artifact in BENCH_WIN.glob("cmd_*"):
-        artifact.unlink()
-    for artifact in BENCH_WIN.glob("*_resources.csv"):
-        artifact.unlink()
-    for artifact in BENCH_WIN.glob("*_network.json"):
-        artifact.unlink()
-    for artifact in BENCH_WIN.glob("*_clock*.json"):
-        artifact.unlink()
+    resume = os.environ.get("HORUS_BENCH_RESUME", "0").lower() in {"1", "true", "yes", "on"}
+    continue_on_failure = os.environ.get("HORUS_BENCH_CONTINUE_ON_FAILURE", "0").lower() in {"1", "true", "yes", "on"}
+    if not resume:
+        for artifact in BENCH_WIN.glob("modeb_*"):
+            artifact.unlink()
+        for artifact in BENCH_WIN.glob("cmd_*"):
+            artifact.unlink()
+        for artifact in BENCH_WIN.glob("*_resources.csv"):
+            artifact.unlink()
+        for artifact in BENCH_WIN.glob("*_network.json"):
+            artifact.unlink()
+        for artifact in BENCH_WIN.glob("*_clock*.json"):
+            artifact.unlink()
     selected_resolutions = set(filter(None, os.environ.get("HORUS_BENCH_RESOLUTIONS", ",".join(RESOLUTIONS)).split(",")))
     selected_paths = set(filter(None, os.environ.get("HORUS_BENCH_PATHS", ",".join(PATHS)).split(",")))
     selected_transports = set(filter(None, os.environ.get("HORUS_BENCH_TRANSPORTS", "dds,zenoh,webrtc").split(",")))
@@ -1177,7 +1203,8 @@ def main() -> None:
     (BENCH_WIN / "distributed_metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
 
     conditions: list[dict] = []
-    domain = 90
+    domain = int(os.environ.get("HORUS_BENCH_DOMAIN_BASE", "90"))
+    domain_step = int(os.environ.get("HORUS_BENCH_DOMAIN_STEP", "10"))
     for resolution, (width, height) in RESOLUTIONS.items():
         if resolution not in selected_resolutions:
             continue
@@ -1210,7 +1237,7 @@ def main() -> None:
                             "network_profile": network_profile,
                         }
                     )
-                    domain += 10
+                    domain += domain_step
                 for transport_label, zenoh_arm in zenoh_arms:
                     conditions.append(
                         {
@@ -1231,7 +1258,7 @@ def main() -> None:
                             "network_profile": network_profile,
                         }
                     )
-                    domain += 10
+                    domain += domain_step
                 if "webrtc" in selected_transports:
                     conditions.append(
                         {
@@ -1249,7 +1276,7 @@ def main() -> None:
                             "network_profile": network_profile,
                         }
                     )
-                    domain += 10
+                    domain += domain_step
     if run_control:
         control_resolution = os.environ.get("HORUS_BENCH_CONTROL_LOAD_RESOLUTION", "1080p30")
         if control_resolution not in RESOLUTIONS:
@@ -1281,7 +1308,7 @@ def main() -> None:
                             "video_load": video_load,
                         }
                     )
-                    domain += 10
+                    domain += domain_step
                 for transport_label, zenoh_arm in control_zenoh_arms:
                     conditions.append(
                         {
@@ -1299,7 +1326,7 @@ def main() -> None:
                             "video_load": video_load,
                         }
                     )
-                    domain += 10
+                    domain += domain_step
     seed = int(os.environ.get("HORUS_BENCH_SHUFFLE_SEED", "20260705"))
     try:
         for rep in range(1, REPETITIONS + 1):
@@ -1307,51 +1334,60 @@ def main() -> None:
             random.Random(seed + rep).shuffle(ordered)
             for condition in ordered:
                 name = condition["name"] if REPETITIONS == 1 else f"{condition['name']}_rep{rep:02d}"
-                if condition["kind"] == "ros":
-                    ros_pair(
-                        name,
-                        condition["sender"],
-                        condition["receiver"],
-                        condition["profile"],
-                        condition["width"],
-                        condition["height"],
-                        condition["domain"] + rep,
-                        transport=condition["transport"],
-                        target=condition.get("target"),
-                        cloud=condition.get("cloud"),
-                        clock_target=condition["clock_target"],
-                        clock_hub=condition.get("clock_hub"),
-                        zenoh_arm=condition.get("zenoh_arm", "tcp"),
-                        network_profile=condition.get("network_profile", "unconstrained"),
-                    )
-                elif condition["kind"] == "webrtc":
-                    webrtc_pair(
-                        name,
-                        condition["sender"],
-                        condition["receiver"],
-                        condition["width"],
-                        condition["height"],
-                        condition["domain"] + rep,
-                        target=condition["target"],
-                        clock_target=condition["clock_target"],
-                        clock_hub=condition.get("clock_hub"),
-                        cloud=condition.get("cloud"),
-                        network_profile=condition.get("network_profile", "unconstrained"),
-                    )
-                else:
-                    control_pair(
-                        name,
-                        condition["sender"],
-                        condition["receiver"],
-                        condition["domain"] + rep,
-                        transport=condition["transport"],
-                        target=condition.get("target"),
-                        cloud=condition.get("cloud"),
-                        clock_target=condition["clock_target"],
-                        zenoh_arm=condition.get("zenoh_arm", "tcp"),
-                        network_profile=condition.get("network_profile", "unconstrained"),
-                        video_load=condition.get("video_load"),
-                    )
+                if resume and condition_complete(name, condition["kind"], bool(condition.get("video_load"))):
+                    print(f"\n=== {name} (skip complete) ===", flush=True)
+                    continue
+                try:
+                    if condition["kind"] == "ros":
+                        ros_pair(
+                            name,
+                            condition["sender"],
+                            condition["receiver"],
+                            condition["profile"],
+                            condition["width"],
+                            condition["height"],
+                            condition["domain"] + rep,
+                            transport=condition["transport"],
+                            target=condition.get("target"),
+                            cloud=condition.get("cloud"),
+                            clock_target=condition["clock_target"],
+                            clock_hub=condition.get("clock_hub"),
+                            zenoh_arm=condition.get("zenoh_arm", "tcp"),
+                            network_profile=condition.get("network_profile", "unconstrained"),
+                        )
+                    elif condition["kind"] == "webrtc":
+                        webrtc_pair(
+                            name,
+                            condition["sender"],
+                            condition["receiver"],
+                            condition["width"],
+                            condition["height"],
+                            condition["domain"] + rep,
+                            target=condition["target"],
+                            clock_target=condition["clock_target"],
+                            clock_hub=condition.get("clock_hub"),
+                            cloud=condition.get("cloud"),
+                            network_profile=condition.get("network_profile", "unconstrained"),
+                        )
+                    else:
+                        control_pair(
+                            name,
+                            condition["sender"],
+                            condition["receiver"],
+                            condition["domain"] + rep,
+                            transport=condition["transport"],
+                            target=condition.get("target"),
+                            cloud=condition.get("cloud"),
+                            clock_target=condition["clock_target"],
+                            zenoh_arm=condition.get("zenoh_arm", "tcp"),
+                            network_profile=condition.get("network_profile", "unconstrained"),
+                            video_load=condition.get("video_load"),
+                        )
+                except Exception as exc:
+                    write_failure(name, condition, exc)
+                    if not continue_on_failure:
+                        raise
+                    print(f"FAILED {name}: {exc}", flush=True)
     finally:
         stop_all(active_nodes)
     print(f"\nBenchmark artifacts: {BENCH_WIN}", flush=True)
