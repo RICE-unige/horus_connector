@@ -33,6 +33,8 @@ Run `./horus setup` on each computer. It asks for the role, topology, robot room
 
 ROS 2 must already be installed on `robot`, `machine`, and `teammate` computers. The `cloud` role does not need a local ROS 2 graph.
 
+Before launch, HORUS checks DDS visibility and records `.run/dds_env.json`. If the launch terminal can see topics but the bridge cannot safely transport them, `./horus doctor <role>` reports domain, discovery, interface, Docker, or Zenoh filter problems.
+
 ## Roles
 
 | Role | Runs on | Purpose |
@@ -90,9 +92,9 @@ Direct mode:
 ```bash
 ./horus status
 ./horus monitor
+./horus doctor robot
 ./horus logs zenoh
 ./horus logs webrtc
-./horus doctor
 ./horus stop
 ```
 

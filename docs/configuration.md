@@ -25,6 +25,47 @@ Use `./horus setup` for normal configuration. Edit `.env` directly only when you
 | `ROS_LOCALHOST_ONLY` | Keeps DDS traffic local to the host. Default: `1`. |
 | `ROS_AUTOMATIC_DISCOVERY_RANGE` | ROS discovery range. Default: `LOCALHOST`. |
 | `ROS_CMD_TOPIC` | Robot velocity command topic. Default: `/cmd_vel`. |
+| `HORUS_SKIP_DDS_PREFLIGHT` | Set `1` to skip the launch-time DDS preflight gate. |
+| `HORUS_DDS_INTERFACE` | Optional CycloneDDS interface name for the connector bridge participant. |
+| `HORUS_DDS_PREFLIGHT_TOPIC_TIMEOUT` | Timeout in seconds for the preflight `ros2 topic list` probe. Default: `5.0`. |
+
+## DDS Preflight
+
+`./horus launch <role>` runs a DDS preflight before starting Zenoh unless `HORUS_SKIP_DDS_PREFLIGHT=1` or `--skip-dds-preflight` is used. The preflight does not replace a partner robot's DDS setup. It snapshots the launch environment, renders a connector-owned CycloneDDS profile for the bridge participant, and classifies issues before the bridge starts.
+
+Artifacts:
+
+```text
+.run/dds_env.json
+.run/dds_preflight.json
+.run/cyclonedds_connector.xml
+.run/zenoh.log
+```
+
+The launch terminal DDS values are captured before `.env` is loaded, so stale `.env` settings can be detected. The snapshot includes `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`, `ROS_LOCALHOST_ONLY`, `ROS_AUTOMATIC_DISCOVERY_RANGE`, `ROS_STATIC_PEERS`, `ROS_DISCOVERY_SERVER`, `CYCLONEDDS_URI`, `FASTRTPS_DEFAULT_PROFILES_FILE`, network interfaces, and the selected route interface.
+
+Use:
+
+```bash
+./horus doctor robot
+./horus doctor machine
+./horus doctor teammate
+```
+
+Typical diagnoses:
+
+| Code | Meaning |
+|---|---|
+| `DDS_DOMAIN_MISMATCH` | The launch terminal and connector config use different `ROS_DOMAIN_ID` values. |
+| `DISCOVERY_SERVER_UNSUPPORTED` | `ROS_DISCOVERY_SERVER` is set; the bridge cannot join a FastDDS discovery-server graph. |
+| `ONLY_INFRASTRUCTURE_TOPICS` | Only `/rosout` and `/parameter_events` are visible, usually pointing to domain, discovery, or interface mismatch. |
+| `HORUS_FILTERED_TOPIC` | A visible topic is blocked by the role's Zenoh allow-list. |
+| `BRIDGE_ROUTE_MISSING` | A visible topic does not appear in the current bridge route log. |
+| `MACHINE_IMPORT_ROUTES_NOT_SEEN` | The machine bridge log does not show remote import routes yet. |
+| `DOCKER_NETWORK_NOT_HOST` | Docker bridge runtime must use host networking for DDS discovery. |
+| `FASTDDS_SHM_CONTAINER_WARNING` | FastDDS shared-memory transport may break data flow across container IPC boundaries. |
+
+For Docker bridge runtime, HORUS mounts the rendered CycloneDDS XML into the bridge container, passes the DDS environment explicitly, and runs the bridge with host networking.
 
 ## Zenoh
 

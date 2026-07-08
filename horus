@@ -6,6 +6,17 @@ RUN_DIR="${HORUS_RUN_DIR:-${ROOT}/.run}"
 ENV_FILE="${HORUS_ENV:-${ROOT}/.env}"
 mkdir -p "${RUN_DIR}"
 
+export HORUS_TERMINAL_ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-}"
+export HORUS_TERMINAL_ROS_DISTRO="${ROS_DISTRO:-}"
+export HORUS_TERMINAL_ROS_SETUP_PATH="${ROS_SETUP_PATH:-}"
+export HORUS_TERMINAL_RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-}"
+export HORUS_TERMINAL_ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-}"
+export HORUS_TERMINAL_ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-}"
+export HORUS_TERMINAL_ROS_STATIC_PEERS="${ROS_STATIC_PEERS:-}"
+export HORUS_TERMINAL_ROS_DISCOVERY_SERVER="${ROS_DISCOVERY_SERVER:-}"
+export HORUS_TERMINAL_CYCLONEDDS_URI="${CYCLONEDDS_URI:-}"
+export HORUS_TERMINAL_FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-}"
+
 # ANSI color helpers
 RESET="\033[0m"
 BOLD="\033[1m"
@@ -53,7 +64,7 @@ usage() {
   echo -e "  ${FG_GREEN}setup${RESET}                             Guided setup wizard"
   echo -e "  ${FG_GREEN}init${RESET}                              Create .env from the template"
   echo -e "  ${FG_GREEN}bootstrap${RESET} ${FG_CYAN}[role]${RESET}                  Install dependencies for a connector role"
-  echo -e "  ${FG_GREEN}launch${RESET} ${FG_CYAN}[role] [--no-monitor]${RESET}      Start services and open the live console"
+  echo -e "  ${FG_GREEN}launch${RESET} ${FG_CYAN}[role] [--no-monitor] [--skip-dds-preflight]${RESET} Start services and open the live console"
   echo -e "  ${FG_GREEN}stop${RESET}                              Stop running services"
   echo -e "  ${FG_GREEN}status${RESET} ${FG_CYAN}[--json]${RESET}                  Show service state and runtime settings"
   echo -e "  ${FG_GREEN}monitor${RESET} ${FG_CYAN}[--once]${RESET}                  Interactive live console"
@@ -293,6 +304,75 @@ build_zenoh_common_args() {
   if [[ -n "${ZENOH_NAMESPACE:-}" ]]; then
     output_ref+=(-n "${ZENOH_NAMESPACE}")
   fi
+}
+
+dds_preflight_target() {
+  local role="$1"
+  zenoh_connect_target "${role}" 2>/dev/null || echo ""
+}
+
+dds_preflight_common_args() {
+  local -n output_ref="$1"
+  local role="$2"
+  local mode="$3"
+  local config
+  local target
+  config="$(zenoh_config_path)"
+  target="$(dds_preflight_target "${role}")"
+  output_ref+=(
+    --root "${ROOT}"
+    --run-dir "${RUN_DIR}"
+    --role "${role}"
+    --mode "${mode}"
+    --runtime "${ZENOH_BRIDGE_RUNTIME:-binary}"
+    --topology "${HORUS_TOPOLOGY:-hub}"
+    --zenoh-config "${config}"
+    --target "${target}"
+    --docker-network "host"
+    --output-json "${RUN_DIR}/dds_preflight.json"
+  )
+}
+
+run_dds_preflight() {
+  local role="$1"
+  local mode="$2"
+  local args=()
+  dds_preflight_common_args args "${role}" "${mode}"
+  python3 "${ROOT}/scripts/dds_preflight.py" "${args[@]}" --pretty
+}
+
+run_dds_launch_gate() {
+  local role="$1"
+  if [[ "${HORUS_SKIP_DDS_PREFLIGHT:-0}" == "1" ]]; then
+    log_warn "Skipping DDS preflight because HORUS_SKIP_DDS_PREFLIGHT=1."
+    return
+  fi
+  log_info "Running DDS preflight."
+  run_dds_preflight "${role}" launch
+}
+
+dds_connector_config_path() {
+  local role="$1"
+  local args=()
+  dds_preflight_common_args args "${role}" render
+  python3 "${ROOT}/scripts/dds_preflight.py" "${args[@]}" --warn-only | tail -n 1
+}
+
+dds_docker_env_args() {
+  local -n output_ref="$1"
+  local key
+  for key in \
+    ROS_DISTRO \
+    ROS_DOMAIN_ID \
+    ROS_LOCALHOST_ONLY \
+    ROS_AUTOMATIC_DISCOVERY_RANGE \
+    ROS_STATIC_PEERS \
+    RMW_IMPLEMENTATION \
+    FASTRTPS_DEFAULT_PROFILES_FILE; do
+    if [[ -n "${!key:-}" ]]; then
+      output_ref+=(-e "${key}=${!key}")
+    fi
+  done
 }
 
 zenoh_transport() {
@@ -685,6 +765,8 @@ doctor() {
   echo -e "  room       ${HORUS_ROOM:-default}"
   warn_runtime_config
   echo ""
+  run_dds_preflight "${role}" doctor || true
+  echo ""
 
   case "${role}:${HORUS_TOPOLOGY:-hub}" in
     robot:direct|teammate:direct)
@@ -1008,8 +1090,10 @@ launch_zenoh_client() {
   local target="$2"
   local bridge="${ROOT}/zenoh-bridge-ros2dds"
   local config
+  local dds_config
   local docker_cmd=(docker)
   local docker_mount_args=()
+  local docker_env_args=()
   local namespace_args=()
   local zenoh_args=()
   local endpoint_args=()
@@ -1020,6 +1104,8 @@ launch_zenoh_client() {
     [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
     config="$(zenoh_config_path)"
     [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+    dds_config="$(dds_connector_config_path "${role}")"
+    dds_docker_env_args docker_env_args
     if zenoh_quic_active; then
       config="$(zenoh_runtime_config_path "${config}")"
       zenoh_docker_tls_mount_args docker_mount_args
@@ -1030,7 +1116,10 @@ launch_zenoh_client() {
       --network host \
       -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
       -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
+      -e "CYCLONEDDS_URI=file:///horus_cyclonedds.xml" \
+      "${docker_env_args[@]}" \
       -v "${config}:/horus_zenoh.json5:ro" \
+      -v "${dds_config}:/horus_cyclonedds.xml:ro" \
       "${docker_mount_args[@]}" \
       "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-1.9.0}}" \
       -c /horus_zenoh.json5 "${namespace_args[@]}" \
@@ -1039,7 +1128,8 @@ launch_zenoh_client() {
     [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
     source_ros_required
     build_zenoh_common_args zenoh_args
-    start_bg zenoh "${bridge}" "${zenoh_args[@]}" --no-multicast-scouting "${endpoint_args[@]}" client
+    dds_config="$(dds_connector_config_path "${role}")"
+    start_bg zenoh env "CYCLONEDDS_URI=file://${dds_config}" "${bridge}" "${zenoh_args[@]}" --no-multicast-scouting "${endpoint_args[@]}" client
   fi
 }
 
@@ -1047,8 +1137,10 @@ launch_zenoh_router() {
   local role="$1"
   local bridge="${ROOT}/zenoh-bridge-ros2dds"
   local config
+  local dds_config
   local docker_cmd=(docker)
   local docker_mount_args=()
+  local docker_env_args=()
   local namespace_args=()
   local zenoh_args=()
   local endpoint_args=()
@@ -1059,6 +1151,8 @@ launch_zenoh_router() {
     [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
     config="$(zenoh_config_path)"
     [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+    dds_config="$(dds_connector_config_path "${role}")"
+    dds_docker_env_args docker_env_args
     if zenoh_quic_active; then
       config="$(zenoh_runtime_config_path "${config}")"
       zenoh_docker_tls_mount_args docker_mount_args
@@ -1069,7 +1163,10 @@ launch_zenoh_router() {
       --network host \
       -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
       -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
+      -e "CYCLONEDDS_URI=file:///horus_cyclonedds.xml" \
+      "${docker_env_args[@]}" \
       -v "${config}:/horus_zenoh.json5:ro" \
+      -v "${dds_config}:/horus_cyclonedds.xml:ro" \
       "${docker_mount_args[@]}" \
       "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-1.9.0}}" \
       -c /horus_zenoh.json5 "${namespace_args[@]}" \
@@ -1082,7 +1179,8 @@ launch_zenoh_router() {
       source_ros_required
     fi
     build_zenoh_common_args zenoh_args
-    start_bg zenoh "${bridge}" "${zenoh_args[@]}" "${endpoint_args[@]}" router
+    dds_config="$(dds_connector_config_path "${role}")"
+    start_bg zenoh env "CYCLONEDDS_URI=file://${dds_config}" "${bridge}" "${zenoh_args[@]}" "${endpoint_args[@]}" router
   fi
 }
 
@@ -1413,9 +1511,11 @@ case "${cmd}" in
     load_env
     role="${2:-${HORUS_ROLE:-robot}}"
     no_monitor=0
+    skip_dds_preflight=0
     for arg in "${@:3}"; do
       case "${arg}" in
         --no-monitor) no_monitor=1 ;;
+        --skip-dds-preflight) skip_dds_preflight=1 ;;
         *) echo "Unknown launch option: ${arg}" >&2; exit 2 ;;
       esac
     done
@@ -1485,6 +1585,14 @@ case "${cmd}" in
     fi
     echo -e "  ros        ${ROS_DISTRO:-jazzy}, domain ${FG_CYAN}${ROS_DOMAIN_ID:-0}${RESET}"
     echo ""
+
+    if zenoh_enabled && [[ "${skip_dds_preflight}" != "1" ]]; then
+      run_dds_launch_gate "${role}"
+      echo ""
+    elif [[ "${skip_dds_preflight}" == "1" ]]; then
+      log_warn "Skipping DDS preflight for this launch."
+      echo ""
+    fi
 
     log_info "Starting services for role: ${BOLD}${role}${RESET}"
     case "${role}" in
