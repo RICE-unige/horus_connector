@@ -6,8 +6,8 @@ Use `./horus setup` for normal configuration. Edit `.env` directly only when you
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `HORUS_ROLE` | all | `robot`, `machine`, or `cloud`. |
-| `HORUS_ROOM` | robot, machine | Pairing room. Use one stable room per robot, for example `robot-a`. |
+| `HORUS_ROLE` | all | `robot`, `machine`, `teammate`, or `cloud`. |
+| `HORUS_ROOM` | robot, machine, teammate | Pairing room. Use one stable room per robot or teammate endpoint, for example `robot-a`. |
 | `HORUS_TOPOLOGY` | all | `hub` through a cloud server, or `direct` over VPN/Tailscale/LAN. |
 | `HORUS_CLOUD_IP` | hub robot, hub machine | Cloud public IP or DNS name. |
 | `HORUS_MACHINE_IP` | direct robot, direct machine | Operator machine VPN/LAN address. |
@@ -49,6 +49,7 @@ Role configs:
 |---|---|
 | `robot` | `config/zenoh_robot.json5` |
 | `machine` | `config/zenoh_machine.json5` |
+| `teammate` | `config/zenoh_teammate.json5` |
 | `cloud` | `config/zenoh_cloud.json5` |
 
 The default robot profile exports robot ROS topics through Zenoh and imports command topics from the operator machine. The machine profile imports robot topics and exports only command topics:
@@ -88,6 +89,40 @@ pub_priorities: [
 ```
 
 Zenoh priority `1` is highest, `7` is lowest. `:express` reduces latency for small high-value messages.
+
+## Field Teammate
+
+The `teammate` role is for a field teammate endpoint that relays local teammate/HoloLens data into the HORUS ROS 2 graph through Zenoh. It is not a cloud hub and it does not run the robot camera WebRTC sender/receiver path.
+
+Normal setup:
+
+```bash
+./horus setup
+./horus bootstrap teammate
+./horus launch teammate
+```
+
+| Variable | Purpose |
+|---|---|
+| `FIELD_TEAMMATE_NAME` | Stable teammate endpoint name used in ROS topic names. |
+| `FIELD_TEAMMATE_HOLOLENS_HOST` | HoloLens IP or DNS name. Leave empty to run without a headset connection. |
+| `FIELD_TEAMMATE_PV_PORT` | HoloLens photo/video stream port. |
+| `FIELD_TEAMMATE_SPATIAL_INPUT_PORT` | HoloLens spatial input port. |
+| `FIELD_TEAMMATE_UMQ_PORT` | HoloLens message queue port. |
+| `FIELD_TEAMMATE_MAP_FRAME` | ROS frame used for teammate poses. |
+| `FIELD_TEAMMATE_PROFILE_HEIGHT` | Teammate profile height in meters. |
+| `FIELD_TEAMMATE_CAMERA_HEIGHT` | Camera height offset in meters. |
+| `FIELD_TEAMMATE_FLOOR_HEIGHT` | Floor height offset in meters. |
+| `FIELD_TEAMMATE_POSE_ORIGIN` | Pose origin mode. Default: `camera`. |
+| `FIELD_TEAMMATE_CONNECT_TIMEOUT` | Connection timeout in seconds. |
+| `FIELD_TEAMMATE_RECONNECT_DELAY` | Reconnect delay in seconds. |
+| `FIELD_TEAMMATE_VIDEO_PROFILE` | Preset video profile, for example `fast60`. |
+| `FIELD_TEAMMATE_RAW_IMAGE` | Set `1` to publish raw image data when supported. |
+| `FIELD_TEAMMATE_VIDEO_MODE` | Optional video mode override. |
+| `FIELD_TEAMMATE_VIDEO_WIDTH` | Optional video width override. |
+| `FIELD_TEAMMATE_VIDEO_HEIGHT` | Optional video height override. |
+| `FIELD_TEAMMATE_VIDEO_FPS` | Optional video FPS override. |
+| `FIELD_TEAMMATE_VIDEO_QUALITY` | Optional video quality override. |
 
 ## WebRTC Camera And Control
 

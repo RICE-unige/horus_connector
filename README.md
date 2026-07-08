@@ -26,12 +26,12 @@ The cloud role is only a hub: it routes Zenoh traffic and relays WebRTC signalin
 git clone https://github.com/RICE-unige/horus_connector.git
 cd horus_connector
 ./horus setup
-./horus bootstrap robot    # or machine/cloud
+./horus bootstrap robot    # or machine/teammate/cloud
 ```
 
 Run `./horus setup` on each computer. It asks for the role, topology, robot room name, network address, ROS 2 setup, domain ID, and camera profile.
 
-ROS 2 must already be installed on `robot` and `machine` computers. The `cloud` role does not need a local ROS 2 graph.
+ROS 2 must already be installed on `robot`, `machine`, and `teammate` computers. The `cloud` role does not need a local ROS 2 graph.
 
 ## Roles
 
@@ -39,6 +39,7 @@ ROS 2 must already be installed on `robot` and `machine` computers. The `cloud` 
 |---|---|---|
 | `robot` | Robot computer | Sends camera/state and optionally receives bounded control commands. |
 | `machine` | Operator computer | Receives camera/state and can send control commands when enabled. |
+| `teammate` | Field teammate computer | Relays local teammate/HoloLens data into the shared ROS 2 graph. |
 | `cloud` | Public VM or server | Shared hub for remote deployments. |
 
 ## Topologies
@@ -63,6 +64,9 @@ Hub mode:
 
 # each operator machine
 ./horus launch machine
+
+# optional field teammate endpoint
+./horus launch teammate
 ```
 
 Direct mode:
