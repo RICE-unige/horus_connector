@@ -6,6 +6,7 @@
 .webrtc_profile.env
 .zenoh_profile.env
 .zenoh_tls_profile.env
+config/webrtc_streams.json
 __pycache__/
 *.pyc
 *.log

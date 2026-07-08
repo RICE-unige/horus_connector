@@ -110,6 +110,7 @@ Zenoh priority `1` is highest, `7` is lowest. `:express` reduces latency for sma
 | `WEBRTC_ROS_IMAGE_OUTPUT_ENCODING` | ROS encoding for decoded frames. |
 | `WEBRTC_ROS_IMAGE_FRAME_ID` | Frame ID for decoded ROS images. |
 | `WEBRTC_ROS_IMAGE_QOS` | `auto` is recommended. |
+| `HORUS_STREAMS_CONFIG` | Optional JSON config for multiple WebRTC camera streams. Usually written by `./horus setup`. |
 | `VIDEO_BITRATE_KBIT` | Starting H.264 bitrate. |
 | `WEBRTC_ADAPTIVE_BITRATE` | Enable adaptive bitrate control. Default: `1`. |
 | `WEBRTC_CONTROL_ENABLED` | Legacy/debug option for WebRTC DataChannel publishing to `ROS_CMD_TOPIC`. Keep `0` for normal runs. Default: `0`. |
@@ -125,6 +126,26 @@ Zenoh priority `1` is highest, `7` is lowest. `:express` reduces latency for sma
 | `WEBRTC_H264_KEY_INT_MAX` | H.264 keyframe interval. |
 | `WEBRTC_CMD_WATCHDOG_TIMEOUT` | Robot command timeout before publishing zero velocity. |
 | `WEBRTC_CMD_RATE_LIMIT_HZ` | Maximum accepted command rate. |
+
+### Multiple Camera Streams
+
+Use `./horus setup` and choose the number of WebRTC camera streams. The setup writes `config/webrtc_streams.json`, which is ignored by git because each deployment usually has different cameras and room names.
+
+Each stream has its own internal WebRTC room, input topic, output topic, resolution, frame rate, and bitrate. `./horus launch robot` starts one sender per enabled stream, and `./horus launch machine` starts one receiver per enabled stream. The machine republishes each decoded stream to its configured ROS 2 output topic.
+
+Example template:
+
+```bash
+cp config/webrtc_streams.example.json config/webrtc_streams.json
+./horus setup
+```
+
+Per-stream logs use the stream service name:
+
+```bash
+./horus logs webrtc-primary
+./horus logs webrtc-camera-2
+```
 
 ## Hardware Codecs
 
