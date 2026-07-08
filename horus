@@ -52,7 +52,7 @@ usage() {
   echo -e "${BOLD}Commands${RESET}"
   echo -e "  ${FG_GREEN}setup${RESET}                             Guided setup wizard"
   echo -e "  ${FG_GREEN}init${RESET}                              Create .env from the template"
-  echo -e "  ${FG_GREEN}bootstrap${RESET} ${FG_CYAN}[role]${RESET}                  Install dependencies for robot, machine, or cloud"
+  echo -e "  ${FG_GREEN}bootstrap${RESET} ${FG_CYAN}[role]${RESET}                  Install dependencies for a connector role"
   echo -e "  ${FG_GREEN}launch${RESET} ${FG_CYAN}[role] [--no-monitor]${RESET}      Start services and open the live console"
   echo -e "  ${FG_GREEN}stop${RESET}                              Stop running services"
   echo -e "  ${FG_GREEN}status${RESET} ${FG_CYAN}[--json]${RESET}                  Show service state and runtime settings"
@@ -68,6 +68,7 @@ usage() {
   echo -e "${BOLD}Roles${RESET}"
   echo -e "  ${BOLD}robot${RESET}     Robot-side system. Sends camera/state and receives velocity commands"
   echo -e "  ${BOLD}machine${RESET}   Operator/local machine. Receives camera/state and sends commands"
+  echo -e "  ${BOLD}teammate${RESET}  Field teammate relay. Publishes HoloLens pose/FPV and receives guidance"
   echo -e "  ${BOLD}cloud${RESET}     Shared Zenoh router + WebRTC signaling relay, optionally TURN"
   echo ""
 
@@ -248,6 +249,7 @@ zenoh_config_path() {
     case "${HORUS_ROLE:-}" in
       robot) configured="config/zenoh_robot.json5" ;;
       machine) configured="config/zenoh_machine.json5" ;;
+      teammate) configured="config/zenoh_teammate.json5" ;;
       cloud) configured="config/zenoh_cloud.json5" ;;
       *) configured="config/zenoh_split.json5" ;;
     esac
@@ -541,11 +543,11 @@ zenoh_connect_target() {
   local role="$1"
   local topology="${HORUS_TOPOLOGY:-hub}"
   case "${role}:${topology}" in
-    robot:hub|machine:hub)
+    robot:hub|machine:hub|teammate:hub)
       required_value HORUS_CLOUD_IP "${HORUS_CLOUD_IP:-}"
       echo "${HORUS_CLOUD_IP}"
       ;;
-    robot:direct)
+    robot:direct|teammate:direct)
       required_value HORUS_MACHINE_IP "${HORUS_MACHINE_IP:-}"
       echo "${HORUS_MACHINE_IP}"
       ;;
@@ -685,8 +687,8 @@ doctor() {
   echo ""
 
   case "${role}:${HORUS_TOPOLOGY:-hub}" in
-    robot:direct)
-      target="$(zenoh_connect_target robot)"
+    robot:direct|teammate:direct)
+      target="$(zenoh_connect_target "${role}")"
       echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
       echo -e "  target     ${target}"
       echo -en "  zenoh      "
@@ -694,8 +696,10 @@ doctor() {
       if zenoh_quic_active; then
         echo -e "  zenoh udp  ${FG_MUTED}udp/${target}:${ZENOH_PORT:-7447} must be reachable for QUIC${RESET}"
       fi
-      echo -en "  signaling  "
-      tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
+      if [[ "${role}" != "teammate" ]]; then
+        echo -en "  signaling  "
+        tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
+      fi
       ;;
     machine:direct)
       echo -e "  mode       listening for direct robot connections"
@@ -720,7 +724,7 @@ doctor() {
         echo -e "  listeners  ${FG_MUTED}none detected yet${RESET}"
       fi
       ;;
-    robot:hub|machine:hub)
+    robot:hub|machine:hub|teammate:hub)
       target="$(zenoh_connect_target "${role}")"
       echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
       echo -e "  cloud      ${target}"
@@ -729,9 +733,11 @@ doctor() {
       if zenoh_quic_active; then
         echo -e "  zenoh udp  ${FG_MUTED}udp/${target}:${ZENOH_PORT:-7447} must be reachable for QUIC${RESET}"
       fi
-      echo -en "  signaling  "
-      tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
-      if [[ "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ]]; then
+      if [[ "${role}" != "teammate" ]]; then
+        echo -en "  signaling  "
+        tcp_probe "$(webrtc_signal_target)" "${WEBRTC_SIGNAL_PORT:-8765}" || true
+      fi
+      if [[ "${role}" != "teammate" && ( "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ) ]]; then
         echo -e "  turn       ${FG_GREEN}configured${RESET} ${FG_MUTED}${WEBRTC_ICE_SERVERS#*,}${RESET}"
       fi
       ;;
@@ -753,6 +759,21 @@ doctor() {
       fi
       ;;
   esac
+  if [[ "${role}" == "teammate" ]]; then
+    local hololens_host="${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-}}"
+    echo -e "  teammate  ${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}"
+    if [[ -z "${hololens_host}" ]]; then
+      echo -e "  hololens  ${FG_YELLOW}not configured${RESET} ${FG_MUTED}set FIELD_TEAMMATE_HOLOLENS_HOST${RESET}"
+    else
+      echo -e "  hololens  ${hololens_host}"
+      echo -en "  pv        "
+      tcp_probe "${hololens_host}" "${FIELD_TEAMMATE_PV_PORT:-3810}" || true
+      echo -en "  pose      "
+      tcp_probe "${hololens_host}" "${FIELD_TEAMMATE_SPATIAL_INPUT_PORT:-3814}" || true
+      echo -en "  umq       "
+      tcp_probe "${hololens_host}" "${FIELD_TEAMMATE_UMQ_PORT:-3816}" || true
+    fi
+  fi
   echo ""
 }
 
@@ -859,6 +880,7 @@ stop_stale_project_processes() {
     "${ROOT}/scripts/webrtc_camera_sender.py"
     "${ROOT}/scripts/webrtc_camera_receiver.py"
     "${ROOT}/scripts/webrtc_signal_relay.py"
+    "${ROOT}/scripts/field_teammate_hololens_relay.py"
     "${ROOT}/scripts/fake_robot_ros2_data.py"
     "${ROOT}/scripts/horus_metrics.py"
     "scripts/gst_webrtc_h264_robot.py"
@@ -866,6 +888,7 @@ stop_stale_project_processes() {
     "scripts/webrtc_camera_sender.py"
     "scripts/webrtc_camera_receiver.py"
     "scripts/webrtc_signal_relay.py"
+    "scripts/field_teammate_hololens_relay.py"
     "scripts/fake_robot_ros2_data.py"
     "scripts/horus_metrics.py"
   )
@@ -925,6 +948,25 @@ status_one() {
   else
     printf "  %-10s %b\n" "${name}" "${FG_MUTED}stopped${RESET}"
   fi
+}
+
+status_webrtc_streams() {
+  local role="${HORUS_ROLE:-robot}"
+  local rows=()
+  local row service rest
+  if { [[ "${role}" != "robot" && "${role}" != "machine" ]] || [[ "${WEBRTC_MEDIA_MODE:-h264}" != "h264" ]]; }; then
+    status_one webrtc
+    return
+  fi
+  mapfile -t rows < <(webrtc_stream_rows "${role}")
+  if [[ "${#rows[@]}" -eq 0 ]]; then
+    status_one webrtc
+    return
+  fi
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r service rest <<< "${row}"
+    status_one "${service}"
+  done
 }
 
 status_zenoh() {
@@ -1044,6 +1086,142 @@ launch_zenoh_router() {
   fi
 }
 
+decode_b64() {
+  if [[ "$1" == "-" ]]; then
+    return
+  fi
+  python3 -c 'import base64, sys; print(base64.b64decode(sys.argv[1]).decode("utf-8"), end="")' "$1"
+}
+
+webrtc_stream_rows() {
+  local role="$1"
+  python3 "${ROOT}/scripts/webrtc_streams.py" list --root "${ROOT}" --role "${role}"
+}
+
+print_webrtc_stream_summary() {
+  local role="$1"
+  local rows=()
+  mapfile -t rows < <(webrtc_stream_rows "${role}")
+  if [[ "${#rows[@]}" -le 1 ]]; then
+    return
+  fi
+  echo -e "  streams    ${FG_CYAN}${#rows[@]} WebRTC camera streams${RESET}"
+  local row service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos <<< "${row}"
+    if [[ "${role}" == "robot" ]]; then
+      echo -e "    ${FG_CYAN}${stream_id}${RESET} room ${room}, ${input_topic}, ${width}x${height}@${fps}"
+    else
+      echo -e "    ${FG_CYAN}${stream_id}${RESET} room ${room}, output ${output_topic}"
+    fi
+  done
+}
+
+launch_webrtc_robot_h264_streams() {
+  local py="$1"
+  local target="$2"
+  local control_enabled="$3"
+  local rows=()
+  local optional_args=()
+  local row service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos source_pipeline
+  "${ROOT}/scripts/detect_video_stack.sh" --role robot --out "${ROOT}/.webrtc_profile.env" >/dev/null
+  build_webrtc_latency_probe_args optional_args
+  mapfile -t rows < <(webrtc_stream_rows robot)
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos <<< "${row}"
+    source_pipeline="$(decode_b64 "${source_pipeline_b64}")"
+    start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
+      --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
+      --room "${room}" \
+      --profile "${ROOT}/.webrtc_profile.env" \
+      --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+      --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
+      --enable-control "${control_enabled}" \
+      --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
+      --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
+      --allow-unauthenticated-control "${WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL:-0}" \
+      --cmd-max-linear-mps "${WEBRTC_CMD_MAX_LINEAR_MPS:-0.5}" \
+      --cmd-max-angular-rps "${WEBRTC_CMD_MAX_ANGULAR_RPS:-1.0}" \
+      --cmd-watchdog-timeout "${WEBRTC_CMD_WATCHDOG_TIMEOUT:-0.3}" \
+      --cmd-rate-limit-hz "${WEBRTC_CMD_RATE_LIMIT_HZ:-100.0}" \
+      --video-bitrate-kbit "${bitrate}" \
+      --adaptive-bitrate "${WEBRTC_ADAPTIVE_BITRATE:-1}" \
+      --min-bitrate-kbit "${WEBRTC_MIN_BITRATE_KBIT:-1000}" \
+      --max-bitrate-kbit "${WEBRTC_MAX_BITRATE_KBIT:-${bitrate}}" \
+      --bitrate-step-kbit "${WEBRTC_BITRATE_STEP_KBIT:-500}" \
+      --bitrate-check-sec "${WEBRTC_BITRATE_CHECK_SEC:-2.0}" \
+      --video-source "${video_source}" \
+      --ros-image-topic "${input_topic}" \
+      --ros-image-qos "${qos}" \
+      --source-pipeline "${source_pipeline}" \
+      --width "${width}" \
+      --height "${height}" \
+      --fps "${fps}" \
+      "${optional_args[@]}" \
+      --duration "${WEBRTC_DURATION:-86400}"
+  done
+}
+
+launch_webrtc_receiver_h264_streams() {
+  local role="$1"
+  local py="$2"
+  local target="$3"
+  local cmd_rate="$4"
+  local rows=()
+  local optional_args=()
+  local use_local_signal_relay=0
+  local row service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos
+  "${ROOT}/scripts/detect_video_stack.sh" --role "${role}" --out "${ROOT}/.webrtc_profile.env" >/dev/null
+  build_webrtc_latency_receiver_args optional_args
+  mapfile -t rows < <(webrtc_stream_rows machine)
+  if [[ "${HORUS_TOPOLOGY:-hub}" == "direct" && "${#rows[@]}" -gt 1 ]]; then
+    launch_signal_relay
+    target="127.0.0.1"
+    use_local_signal_relay=1
+  fi
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos <<< "${row}"
+    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" || "${use_local_signal_relay}" == "1" ]]; then
+      start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
+        --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
+        --room "${room}" \
+        --profile "${ROOT}/.webrtc_profile.env" \
+        --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
+        --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
+        --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
+        --ros-image-topic "${output_topic}" \
+        --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
+        --ros-image-frame-id "${frame_id}" \
+        --ros-image-qos "${qos}" \
+        --cmd-rate "${cmd_rate}" \
+        --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
+        --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+        "${optional_args[@]}" \
+        --duration "${WEBRTC_DURATION:-86400}"
+    else
+      start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
+        --host 0.0.0.0 \
+        --port "${WEBRTC_SIGNAL_PORT:-8765}" \
+        --room "${room}" \
+        --profile "${ROOT}/.webrtc_profile.env" \
+        --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
+        --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
+        --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
+        --ros-image-topic "${output_topic}" \
+        --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
+        --ros-image-frame-id "${frame_id}" \
+        --ros-image-qos "${qos}" \
+        --cmd-rate "${cmd_rate}" \
+        --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
+        --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+        "${optional_args[@]}" \
+        --duration "${WEBRTC_DURATION:-86400}"
+    fi
+  done
+}
+
 launch_webrtc_robot() {
   local py
   local target
@@ -1071,37 +1249,7 @@ launch_webrtc_robot() {
       "${optional_args[@]}" \
       --json "${RUN_DIR}/webrtc_robot_summary.json"
   else
-    "${ROOT}/scripts/detect_video_stack.sh" --role robot --out "${ROOT}/.webrtc_profile.env" >/dev/null
-    build_webrtc_latency_probe_args optional_args
-    start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
-      --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
-      --room "${HORUS_ROOM:-default}" \
-      --profile "${ROOT}/.webrtc_profile.env" \
-      --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
-      --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
-      --enable-control "${control_enabled}" \
-      --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
-      --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
-      --allow-unauthenticated-control "${WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL:-0}" \
-      --cmd-max-linear-mps "${WEBRTC_CMD_MAX_LINEAR_MPS:-0.5}" \
-      --cmd-max-angular-rps "${WEBRTC_CMD_MAX_ANGULAR_RPS:-1.0}" \
-      --cmd-watchdog-timeout "${WEBRTC_CMD_WATCHDOG_TIMEOUT:-0.3}" \
-      --cmd-rate-limit-hz "${WEBRTC_CMD_RATE_LIMIT_HZ:-100.0}" \
-      --video-bitrate-kbit "${VIDEO_BITRATE_KBIT:-6000}" \
-      --adaptive-bitrate "${WEBRTC_ADAPTIVE_BITRATE:-1}" \
-      --min-bitrate-kbit "${WEBRTC_MIN_BITRATE_KBIT:-1000}" \
-      --max-bitrate-kbit "${WEBRTC_MAX_BITRATE_KBIT:-${VIDEO_BITRATE_KBIT:-6000}}" \
-      --bitrate-step-kbit "${WEBRTC_BITRATE_STEP_KBIT:-500}" \
-      --bitrate-check-sec "${WEBRTC_BITRATE_CHECK_SEC:-2.0}" \
-      --video-source "${WEBRTC_VIDEO_SOURCE:-ros2}" \
-      --ros-image-topic "${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/image_raw}}" \
-      --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
-      --source-pipeline "${WEBRTC_GST_VIDEO_SOURCE:-}" \
-      --width "${WEBRTC_VIDEO_WIDTH:-1280}" \
-      --height "${WEBRTC_VIDEO_HEIGHT:-720}" \
-      --fps "${WEBRTC_VIDEO_FPS:-30}" \
-      "${optional_args[@]}" \
-      --duration "${WEBRTC_DURATION:-86400}"
+    launch_webrtc_robot_h264_streams "${py}" "${target}" "${control_enabled}"
   fi
 }
 
@@ -1132,46 +1280,7 @@ launch_webrtc_receiver() {
       --json "${RUN_DIR}/webrtc_${role}_summary.json" \
       --csv "${RUN_DIR}/webrtc_${role}_latency.csv"
   else
-    "${ROOT}/scripts/detect_video_stack.sh" --role "${role}" --out "${ROOT}/.webrtc_profile.env" >/dev/null
-    build_webrtc_latency_receiver_args optional_args
-    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
-      start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
-        --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
-        --room "${HORUS_ROOM:-default}" \
-        --profile "${ROOT}/.webrtc_profile.env" \
-        --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
-        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
-        --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
-        --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
-        --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
-        --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
-        --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
-        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
-        --cmd-rate "${cmd_rate}" \
-        --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
-        --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
-        "${optional_args[@]}" \
-        --duration "${WEBRTC_DURATION:-86400}"
-    else
-      start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
-        --host 0.0.0.0 \
-        --port "${WEBRTC_SIGNAL_PORT:-8765}" \
-        --room "${HORUS_ROOM:-default}" \
-        --profile "${ROOT}/.webrtc_profile.env" \
-        --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
-        --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
-        --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
-        --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
-        --ros-image-topic "${WEBRTC_ROS_IMAGE_OUTPUT_TOPIC:-${WEBRTC_ROS_IMAGE_TOPIC:-/camera/webrtc/image_raw}}" \
-        --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
-        --ros-image-frame-id "${WEBRTC_ROS_IMAGE_FRAME_ID:-webrtc_camera}" \
-        --ros-image-qos "${WEBRTC_ROS_IMAGE_QOS:-auto}" \
-        --cmd-rate "${cmd_rate}" \
-        --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
-        --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
-        "${optional_args[@]}" \
-        --duration "${WEBRTC_DURATION:-86400}"
-    fi
+    launch_webrtc_receiver_h264_streams "${role}" "${py}" "${target}" "${cmd_rate}"
   fi
 }
 
@@ -1224,10 +1333,55 @@ launch_fake_data() {
     --color-seed "${FAKE_COLOR_SEED:-17}"
 }
 
+launch_field_teammate() {
+  local py="python3"
+  local name="${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}"
+  local hololens_host="${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-}}"
+  local relay_args=()
+
+  required_value FIELD_TEAMMATE_HOLOLENS_HOST "${hololens_host}"
+  source_ros_required
+
+  relay_args+=(
+    --name "${name}"
+    --hololens-host "${hololens_host}"
+    --pv-port "${FIELD_TEAMMATE_PV_PORT:-3810}"
+    --spatial-input-port "${FIELD_TEAMMATE_SPATIAL_INPUT_PORT:-3814}"
+    --umq-port "${FIELD_TEAMMATE_UMQ_PORT:-3816}"
+    --map-frame "${FIELD_TEAMMATE_MAP_FRAME:-map}"
+    --profile-height "${FIELD_TEAMMATE_PROFILE_HEIGHT:-1.75}"
+    --camera-height "${FIELD_TEAMMATE_CAMERA_HEIGHT:-0.0}"
+    --floor-height "${FIELD_TEAMMATE_FLOOR_HEIGHT:-0.0}"
+    --pose-origin "${FIELD_TEAMMATE_POSE_ORIGIN:-camera}"
+    --connect-timeout "${FIELD_TEAMMATE_CONNECT_TIMEOUT:-2.0}"
+    --reconnect-delay "${FIELD_TEAMMATE_RECONNECT_DELAY:-1.0}"
+    --video-profile "${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}"
+  )
+
+  if [[ "${FIELD_TEAMMATE_RAW_IMAGE:-0}" == "1" ]]; then
+    relay_args+=(--raw-image)
+  else
+    relay_args+=(--no-raw-image)
+  fi
+  [[ -n "${FIELD_TEAMMATE_VIDEO_MODE:-}" ]] && relay_args+=(--video-mode "${FIELD_TEAMMATE_VIDEO_MODE}")
+  [[ -n "${FIELD_TEAMMATE_VIDEO_WIDTH:-}" ]] && relay_args+=(--video-width "${FIELD_TEAMMATE_VIDEO_WIDTH}")
+  [[ -n "${FIELD_TEAMMATE_VIDEO_HEIGHT:-}" ]] && relay_args+=(--video-height "${FIELD_TEAMMATE_VIDEO_HEIGHT}")
+  [[ -n "${FIELD_TEAMMATE_VIDEO_FPS:-}" ]] && relay_args+=(--video-fps "${FIELD_TEAMMATE_VIDEO_FPS}")
+  [[ -n "${FIELD_TEAMMATE_VIDEO_QUALITY:-}" ]] && relay_args+=(--video-quality "${FIELD_TEAMMATE_VIDEO_QUALITY}")
+
+  start_bg teammate "${py}" "${ROOT}/scripts/field_teammate_hololens_relay.py" "${relay_args[@]}"
+}
+
 cmd="${1:-help}"
 case "${cmd}" in
   setup|configure)
-    python3 "${ROOT}/scripts/horus_setup.py" --root "${ROOT}" --env "${ENV_FILE}" "${@:2}"
+    setup_args=("${@:2}")
+    case "${2:-}" in
+      robot|machine|teammate|cloud)
+        setup_args=(--role "$2" "${@:3}")
+        ;;
+    esac
+    python3 "${ROOT}/scripts/horus_setup.py" --root "${ROOT}" --env "${ENV_FILE}" "${setup_args[@]}"
     ;;
   init)
     print_banner
@@ -1270,7 +1424,7 @@ case "${cmd}" in
         ensure_webrtc_media_supported
         warn_runtime_config
         ;;
-      cloud)
+      teammate|cloud)
         ;;
       fleet)
         log_error "'fleet' is managed with the fleet command, not launch."
@@ -1279,7 +1433,7 @@ case "${cmd}" in
         ;;
       *)
         log_error "Unknown launch role: ${role}"
-        echo -e "Supported roles: ${FG_CYAN}robot${RESET}, ${FG_CYAN}machine${RESET}, ${FG_CYAN}cloud${RESET}" >&2
+        echo -e "Supported roles: ${FG_CYAN}robot${RESET}, ${FG_CYAN}machine${RESET}, ${FG_CYAN}teammate${RESET}, ${FG_CYAN}cloud${RESET}" >&2
         exit 2
         ;;
     esac
@@ -1296,25 +1450,38 @@ case "${cmd}" in
       echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, listening ${FG_CYAN}$(zenoh_listen_summary)${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
     fi
     echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
-    echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    if [[ "${role}" == "teammate" ]]; then
+      echo -e "  relay      HoloLens TCP -> local ROS 2 -> Zenoh"
+    else
+      echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    fi
     if [[ "${role}" == "cloud" ]]; then
       if turn_enabled; then
         echo -e "  turn       ${FG_CYAN}enabled${RESET}, udp/tcp ${TURN_PORT:-3478}, relay ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}"
       else
         echo -e "  turn       ${FG_MUTED}disabled${RESET}"
       fi
-    elif [[ "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ]]; then
+    elif [[ "${role}" != "teammate" && ( "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ) ]]; then
       echo -e "  turn       ${FG_CYAN}fallback configured${RESET}"
     fi
-    if [[ "$(webrtc_control_enabled)" == "1" ]]; then
-      echo -e "  control    ${FG_YELLOW}WebRTC DataChannel enabled${RESET}, ROS topic ${ROS_CMD_TOPIC:-/cmd_vel}"
+    if [[ "${role}" == "teammate" ]]; then
+      echo -e "  teammate  ${FG_CYAN}${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}${RESET}"
+      echo -e "  hololens  ${FG_CYAN}${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-unset}}${RESET}"
+      echo -e "  fpv        ${FG_CYAN}${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}${RESET}, ROS compressed image"
     else
-      echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}, WebRTC video only"
+      if [[ "$(webrtc_control_enabled)" == "1" ]]; then
+        echo -e "  control    ${FG_YELLOW}WebRTC DataChannel enabled${RESET}, ROS topic ${ROS_CMD_TOPIC:-/cmd_vel}"
+      else
+        echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}, WebRTC video only"
+      fi
+      echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
     fi
-    echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
-    if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+    if [[ "${role}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720}${RESET} @ ${FG_CYAN}${WEBRTC_VIDEO_FPS:-30} fps${RESET}, source ${WEBRTC_VIDEO_SOURCE:-ros2}"
       echo -e "  ros image  ${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-/camera/image_raw}"
+      if [[ "${role}" == "robot" || "${role}" == "machine" ]]; then
+        print_webrtc_stream_summary "${role}"
+      fi
     fi
     echo -e "  ros        ${ROS_DISTRO:-jazzy}, domain ${FG_CYAN}${ROS_DOMAIN_ID:-0}${RESET}"
     echo ""
@@ -1340,6 +1507,14 @@ case "${cmd}" in
           log_warn "Zenoh is disabled for this launch."
         fi
         launch_webrtc_receiver machine
+        ;;
+      teammate)
+        if zenoh_enabled; then
+          launch_zenoh_client teammate "$(zenoh_connect_target teammate)"
+        else
+          log_warn "Zenoh is disabled for this launch."
+        fi
+        launch_field_teammate
         ;;
       cloud)
         if zenoh_enabled; then
@@ -1387,6 +1562,10 @@ case "${cmd}" in
     }
 
     stop_one_styled webrtc
+    for stream_pid in "${RUN_DIR}"/webrtc-*.pid; do
+      [[ -e "${stream_pid}" ]] || continue
+      stop_one_styled "$(basename "${stream_pid}" .pid)"
+    done
     stop_one_styled signal
     rm -f "${RUN_DIR}/signal_members.json"
     if turn_enabled; then
@@ -1401,6 +1580,7 @@ case "${cmd}" in
       echo -e "  turn        ${FG_MUTED}disabled${RESET}"
     fi
     stop_one_styled metrics
+    stop_one_styled teammate
     stop_one_styled fake-data
 
     if [[ "${ZENOH_BRIDGE_RUNTIME:-binary}" == "docker" ]]; then
@@ -1438,17 +1618,26 @@ case "${cmd}" in
     domain="${ROS_DOMAIN_ID:-0}"
     ns="${ZENOH_NAMESPACE:-/}"
     echo -e "  ros        ${FG_CYAN}${distro}${RESET}, domain ${FG_CYAN}${domain}${RESET}, namespace ${FG_CYAN}${ns}${RESET}"
-    echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
-    if [[ "$(webrtc_control_enabled)" == "1" ]]; then
-      echo -e "  control    ${FG_YELLOW}WebRTC DataChannel${RESET}"
+    if [[ "${HORUS_ROLE:-robot}" == "teammate" ]]; then
+      echo -e "  teammate  ${FG_CYAN}${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}${RESET}"
+      echo -e "  hololens  ${FG_CYAN}${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-unset}}${RESET}"
+      echo -e "  fpv        ${FG_CYAN}${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}${RESET}"
     else
-      echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}"
+      echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
+      if [[ "$(webrtc_control_enabled)" == "1" ]]; then
+        echo -e "  control    ${FG_YELLOW}WebRTC DataChannel${RESET}"
+      else
+        echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}"
+      fi
     fi
-    if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+    if [[ "${HORUS_ROLE:-robot}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720} @ ${WEBRTC_VIDEO_FPS:-30} fps${RESET}"
       echo -e "  source     ${FG_CYAN}${WEBRTC_VIDEO_SOURCE:-ros2}${RESET}"
       if [[ "${WEBRTC_VIDEO_SOURCE:-ros2}" == "ros2" ]]; then
         echo -e "  image in   ${FG_CYAN}${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-/camera/image_raw}${RESET}"
+      fi
+      if [[ "${HORUS_ROLE:-robot}" == "robot" || "${HORUS_ROLE:-robot}" == "machine" ]]; then
+        print_webrtc_stream_summary "${HORUS_ROLE:-robot}"
       fi
     fi
     zenoh_target="$(zenoh_connect_target "${HORUS_ROLE:-robot}")"
@@ -1458,7 +1647,11 @@ case "${cmd}" in
       echo -e "  zenoh      listening $(zenoh_listen_summary)"
     fi
     echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
-    echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    if [[ "${HORUS_ROLE:-robot}" == "teammate" ]]; then
+      echo -e "  relay      HoloLens TCP -> local ROS 2 -> Zenoh"
+    else
+      echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
+    fi
     if [[ -f "${ROOT}/.webrtc_profile.env" ]]; then
       load_key_value_file "${ROOT}/.webrtc_profile.env"
       encoder="${GST_H264_ENCODER_NAME:-unknown}"
@@ -1471,7 +1664,11 @@ case "${cmd}" in
     status_zenoh
     status_one signal
     status_turn
-    status_one webrtc
+    if [[ "${HORUS_ROLE:-robot}" == "teammate" ]]; then
+      status_one teammate
+    else
+      status_webrtc_streams
+    fi
     status_one metrics
     status_one fake-data
     echo ""
@@ -1559,7 +1756,7 @@ case "${cmd}" in
           exit 1
         fi
         ;;
-      zenoh|webrtc|signal|metrics|fake-data)
+      zenoh|webrtc|webrtc-*|signal|metrics|teammate|fake-data)
       print_banner
         log_file="${RUN_DIR}/${service}.log"
         size_bytes=0
@@ -1594,7 +1791,7 @@ case "${cmd}" in
       *)
         log_error "Invalid service specified."
         echo -e "${BOLD}Usage:${RESET}"
-        echo -e "  ./horus logs ${FG_GREEN}[zenoh|webrtc|signal|turn|metrics|fake-data]${RESET}\n" >&2
+        echo -e "  ./horus logs ${FG_GREEN}[zenoh|webrtc|webrtc-<stream>|signal|turn|metrics|teammate|fake-data]${RESET}\n" >&2
         exit 2
         ;;
     esac

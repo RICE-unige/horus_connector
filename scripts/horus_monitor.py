@@ -49,6 +49,7 @@ MONITOR_ROS_NODES = {"/horus_monitor_topic_probe"}
 ROLE_SUMMARIES = {
     "robot": "robot endpoint - sends camera/state, receives cmd_vel",
     "machine": "machine endpoint - receives camera/state, sends cmd_vel",
+    "teammate": "field teammate endpoint - publishes HoloLens pose/FPV, receives guidance",
     "cloud": "cloud hub - routes Zenoh and WebRTC signaling",
 }
 
@@ -113,6 +114,58 @@ def load_env(root: Path, env_path: Path) -> Dict[str, str]:
     values.update(load_env_file(root / ".zenoh_profile.env"))
     values.update(load_env_file(root / ".zenoh_tls_profile.env"))
     return values
+
+
+def configured_stream_topics(env: Dict[str, str], root: Path) -> List[str]:
+    configured = env.get("HORUS_STREAMS_CONFIG", "config/webrtc_streams.json")
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.debug("Failed to load stream config from %s", path, exc_info=True)
+        return []
+    streams = data.get("streams", []) if isinstance(data, dict) else data
+    if not isinstance(streams, list):
+        return []
+    topics: List[str] = []
+    for stream in streams:
+        if not isinstance(stream, dict) or stream.get("enabled", True) is False:
+            continue
+        for key in ("input_topic", "output_topic"):
+            value = str(stream.get(key) or "")
+            if value.startswith("/") and value not in topics:
+                topics.append(value)
+    return topics
+
+
+def configured_webrtc_services(env: Dict[str, str], root: Path) -> List[str]:
+    configured = env.get("HORUS_STREAMS_CONFIG", "config/webrtc_streams.json")
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    if not path.exists():
+        return ["webrtc"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.debug("Failed to load WebRTC stream services from %s", path, exc_info=True)
+        return ["webrtc"]
+    streams = data.get("streams", []) if isinstance(data, dict) else data
+    if not isinstance(streams, list):
+        return ["webrtc"]
+    enabled = [stream for stream in streams if isinstance(stream, dict) and stream.get("enabled", True) is not False]
+    if len(enabled) <= 1:
+        return ["webrtc"]
+    services: List[str] = []
+    for index, stream in enumerate(enabled):
+        raw_id = str(stream.get("id") or stream.get("name") or f"camera-{index + 1}")
+        identifier = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_id.strip().lower()).strip("-") or f"camera-{index + 1}"
+        services.append(f"webrtc-{identifier}")
+    return services
 
 
 def read_pid(path: Path) -> Optional[int]:
@@ -180,6 +233,22 @@ def process_state(run_dir: Path, name: str) -> ProcessState:
             state.cpu = parts[1]
             state.mem = parts[2]
     return state
+
+
+def webrtc_service_names(run_dir: Path) -> List[str]:
+    names = ["webrtc"]
+    for path in sorted(run_dir.glob("webrtc-*.pid")):
+        if path.stem not in names:
+            names.append(path.stem)
+    return names
+
+
+def combined_webrtc_logs(logs: Dict[str, List[str]]) -> List[str]:
+    combined: List[str] = []
+    for name, lines in logs.items():
+        if name == "webrtc" or name.startswith("webrtc-"):
+            combined.extend(lines)
+    return combined
 
 
 def format_elapsed(seconds: int) -> str:
@@ -480,15 +549,17 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
     signal_port = int(env.get("WEBRTC_SIGNAL_PORT", "8765") or 8765)
     turn_port = int(env.get("TURN_PORT", "3478") or 3478)
 
-    processes = {
-        name: process_state(run_dir, name)
-        for name in ("zenoh", "webrtc", "signal", "turn")
-    }
+    stream_services = configured_webrtc_services(env, root)
+    process_names = ["zenoh", "signal", "turn", "teammate", *stream_services, *webrtc_service_names(run_dir)]
+    process_names = list(dict.fromkeys(process_names))
+    processes = {name: process_state(run_dir, name) for name in process_names}
     logs = {
         "zenoh": tail(run_dir / "zenoh.log", lines=2000),
-        "webrtc": tail(run_dir / "webrtc.log", lines=1000),
         "signal": tail(run_dir / "signal.log", lines=1000),
+        "teammate": tail(run_dir / "teammate.log", lines=1000) if role == "teammate" else [],
     }
+    for name in list(dict.fromkeys([*stream_services, *webrtc_service_names(run_dir)])):
+        logs[name] = tail(run_dir / f"{name}.log", lines=1000)
     listeners = local_listeners([zenoh_port, signal_port, turn_port])
     topics = ros_topics(env, root, cache, force_refresh)
 
@@ -497,9 +568,10 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
     signal = processes["signal"]
     signal_state = load_signal_members_state(run_dir / "signal_members.json") if signal.running else []
     signal_members = signal_state or active_signal_members(logs["signal"])
-    webrtc_peers = active_webrtc_peers(logs["webrtc"], limit=8)
-    webrtc_clients = active_webrtc_clients(logs["webrtc"], limit=8)
-    webrtc_registered = webrtc_registrations(logs["webrtc"])
+    webrtc_lines = combined_webrtc_logs(logs)
+    webrtc_peers = active_webrtc_peers(webrtc_lines, limit=8)
+    webrtc_clients = active_webrtc_clients(webrtc_lines, limit=8)
+    webrtc_registered = webrtc_registrations(webrtc_lines)
 
     ips = local_ips()
     ts_ips = tailscale_ips()
@@ -508,10 +580,11 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
     target_ports = {}
     if target:
         target_ports[zenoh_port] = tcp_open(target, zenoh_port)
-        target_ports[signal_port] = webrtc_signaling_state(logs["webrtc"])
+        target_ports[signal_port] = webrtc_signaling_state(webrtc_lines)
 
     return {
         "env": env,
+        "root": str(root),
         "role": role,
         "topology": topology,
         "ports": {"zenoh": zenoh_port, "signal": signal_port, "turn": turn_port},
@@ -537,9 +610,9 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
 def connection_target(env: Dict[str, str]) -> str:
     role = env.get("HORUS_ROLE", "robot")
     topology = env.get("HORUS_TOPOLOGY", "hub")
-    if topology == "direct" and role == "robot":
+    if topology == "direct" and role in {"robot", "teammate"}:
         return env.get("HORUS_MACHINE_IP", "")
-    if topology == "hub" and role in {"robot", "machine"}:
+    if topology == "hub" and role in {"robot", "machine", "teammate"}:
         return env.get("HORUS_CLOUD_IP", "")
     return ""
 
@@ -598,40 +671,73 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
     else:
         services.append(ServiceState("Zenoh", "RUN", f"pid {zenoh.pid}, uptime {zenoh.etime}", "info"))
 
-    webrtc = processes["webrtc"]
-    webrtc_log = "\n".join(logs["webrtc"][-120:])
-    if role == "cloud":
-        signal = processes["signal"]
-        if not signal.running:
-            services.append(ServiceState("WebRTC", "DOWN", "signaling relay is not running", "down"))
+    if role == "teammate":
+        teammate = processes["teammate"]
+        teammate_log = "\n".join(logs["teammate"][-160:])
+        if not teammate.running:
+            services.append(ServiceState("Teammate", "DOWN", "HoloLens relay is not running", "down"))
         else:
-            detail = "relay running"
-            if state["signal_members"]:
-                detail = "members: " + ", ".join(state["signal_members"][-4:])  # type: ignore[index]
-            services.append(ServiceState("WebRTC", "OK", detail, "ok"))
-    elif not webrtc.running:
-        services.append(ServiceState("WebRTC", "DOWN", "process is not running", "down"))
-    elif "Incoming RTP video" in webrtc_log:
-        services.append(ServiceState("WebRTC", "VIDEO", "RTP video connected and receiver pipeline active", "ok"))
-    elif role == "robot" and ("ROS image appsrc rate" in webrtc_log or "ROS image appsrc caps" in webrtc_log):
-        detail = "camera stream publishing"
-        if "cmd-vel DataChannel open" in webrtc_log or "DataChannel received" in webrtc_log:
-            detail += "; control DataChannel connected"
-        services.append(ServiceState("WebRTC", "VIDEO", detail, "ok"))
-    elif "cmd-vel DataChannel open" in webrtc_log or "DataChannel received" in webrtc_log:
-        services.append(ServiceState("WebRTC", "CTRL", "control DataChannel connected, waiting for video", "warn"))
-    elif "WebRTC signaling peer connected" in webrtc_log or "WebRTC signaling connected" in webrtc_log:
-        peer = ", ".join(named_webrtc_members(state, logs)) or infer_webrtc_peer(logs["webrtc"]) or "signaling peer connected"
-        services.append(ServiceState("WebRTC", "SIGNAL", peer, "info"))
-    elif "signaling reconnect after error" in webrtc_log or "Connection refused" in webrtc_log:
-        detail = find_last(logs["webrtc"], ["signaling reconnect after error", "Connection refused"])
-        services.append(ServiceState("WebRTC", "WARN", truncate(detail, 90), "warn"))
-    elif topology == "direct" and role == "machine" and ports["signal"] in listeners:
-        services.append(ServiceState("WebRTC", "LISTEN", f"waiting on ws://0.0.0.0:{ports['signal']}", "info"))
-    elif state["target"] and target_ports.get(ports["signal"]) is True:
-        services.append(ServiceState("WebRTC", "OPEN", f"target ws://{state['target']}:{ports['signal']} reachable", "info"))
+            connected = []
+            if "Connected to HoloLens PV video stream." in teammate_log:
+                connected.append("pv")
+            if "Connected to HoloLens pose stream." in teammate_log:
+                connected.append("pose")
+            if "Connected to HoloLens control stream." in teammate_log:
+                connected.append("control")
+            if connected:
+                services.append(ServiceState("Teammate", "OK", "HoloLens streams: " + ", ".join(connected), "ok"))
+            elif "HoloLens" in teammate_log and ("unavailable" in teammate_log or "error" in teammate_log):
+                detail = find_last(logs["teammate"], ["HoloLens", "unavailable", "error"])
+                services.append(ServiceState("Teammate", "WARN", truncate(detail, 90), "warn"))
+            else:
+                services.append(ServiceState("Teammate", "RUN", f"pid {teammate.pid}, uptime {teammate.etime}", "info"))
     else:
-        services.append(ServiceState("WebRTC", "RUN", f"pid {webrtc.pid}, uptime {webrtc.etime}", "info"))
+        webrtc = processes["webrtc"]
+        webrtc_names = [name for name in processes if name == "webrtc" or name.startswith("webrtc-")]
+        configured_streams = [name for name in webrtc_names if name.startswith("webrtc-")]
+        running_streams = [name for name in webrtc_names if processes[name].running]
+        webrtc_log = "\n".join(combined_webrtc_logs(logs)[-200:])
+        if role == "cloud":
+            signal = processes["signal"]
+            if not signal.running:
+                services.append(ServiceState("WebRTC", "DOWN", "signaling relay is not running", "down"))
+            else:
+                detail = "relay running"
+                if state["signal_members"]:
+                    detail = "members: " + ", ".join(state["signal_members"][-4:])  # type: ignore[index]
+                services.append(ServiceState("WebRTC", "OK", detail, "ok"))
+        elif configured_streams:
+            if not running_streams:
+                services.append(ServiceState("WebRTC", "DOWN", f"{len(configured_streams)} stream process(es) are stopped", "down"))
+            elif len(running_streams) == len(configured_streams):
+                names = ", ".join(name.replace("webrtc-", "") for name in running_streams[:4])
+                services.append(ServiceState("WebRTC", "OK", f"{len(running_streams)} stream(s): {names}", "ok"))
+            else:
+                missing = [name.replace("webrtc-", "") for name in configured_streams if not processes[name].running]
+                services.append(ServiceState("WebRTC", "WARN", "missing stream(s): " + ", ".join(missing[:4]), "warn"))
+        elif not webrtc.running:
+            services.append(ServiceState("WebRTC", "DOWN", "process is not running", "down"))
+        elif "Incoming RTP video" in webrtc_log:
+            services.append(ServiceState("WebRTC", "VIDEO", "RTP video connected and receiver pipeline active", "ok"))
+        elif role == "robot" and ("ROS image appsrc rate" in webrtc_log or "ROS image appsrc caps" in webrtc_log):
+            detail = "camera stream publishing"
+            if "cmd-vel DataChannel open" in webrtc_log or "DataChannel received" in webrtc_log:
+                detail += "; control DataChannel connected"
+            services.append(ServiceState("WebRTC", "VIDEO", detail, "ok"))
+        elif "cmd-vel DataChannel open" in webrtc_log or "DataChannel received" in webrtc_log:
+            services.append(ServiceState("WebRTC", "CTRL", "control DataChannel connected, waiting for video", "warn"))
+        elif "WebRTC signaling peer connected" in webrtc_log or "WebRTC signaling connected" in webrtc_log:
+            peer = ", ".join(named_webrtc_members(state, logs)) or infer_webrtc_peer(combined_webrtc_logs(logs)) or "signaling peer connected"
+            services.append(ServiceState("WebRTC", "SIGNAL", peer, "info"))
+        elif "signaling reconnect after error" in webrtc_log or "Connection refused" in webrtc_log:
+            detail = find_last(combined_webrtc_logs(logs), ["signaling reconnect after error", "Connection refused"])
+            services.append(ServiceState("WebRTC", "WARN", truncate(detail, 90), "warn"))
+        elif topology == "direct" and role == "machine" and ports["signal"] in listeners:
+            services.append(ServiceState("WebRTC", "LISTEN", f"waiting on ws://0.0.0.0:{ports['signal']}", "info"))
+        elif state["target"] and target_ports.get(ports["signal"]) is True:
+            services.append(ServiceState("WebRTC", "OPEN", f"target ws://{state['target']}:{ports['signal']} reachable", "info"))
+        else:
+            services.append(ServiceState("WebRTC", "RUN", f"pid {webrtc.pid}, uptime {webrtc.etime}", "info"))
 
     if role == "cloud":
         turn = processes["turn"]
@@ -852,13 +958,13 @@ def route_line(state: Dict[str, object]) -> str:
     room = str(state["env"].get("HORUS_ROOM", "default"))  # type: ignore[index]
     local_ip = str(state["local_route_ip"])
     target = str(state["target"] or "")
-    if topology == "direct" and role == "robot":
-        return f"robot:{room} {local_ip}  ->  machine:{room} {target or '?'}"
+    if topology == "direct" and role in {"robot", "teammate"}:
+        return f"{role}:{room} {local_ip}  ->  machine:{room} {target or '?'}"
     if topology == "direct" and role == "machine":
         return f"machine:{room} {local_ip}  <-  robot:{room}"
-    if topology == "hub" and role in {"robot", "machine"}:
+    if topology == "hub" and role in {"robot", "machine", "teammate"}:
         return f"{role}:{room} {local_ip}  ->  cloud {target or '?'}"
-    return f"cloud {local_ip}  <-  robots and machines"
+    return f"cloud {local_ip}  <-  endpoints"
 
 
 def route_detail(state: Dict[str, object], env: Dict[str, str]) -> str:
@@ -872,9 +978,24 @@ def route_detail(state: Dict[str, object], env: Dict[str, str]) -> str:
         zenoh = "listening" if processes["zenoh"].running and ports["zenoh"] in listeners else "stopped"
         webrtc_process = processes["signal"] if role == "cloud" else processes["webrtc"]
         webrtc = "listening" if webrtc_process.running and ports["signal"] in listeners else "stopped"
+    elif role == "teammate":
+        zenoh = "stopped" if not processes["zenoh"].running else "open" if target_ports.get(ports["zenoh"]) is True else "closed"
+        teammate = "running" if processes["teammate"].running else "stopped"
+        detail = (
+            f"zenoh {zenoh_transport_name(env)}/{ports['zenoh']} {zenoh}   "
+            f"teammate relay {teammate}   "
+            f"domain {env.get('ROS_DOMAIN_ID', '0')}   namespace {env.get('ZENOH_NAMESPACE', '/') or '/'}"
+        )
+        hololens = env.get("FIELD_TEAMMATE_HOLOLENS_HOST", "")
+        if hololens:
+            detail += f"   hololens {hololens}"
+        return detail
     else:
         zenoh = "stopped" if not processes["zenoh"].running else "open" if target_ports.get(ports["zenoh"]) is True else "closed"
-        signal = target_ports.get(ports["signal"]) if processes["webrtc"].running else None
+        any_webrtc_running = any(
+            proc.running for name, proc in processes.items() if name == "webrtc" or name.startswith("webrtc-")
+        )
+        signal = target_ports.get(ports["signal"]) if any_webrtc_running else None
         webrtc = "connected" if signal is True else "reconnecting" if signal is False else "stopped"
     detail = (
         f"zenoh {zenoh_transport_name(env)}/{ports['zenoh']} {zenoh}   "
@@ -915,12 +1036,25 @@ def connection_focus(state: Dict[str, object], logs: Dict[str, List[str]], env: 
     zenoh_proc = processes.get("zenoh")
     webrtc_proc = processes.get("webrtc")
     signal_proc = processes.get("signal")
+    any_webrtc_running = any(
+        proc.running for name, proc in processes.items() if name == "webrtc" or name.startswith("webrtc-")
+    )
+    any_webrtc_running = any(
+        proc.running for name, proc in processes.items() if name == "webrtc" or name.startswith("webrtc-")
+    )
     if zenoh_names and (not zenoh_proc or zenoh_proc.running):
         parts.append("zenoh -> " + ",".join(zenoh_names))
-    if webrtc_names and ((webrtc_proc and webrtc_proc.running) or (signal_proc and signal_proc.running)):
+    if str(state["role"]) != "teammate" and webrtc_names and (any_webrtc_running or (signal_proc and signal_proc.running)):
         parts.append("webrtc -> " + ",".join(webrtc_names))
+    if str(state["role"]) == "teammate":
+        hololens = env.get("FIELD_TEAMMATE_HOLOLENS_HOST", "")
+        if hololens:
+            parts.append("hololens -> " + hololens)
+        name = env.get("FIELD_TEAMMATE_NAME") or env.get("HORUS_ROOM", "field_teammate_1")
+        safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_") or "field_teammate_1"
+        parts.append(f"fpv -> /{safe_name}/fpv/image_raw/compressed")
     camera = env.get("WEBRTC_ROS_IMAGE_OUTPUT_TOPIC") or env.get("WEBRTC_ROS_IMAGE_INPUT_TOPIC", "")
-    if camera:
+    if camera and str(state["role"]) != "teammate":
         parts.append("camera -> " + camera)
     return "   ".join(parts) if parts else "waiting for named peers"
 
@@ -940,7 +1074,7 @@ def named_zenoh_members(state: Dict[str, object]) -> List[str]:
     if topology == "direct":
         if role == "machine":
             return [f"robot:{room}"]
-        if role == "robot":
+        if role in {"robot", "teammate"}:
             return [f"machine:{room}"]
     signal_members: List[str] = state["signal_members"]  # type: ignore[assignment]
     if role == "cloud":
@@ -952,6 +1086,8 @@ def named_zenoh_members(state: Dict[str, object]) -> List[str]:
 def named_webrtc_members(state: Dict[str, object], logs: Dict[str, List[str]]) -> List[str]:
     env: Dict[str, str] = state["env"]  # type: ignore[assignment]
     role = str(state["role"])
+    if role == "teammate":
+        return []
     topology = str(state["topology"])
     room = env.get("HORUS_ROOM", "default")
     processes: Dict[str, ProcessState] = state["processes"]  # type: ignore[assignment]
@@ -960,8 +1096,10 @@ def named_webrtc_members(state: Dict[str, object], logs: Dict[str, List[str]]) -
         if signal_proc and not signal_proc.running:
             return []
     else:
-        webrtc_proc = processes.get("webrtc")
-        if webrtc_proc and not webrtc_proc.running:
+        any_webrtc_running = any(
+            proc.running for name, proc in processes.items() if name == "webrtc" or name.startswith("webrtc-")
+        )
+        if not any_webrtc_running:
             return []
     registered: List[str] = state["webrtc_registrations"]  # type: ignore[assignment]
     peers: List[str] = state["webrtc_peers"]  # type: ignore[assignment]
@@ -973,17 +1111,17 @@ def named_webrtc_members(state: Dict[str, object], logs: Dict[str, List[str]]) -
         return signal_members
     if topology == "direct" and role == "machine" and peers:
         return [f"robot:{room} @ {summarize_webrtc_endpoint(peers[-1])}"]
-    if topology == "direct" and role == "robot" and (clients or infer_webrtc_peer(logs["webrtc"])):
+    if topology == "direct" and role == "robot" and (clients or infer_webrtc_peer(combined_webrtc_logs(logs))):
         target = str(state["target"] or "")
         return [f"machine:{room}" + (f" @ {target}" if target else "")]
-    if topology == "hub" and role in {"robot", "machine"} and (clients or infer_webrtc_peer(logs["webrtc"])):
+    if topology == "hub" and role in {"robot", "machine"} and (clients or infer_webrtc_peer(combined_webrtc_logs(logs))):
         target = str(state["target"] or "")
         return [f"cloud" + (f" @ {target}" if target else "")]
     return []
 
 
 def group_role_members(members: Sequence[str]) -> Dict[str, List[str]]:
-    grouped: Dict[str, List[str]] = {"robot": [], "machine": []}
+    grouped: Dict[str, List[str]] = {"robot": [], "machine": [], "teammate": []}
     for member in members:
         if ":" not in member:
             continue
@@ -1024,14 +1162,18 @@ def endpoint_lines(state: Dict[str, object], use_color: bool) -> List[str]:
         grouped = group_role_members(signal_members)
         robots = ", ".join(grouped.get("robot", [])) or "none"
         machines = ", ".join(grouped.get("machine", [])) or "none"
-        lines.append(f"users   robots {robots}   machines {machines}")
+        teammates = ", ".join(grouped.get("teammate", [])) or "none"
+        lines.append(f"users   robots {robots}   machines {machines}   teammates {teammates}")
         rooms = room_presence(signal_members)
-        lines.append("rooms   " + (", ".join(rooms) if rooms else "waiting for robot and machine endpoints"))
+        lines.append("rooms   " + (", ".join(rooms) if rooms else "waiting for endpoints"))
     else:
         webrtc_names: List[str] = state["webrtc_registrations"]  # type: ignore[assignment]
-        peer_type = "machine" if role == "robot" else "robot"
-        peer = ", ".join(webrtc_names) if webrtc_names else f"no {peer_type} peer yet"
-        lines.append(f"users   local {role}:{room}   remote {peer}")
+        if role == "teammate":
+            lines.append(f"users   local {role}:{room}   remote guidance over Zenoh")
+        else:
+            peer_type = "machine" if role == "robot" else "robot"
+            peer = ", ".join(webrtc_names) if webrtc_names else f"no {peer_type} peer yet"
+            lines.append(f"users   local {role}:{room}   remote {peer}")
     return lines
 
 
@@ -1043,6 +1185,11 @@ def member_lines(state: Dict[str, object], logs: Dict[str, List[str]], use_color
     zenoh_proc = processes.get("zenoh")
     webrtc_proc = processes.get("webrtc")
     signal_proc = processes.get("signal")
+    any_webrtc_running = any(
+        proc.running
+        for name, proc in processes.items()
+        if name == "webrtc" or name.startswith("webrtc-")
+    )
 
     lines.extend(endpoint_lines(state, use_color))
 
@@ -1053,13 +1200,20 @@ def member_lines(state: Dict[str, object], logs: Dict[str, List[str]], use_color
     else:
         lines.append("zenoh   no named peer yet")
 
-    webrtc_running = bool((webrtc_proc and webrtc_proc.running) or (signal_proc and signal_proc.running))
-    if not webrtc_running:
-        lines.append("webrtc  service stopped")
-    elif webrtc_names:
-        lines.append("webrtc  connected to " + ", ".join(webrtc_names))
+    if str(state["role"]) == "teammate":
+        teammate_proc = processes.get("teammate")
+        if teammate_proc and teammate_proc.running:
+            lines.append("relay   HoloLens relay running")
+        else:
+            lines.append("relay   service stopped")
     else:
-        lines.append("webrtc  no named peer yet")
+        webrtc_running = bool(any_webrtc_running or (signal_proc and signal_proc.running))
+        if not webrtc_running:
+            lines.append("webrtc  service stopped")
+        elif webrtc_names:
+            lines.append("webrtc  connected to " + ", ".join(webrtc_names))
+        else:
+            lines.append("webrtc  no named peer yet")
     ros_nodes: List[str] = state["ros_nodes"]  # type: ignore[assignment]
     visible_nodes = [node for node in ros_nodes if "_ros2cli_daemon" not in node]
     if visible_nodes:
@@ -1074,6 +1228,20 @@ def ros_lines(state: Dict[str, object], env: Dict[str, str]) -> List[str]:
     camera_in = env.get("WEBRTC_ROS_IMAGE_INPUT_TOPIC", "/camera/image_raw")
     camera_out = env.get("WEBRTC_ROS_IMAGE_OUTPUT_TOPIC", "/camera/webrtc/image_raw")
     key_topics = ["/odom", "/scan", "/tf", "/joint_states", "/points", camera_in, camera_out]
+    key_topics.extend(configured_stream_topics(env, Path(str(state.get("root", ".")))))
+    if env.get("HORUS_ROLE") == "teammate":
+        name = env.get("FIELD_TEAMMATE_NAME") or env.get("HORUS_ROOM", "field_teammate_1")
+        safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_") or "field_teammate_1"
+        key_topics.extend(
+            [
+                f"/{safe_name}/status",
+                f"/{safe_name}/localization_confidence",
+                f"/{safe_name}/fpv/image_raw/compressed",
+                f"/{safe_name}/fpv/camera_info",
+                f"/{safe_name}/guidance/request",
+                f"/{safe_name}/guidance/response",
+            ]
+        )
     visible = [topic for topic in key_topics if topic and topic in topics]
     lines = [f"{len(topics)} visible topic(s)"]
     if visible:
@@ -1137,6 +1305,12 @@ def recent_events(logs: Dict[str, List[str]]) -> List[str]:
         "cmd_vel watchdog",
         "GStreamer recovery",
         "Robot GStreamer pipeline recovered",
+        "Live HoloLens relay started",
+        "Connected to HoloLens",
+        "HoloLens PV frame size",
+        "HoloLens video stream",
+        "HoloLens pose stream",
+        "HoloLens control stream",
     ]
     events = []
     for name, lines in logs.items():
@@ -1227,6 +1401,18 @@ def format_event(name: str, line_item: str) -> str:
         return "webrtc: media pipeline recovery scheduled"
     if "Robot GStreamer pipeline recovered" in line_item:
         return "webrtc: media pipeline recovered"
+    if "Live HoloLens relay started" in line_item:
+        return "teammate: HoloLens relay started"
+    if "Connected to HoloLens PV video stream" in line_item:
+        return "teammate: HoloLens video stream connected"
+    if "Connected to HoloLens pose stream" in line_item:
+        return "teammate: HoloLens pose stream connected"
+    if "Connected to HoloLens control stream" in line_item:
+        return "teammate: HoloLens control stream connected"
+    if "HoloLens PV frame size" in line_item:
+        return "teammate: " + line_item.split("HoloLens PV frame size", 1)[-1].strip(": ")
+    if "HoloLens" in line_item and ("unavailable" in line_item or "error" in line_item):
+        return f"teammate: {line_item}"
     if "Unable to connect" in line_item or "Failed to start" in line_item:
         return f"{name}: {line_item}"
     if "ROS image appsrc rate" in line_item:

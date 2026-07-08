@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import secrets
@@ -17,6 +18,7 @@ from pathlib import Path
 ROLE_HELP = {
     "robot": "Robot-side system. Sends camera and state, receives velocity commands.",
     "machine": "Operator/local machine. Receives camera and robot state.",
+    "teammate": "Field teammate relay. Publishes HoloLens pose/FPV and receives guidance.",
     "cloud": "Shared hub. Runs Zenoh routing and WebRTC signaling only.",
 }
 
@@ -35,6 +37,13 @@ VIDEO_PRESETS = {
     "standard": (1280, 720, 30, 6000),
     "light": (960, 540, 30, 1600),
     "high": (1920, 1080, 30, 8000),
+}
+
+TEAMMATE_VIDEO_PROFILES = {
+    "fast60": "640x360@60, low-latency first-person view. Recommended.",
+    "balanced": "640x360@30, lower CPU/network load.",
+    "hd720": "1280x720@30, higher detail.",
+    "app": "Keep the HoloLens app's current video profile.",
 }
 
 
@@ -68,6 +77,7 @@ class Wizard:
         self.interactive = sys.stdin.isatty() and not args.yes
         self.existing = read_env(self.env_path)
         self.values: dict[str, str] = {}
+        self.streams: list[dict[str, object]] = []
         self.step_counter = 0
 
     def header(self) -> None:
@@ -205,13 +215,20 @@ class Wizard:
             room = "default"
             print(f"Cloud room uses: {self.color.paint(room, 'green')}\n")
         else:
-            self.section(3, total, "Robot identity")
+            identity_title = "Teammate identity" if role == "teammate" else "Robot identity"
+            identity_label = "Teammate name" if role == "teammate" else "Room / robot name"
+            identity_hint = (
+                "Use one stable name for this field teammate, for example teammate-a."
+                if role == "teammate"
+                else "Use one stable name per robot, for example robot-a or mobile-base-01."
+            )
+            self.section(3, total, identity_title)
             room = self.prompt_text(
-                "Room / robot name",
+                identity_label,
                 default_room,
                 required=True,
                 validator=is_name,
-                hint="Use one stable name per robot, for example robot-a or mobile-base-01.",
+                hint=identity_hint,
             )
 
         if role == "cloud":
@@ -226,18 +243,18 @@ class Wizard:
                 cloud_default,
                 required=True,
                 validator=is_host,
-                hint="Robots and machines use this to reach the hub.",
+                hint="Endpoints use this to reach the hub.",
             )
             machine_ip = ""
         else:
             cloud_ip = self.args.cloud_ip or ""
-            if role == "robot":
+            if role in {"robot", "teammate"}:
                 machine_ip = self.prompt_text(
                     "Operator machine VPN/LAN IP or DNS name",
                     machine_default,
                     required=True,
                     validator=is_host,
-                    hint="You selected robot. In direct mode, the robot connects to the operator machine at this address.",
+                    hint=f"You selected {role}. In direct mode, this endpoint connects to the operator machine at this address.",
                 )
             else:
                 machine_ip = self.prompt_text(
@@ -258,7 +275,7 @@ class Wizard:
             namespace_default = f"/{ros_safe_name(room)}" if role == "robot" else ""
         namespace = namespace_default
         print(f"Zenoh namespace: {self.color.paint(namespace or '-', 'green')}")
-        print("  Robots use /robot_name. Machines and cloud usually stay empty.\n")
+        print("  Robots use /robot_name. Machines, teammates, and cloud usually stay empty.\n")
         zenoh_transport = self.prompt_choice(
             "Zenoh transport",
             list(ZENOH_TRANSPORT_HELP),
@@ -280,6 +297,22 @@ class Wizard:
             auto_enable_quic = existing_quic
 
         self.section(6, total, "Camera and runtime")
+        existing_role = self.existing.get("HORUS_ROLE")
+        existing_teammate_name = self.existing.get("FIELD_TEAMMATE_NAME") if existing_role == "teammate" else ""
+        teammate_name = self.args.teammate_name or existing_teammate_name or room
+        hololens_host = (
+            self.args.hololens_host
+            or self.existing.get("FIELD_TEAMMATE_HOLOLENS_HOST")
+            or self.existing.get("HOLOLENS_HOST", "")
+        )
+        teammate_video_profile = self.args.teammate_video_profile or valid_or(
+            self.existing.get("FIELD_TEAMMATE_VIDEO_PROFILE"),
+            TEAMMATE_VIDEO_PROFILES,
+            "fast60",
+        )
+        teammate_raw_image = self.args.teammate_raw_image or (
+            self.existing.get("FIELD_TEAMMATE_RAW_IMAGE", "0").lower() in {"1", "true", "yes", "on"}
+        )
         if role in {"robot", "machine"}:
             camera_default = self.args.camera_topic or self.existing.get("WEBRTC_ROS_IMAGE_INPUT_TOPIC") or "/camera/image_raw"
             output_default = self.camera_output_default(role, room)
@@ -315,6 +348,54 @@ class Wizard:
                 {"stable": "", "hardware": "", "software": ""},
                 "stable",
             )
+            self.streams = self.configure_webrtc_streams(
+                role,
+                room,
+                camera_topic,
+                output_topic,
+                width,
+                height,
+                fps,
+                bitrate,
+            )
+        elif role == "teammate":
+            teammate_name = self.prompt_text(
+                "Teammate ROS name",
+                teammate_name,
+                required=True,
+                validator=is_name,
+                hint="This becomes the ROS topic prefix, for example /teammate-a/fpv/image_raw/compressed.",
+            )
+            hololens_host = self.prompt_text(
+                "HoloLens IP or DNS name",
+                hololens_host,
+                required=True,
+                validator=is_host,
+                hint="Use the address shown by the HORUS Lenses status panel.",
+            )
+            teammate_video_profile = self.prompt_choice(
+                "HoloLens video profile",
+                list(TEAMMATE_VIDEO_PROFILES),
+                teammate_video_profile,
+                TEAMMATE_VIDEO_PROFILES,
+            )
+            teammate_raw_image = self.prompt_yes_no(
+                "Also publish decoded raw image locally?",
+                teammate_raw_image,
+                "Compressed FPV is transported by default. Raw image is only for local viewers/debugging.",
+            )
+            safe_name = ros_safe_name(teammate_name)
+            camera_topic = f"/{safe_name}/fpv/image_raw/compressed"
+            output_topic = camera_topic
+            if teammate_video_profile == "hd720":
+                width, height, fps = 1280, 720, 30
+            elif teammate_video_profile == "balanced":
+                width, height, fps = 640, 360, 30
+            else:
+                width, height, fps = 640, 360, 60
+            bitrate = int(self.existing.get("VIDEO_BITRATE_KBIT", "6000"))
+            encoder_preference = "stable"
+            self.streams = []
         else:
             camera_topic = self.existing.get("WEBRTC_ROS_IMAGE_INPUT_TOPIC", "/camera/image_raw")
             output_topic = self.existing.get("WEBRTC_ROS_IMAGE_OUTPUT_TOPIC", "/camera/webrtc/image_raw")
@@ -323,6 +404,7 @@ class Wizard:
             fps = int(self.existing.get("WEBRTC_VIDEO_FPS", "30"))
             bitrate = int(self.existing.get("VIDEO_BITRATE_KBIT", "6000"))
             encoder_preference = "stable"
+            self.streams = []
             print("Cloud role skips media encoding and decoding.\n")
 
         existing_turn = (
@@ -408,6 +490,7 @@ class Wizard:
             "WEBRTC_ROS_IMAGE_INPUT_TOPIC": camera_topic,
             "WEBRTC_ROS_IMAGE_OUTPUT_TOPIC": output_topic,
             "WEBRTC_ROS_IMAGE_QOS": "auto",
+            "HORUS_STREAMS_CONFIG": "config/webrtc_streams.json",
             "VIDEO_BITRATE_KBIT": str(bitrate),
             "WEBRTC_MIN_BITRATE_KBIT": "1000",
             "WEBRTC_MAX_BITRATE_KBIT": str(bitrate),
@@ -415,6 +498,25 @@ class Wizard:
             "WEBRTC_DECODER_PREFERENCE": encoder_preference,
             "WEBRTC_CONTROL_ENABLED": "0",
             "WEBRTC_ENABLE_CONTROL": "0",
+            "FIELD_TEAMMATE_NAME": teammate_name,
+            "FIELD_TEAMMATE_HOLOLENS_HOST": hololens_host,
+            "FIELD_TEAMMATE_PV_PORT": self.existing.get("FIELD_TEAMMATE_PV_PORT", "3810"),
+            "FIELD_TEAMMATE_SPATIAL_INPUT_PORT": self.existing.get("FIELD_TEAMMATE_SPATIAL_INPUT_PORT", "3814"),
+            "FIELD_TEAMMATE_UMQ_PORT": self.existing.get("FIELD_TEAMMATE_UMQ_PORT", "3816"),
+            "FIELD_TEAMMATE_MAP_FRAME": self.existing.get("FIELD_TEAMMATE_MAP_FRAME", "map"),
+            "FIELD_TEAMMATE_PROFILE_HEIGHT": self.existing.get("FIELD_TEAMMATE_PROFILE_HEIGHT", "1.75"),
+            "FIELD_TEAMMATE_CAMERA_HEIGHT": self.existing.get("FIELD_TEAMMATE_CAMERA_HEIGHT", "0.0"),
+            "FIELD_TEAMMATE_FLOOR_HEIGHT": self.existing.get("FIELD_TEAMMATE_FLOOR_HEIGHT", "0.0"),
+            "FIELD_TEAMMATE_POSE_ORIGIN": self.existing.get("FIELD_TEAMMATE_POSE_ORIGIN", "camera"),
+            "FIELD_TEAMMATE_CONNECT_TIMEOUT": self.existing.get("FIELD_TEAMMATE_CONNECT_TIMEOUT", "2.0"),
+            "FIELD_TEAMMATE_RECONNECT_DELAY": self.existing.get("FIELD_TEAMMATE_RECONNECT_DELAY", "1.0"),
+            "FIELD_TEAMMATE_VIDEO_PROFILE": teammate_video_profile,
+            "FIELD_TEAMMATE_RAW_IMAGE": "1" if teammate_raw_image else "0",
+            "FIELD_TEAMMATE_VIDEO_MODE": self.existing.get("FIELD_TEAMMATE_VIDEO_MODE", ""),
+            "FIELD_TEAMMATE_VIDEO_WIDTH": self.existing.get("FIELD_TEAMMATE_VIDEO_WIDTH", ""),
+            "FIELD_TEAMMATE_VIDEO_HEIGHT": self.existing.get("FIELD_TEAMMATE_VIDEO_HEIGHT", ""),
+            "FIELD_TEAMMATE_VIDEO_FPS": self.existing.get("FIELD_TEAMMATE_VIDEO_FPS", ""),
+            "FIELD_TEAMMATE_VIDEO_QUALITY": self.existing.get("FIELD_TEAMMATE_VIDEO_QUALITY", ""),
             "FAKE_DATA_ROBOT_ID": room if role != "cloud" else "robot-a",
             "FAKE_ROS_IMAGE_TOPIC": camera_topic,
             "FAKE_ROS_IMAGE_QOS": "default",
@@ -428,6 +530,7 @@ class Wizard:
         }
 
         self.write()
+        self.write_streams_config()
         self.summary()
 
     def resolve_ros_distro(self) -> str:
@@ -459,7 +562,7 @@ class Wizard:
             source = "detected" if ros_distro in installed else "default"
             print(f"ROS 2 distro: {self.color.paint(ros_distro, 'green')} ({source})")
             if not installed:
-                print("  ROS 2 was not found under /opt/ros. Install ROS 2 before bootstrap/launch on robot and machine roles.")
+                print("  ROS 2 was not found under /opt/ros. Install ROS 2 before bootstrap/launch on robot, machine, or teammate roles.")
             print()
         return ros_distro
 
@@ -528,6 +631,108 @@ class Wizard:
             return expected
         return self.existing.get("WEBRTC_ROS_IMAGE_OUTPUT_TOPIC") or "/camera/webrtc/image_raw"
 
+    def streams_config_path(self) -> Path:
+        configured = self.values.get("HORUS_STREAMS_CONFIG") or self.existing.get("HORUS_STREAMS_CONFIG") or "config/webrtc_streams.json"
+        path = Path(configured).expanduser()
+        if not path.is_absolute():
+            path = self.root / path
+        if path.name == "machine_streams.json" and not path.exists():
+            path = self.root / "config" / "webrtc_streams.json"
+        return path
+
+    def existing_streams(self) -> list[dict[str, object]]:
+        path = self.streams_config_path()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        streams = data.get("streams", []) if isinstance(data, dict) else data
+        if not isinstance(streams, list):
+            return []
+        return [stream for stream in streams if isinstance(stream, dict)]
+
+    def configure_webrtc_streams(
+        self,
+        role: str,
+        room: str,
+        camera_topic: str,
+        output_topic: str,
+        width: int,
+        height: int,
+        fps: int,
+        bitrate: int,
+    ) -> list[dict[str, object]]:
+        existing = self.existing_streams()
+        default_count = len(existing) if existing else 1
+        if self.args.stream_count and not is_positive_uint(str(self.args.stream_count)):
+            raise SystemExit("--stream-count must be a positive integer")
+        requested_count = int(self.args.stream_count or default_count)
+        if self.interactive:
+            requested_count = int(
+                self.prompt_text(
+                    "WebRTC camera streams",
+                    str(requested_count),
+                    required=True,
+                    validator=is_positive_uint,
+                    hint="Use 1 for the common case. Use more when this endpoint sends or receives multiple cameras.",
+                )
+            )
+
+        streams: list[dict[str, object]] = []
+        for index in range(requested_count):
+            existing_stream = existing[index] if index < len(existing) else {}
+            default_id = str(existing_stream.get("id") or ("primary" if index == 0 else f"camera-{index + 1}"))
+            default_room = str(existing_stream.get("room") or (room if index == 0 else f"{room}-{default_id}"))
+            identifier = default_id
+            stream_room = default_room
+            input_default = str(existing_stream.get("input_topic") or (camera_topic if index == 0 else f"/camera/{ros_safe_name(default_id)}/image_raw"))
+            output_default = str(existing_stream.get("output_topic") or (output_topic if index == 0 else self.stream_output_default(default_room, default_id)))
+            if self.interactive and requested_count > 1:
+                print(self.color.paint(f"Camera stream {index + 1}", "blue"))
+                identifier = self.prompt_text("Stream ID", default_id, required=True, validator=is_name)
+                stream_room = self.prompt_text(
+                    "WebRTC room",
+                    stream_room,
+                    required=True,
+                    validator=is_name,
+                    hint="Sender and receiver must use the same room for this camera stream.",
+                )
+                if role == "robot":
+                    input_default = self.prompt_text("ROS image input topic", input_default, required=True, validator=is_topic)
+                    output_default = self.stream_output_default(stream_room, identifier)
+                else:
+                    output_default = self.prompt_text("Decoded ROS image output topic", self.stream_output_default(stream_room, identifier), required=True, validator=is_topic)
+                    input_default = str(existing_stream.get("input_topic") or camera_topic)
+
+            streams.append(
+                {
+                    "id": sanitize_name(identifier) or "primary",
+                    "label": str(existing_stream.get("label") or identifier),
+                    "room": stream_room,
+                    "enabled": bool(existing_stream.get("enabled", True)),
+                    "input_topic": input_default,
+                    "output_topic": output_default,
+                    "width": int(existing_stream.get("width") or width),
+                    "height": int(existing_stream.get("height") or height),
+                    "fps": int(existing_stream.get("fps") or fps),
+                    "bitrate_kbit": int(existing_stream.get("bitrate_kbit") or bitrate),
+                    "video_source": str(existing_stream.get("video_source") or "ros2"),
+                    "source_pipeline": str(existing_stream.get("source_pipeline") or ""),
+                    "ros_image_qos": str(existing_stream.get("ros_image_qos") or "auto"),
+                    "frame_id": str(existing_stream.get("frame_id") or f"{ros_safe_name(stream_room)}_{ros_safe_name(identifier)}_webrtc_camera"),
+                }
+            )
+        return streams
+
+    def stream_output_default(self, room: str, identifier: str) -> str:
+        room_token = ros_safe_name(room)
+        stream_token = ros_safe_name(identifier)
+        if stream_token == "primary":
+            return f"/{room_token}/camera/webrtc/image_raw"
+        return f"/{room_token}/camera/{stream_token}/webrtc/image_raw"
+
     def write(self) -> None:
         content = self.template_path.read_text(encoding="utf-8")
         merged = dict(read_env(self.template_path))
@@ -544,6 +749,19 @@ class Wizard:
             print(f"Backup written: {backup}")
         self.env_path.write_text(rendered, encoding="utf-8")
         print(f"Configuration written: {self.env_path}\n")
+
+    def write_streams_config(self) -> None:
+        if self.args.dry_run or not self.streams:
+            return
+        path = self.streams_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            backup = path.with_name(f"{path.name}.backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+            shutil.copy2(path, backup)
+            print(f"Stream config backup written: {backup}")
+        payload = {"version": 1, "streams": self.streams}
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"Stream config written: {path}\n")
 
     def summary(self) -> None:
         if self.args.dry_run:
@@ -568,12 +786,19 @@ class Wizard:
             print(f"  turn       {turn_status}")
         elif "turn:" in self.values.get("WEBRTC_ICE_SERVERS", ""):
             print("  turn       fallback configured")
-        if role != "cloud":
+        if role == "teammate":
+            print(f"  teammate  {self.values['FIELD_TEAMMATE_NAME']}")
+            print(f"  hololens  {self.values['FIELD_TEAMMATE_HOLOLENS_HOST']}")
+            print(f"  fpv        {self.values['FIELD_TEAMMATE_VIDEO_PROFILE']} -> {self.values['WEBRTC_ROS_IMAGE_OUTPUT_TOPIC']}")
+        elif role != "cloud":
             print(
                 "  camera     "
                 f"{self.values['WEBRTC_VIDEO_WIDTH']}x{self.values['WEBRTC_VIDEO_HEIGHT']}"
                 f"@{self.values['WEBRTC_VIDEO_FPS']} -> {self.values['WEBRTC_ROS_IMAGE_OUTPUT_TOPIC']}"
             )
+            if self.streams:
+                stream_names = ", ".join(str(stream["id"]) for stream in self.streams)
+                print(f"  streams    {len(self.streams)} ({stream_names})")
         print()
         print(c.paint("Next commands", "cyan"))
         print(f"  ./horus bootstrap {role}")
@@ -732,6 +957,10 @@ def is_uint(value: str) -> bool:
     return value.isdigit()
 
 
+def is_positive_uint(value: str) -> bool:
+    return value.isdigit() and int(value) > 0
+
+
 def is_turn_secret(value: str) -> bool:
     return value != "change-me" and bool(re.match(r"^[A-Za-z0-9_.~-]{8,128}$", value))
 
@@ -779,6 +1008,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ros-setup-path")
     parser.add_argument("--camera-topic")
     parser.add_argument("--camera-output-topic")
+    parser.add_argument("--stream-count")
+    parser.add_argument("--teammate-name")
+    parser.add_argument("--hololens-host")
+    parser.add_argument("--teammate-video-profile", choices=list(TEAMMATE_VIDEO_PROFILES))
+    parser.add_argument("--teammate-raw-image", action="store_true")
     parser.add_argument("--video-preset", choices=list(VIDEO_PRESETS) + ["custom"])
     parser.add_argument("--width")
     parser.add_argument("--height")
