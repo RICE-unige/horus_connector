@@ -126,6 +126,53 @@ def test_dds_preflight_extracts_zenoh_allow_patterns():
     assert "^/[^/]+/guidance/request$" in patterns["subscribers"]
 
 
+def test_cyclonedds_render_does_not_duplicate_loopback_for_localhost_env(tmp_path):
+    import dds_preflight
+
+    path = dds_preflight.render_cyclonedds_template(
+        ROOT,
+        tmp_path,
+        {"ROS_LOCALHOST_ONLY": "1", "ROS_AUTOMATIC_DISCOVERY_RANGE": ""},
+        {"route": {"interface": "eth0"}},
+        ROOT / "config" / "zenoh_robot.json5",
+    )
+
+    text = Path(path).read_text(encoding="utf-8")
+    assert 'NetworkInterface name="lo"' not in text
+    assert 'NetworkInterface name="eth0"' not in text
+
+
+def test_cyclonedds_render_does_not_override_localhost_zenoh_config(tmp_path):
+    import dds_preflight
+
+    path = dds_preflight.render_cyclonedds_template(
+        ROOT,
+        tmp_path,
+        {"ROS_LOCALHOST_ONLY": "", "ROS_AUTOMATIC_DISCOVERY_RANGE": "SUBNET"},
+        {"route": {"interface": "eth0"}},
+        ROOT / "config" / "zenoh_robot.json5",
+    )
+
+    text = Path(path).read_text(encoding="utf-8")
+    assert 'NetworkInterface name="eth0"' not in text
+
+
+def test_cyclonedds_render_allows_explicit_interface_override(tmp_path, monkeypatch):
+    import dds_preflight
+
+    monkeypatch.setenv("HORUS_DDS_INTERFACE", "eth0")
+    path = dds_preflight.render_cyclonedds_template(
+        ROOT,
+        tmp_path,
+        {"ROS_LOCALHOST_ONLY": "1", "ROS_AUTOMATIC_DISCOVERY_RANGE": ""},
+        {"route": {"interface": "wlan0"}},
+        ROOT / "config" / "zenoh_robot.json5",
+    )
+
+    text = Path(path).read_text(encoding="utf-8")
+    assert 'NetworkInterface name="eth0"' in text
+
+
 def test_dds_preflight_parses_bridge_log_routes(tmp_path):
     import dds_preflight
 

@@ -460,24 +460,46 @@ def classify_bridge_log(role: str, topics: list[str], bridge_log: dict[str, Any]
     return findings
 
 
-def infer_interface(snapshot: dict[str, str], network: dict[str, Any]) -> tuple[str, bool]:
+def zenoh_config_requests_localhost(config_path: Path | None) -> bool:
+    if not config_path or not config_path.exists():
+        return False
+    try:
+        text = strip_json5_line_comments(config_path.read_text(encoding="utf-8", errors="ignore"))
+    except OSError:
+        return False
+    return bool(
+        re.search(r"\bros_localhost_only\s*:\s*true\b", text, re.IGNORECASE)
+        or re.search(r"\bros_automatic_discovery_range\s*:\s*['\"]LOCALHOST['\"]", text, re.IGNORECASE)
+    )
+
+
+def infer_interface(snapshot: dict[str, str], network: dict[str, Any], zenoh_config: Path | None = None) -> tuple[str, bool]:
     explicit = os.environ.get("HORUS_DDS_INTERFACE", "").strip()
     if explicit:
         return explicit, True
     localhost_only = snapshot.get("ROS_LOCALHOST_ONLY", "")
     discovery_range = snapshot.get("ROS_AUTOMATIC_DISCOVERY_RANGE", "")
-    if truthy(localhost_only) or discovery_range.upper() == "LOCALHOST":
-        return "lo", True
+    if truthy(localhost_only) or discovery_range.upper() == "LOCALHOST" or zenoh_config_requests_localhost(zenoh_config):
+        # ROS and zenoh-bridge-ros2dds already select loopback in localhost-only
+        # mode. Adding an explicit "lo" here can make CycloneDDS reject the
+        # participant with "the same interface may not be selected twice".
+        return "", False
     route = network.get("route", {}) if isinstance(network.get("route"), dict) else {}
     interface = str(route.get("interface") or "")
     return interface, bool(interface)
 
 
-def render_cyclonedds_template(root: Path, run_dir: Path, snapshot: dict[str, str], network: dict[str, Any]) -> str:
+def render_cyclonedds_template(
+    root: Path,
+    run_dir: Path,
+    snapshot: dict[str, str],
+    network: dict[str, Any],
+    zenoh_config: Path | None = None,
+) -> str:
     template = root / "config" / "cyclonedds_connector.xml.template"
     out = run_dir / "cyclonedds_connector.xml"
     run_dir.mkdir(parents=True, exist_ok=True)
-    interface, has_interface = infer_interface(snapshot, network)
+    interface, has_interface = infer_interface(snapshot, network, zenoh_config)
     if has_interface:
         interfaces = (
             "<Interfaces>\n"
@@ -508,8 +530,8 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     snapshot = env_snapshot()
     network = load_network_snapshot(args.target)
-    cyclonedds = render_cyclonedds_template(root, run_dir, snapshot, network)
     zenoh_config = Path(args.zenoh_config).expanduser().resolve() if args.zenoh_config else Path()
+    cyclonedds = render_cyclonedds_template(root, run_dir, snapshot, network, zenoh_config)
     allow_patterns = load_allow_patterns(zenoh_config) if zenoh_config else {}
 
     findings = []
