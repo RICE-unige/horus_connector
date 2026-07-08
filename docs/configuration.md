@@ -26,12 +26,13 @@ Use `./horus setup` for normal configuration. Edit `.env` directly only when you
 | `ROS_AUTOMATIC_DISCOVERY_RANGE` | ROS discovery range. Default: `LOCALHOST`. |
 | `ROS_CMD_TOPIC` | Robot velocity command topic. Default: `/cmd_vel`. |
 | `HORUS_SKIP_DDS_PREFLIGHT` | Set `1` to skip the launch-time DDS preflight gate. |
+| `CYCLONEDDS_URI` | Optional existing CycloneDDS XML profile. Use this when a partner robot already has a working DDS interface profile. |
 | `HORUS_DDS_INTERFACE` | Optional CycloneDDS interface name for the connector bridge participant. |
 | `HORUS_DDS_PREFLIGHT_TOPIC_TIMEOUT` | Timeout in seconds for the preflight `ros2 topic list` probe. Default: `5.0`. |
 
 ## DDS Preflight
 
-`./horus launch <role>` runs a DDS preflight before starting Zenoh unless `HORUS_SKIP_DDS_PREFLIGHT=1` or `--skip-dds-preflight` is used. The preflight does not replace a partner robot's DDS setup. It snapshots the launch environment, renders a connector-owned CycloneDDS profile for the bridge participant, and classifies issues before the bridge starts.
+`./horus launch <role>` runs a DDS preflight before starting Zenoh unless `HORUS_SKIP_DDS_PREFLIGHT=1` or `--skip-dds-preflight` is used. It snapshots the launch environment and classifies issues before the bridge starts. If `CYCLONEDDS_URI` is set, HORUS passes that existing profile to the bridge. If it is empty, HORUS renders a connector-owned CycloneDDS profile for the bridge participant.
 
 Artifacts:
 
@@ -65,7 +66,17 @@ Typical diagnoses:
 | `DOCKER_NETWORK_NOT_HOST` | Docker bridge runtime must use host networking for DDS discovery. |
 | `FASTDDS_SHM_CONTAINER_WARNING` | FastDDS shared-memory transport may break data flow across container IPC boundaries. |
 
-For Docker bridge runtime, HORUS mounts the rendered CycloneDDS XML into the bridge container, passes the DDS environment explicitly, and runs the bridge with host networking.
+For Docker bridge runtime, HORUS mounts either the existing `CYCLONEDDS_URI` XML or the rendered CycloneDDS XML into the bridge container, passes the DDS environment explicitly, and runs the bridge with host networking.
+
+For partner robots that discover ROS 2 nodes through a real LAN interface, do not use localhost-only discovery. Set:
+
+```bash
+ROS_LOCALHOST_ONLY=0
+ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+CYCLONEDDS_URI=file:///absolute/path/to/their/cyclonedds.xml
+```
+
+Use a robot Zenoh config where `ros_localhost_only` is `false`; the default robot profile is localhost-only to avoid accidentally mixing ROS graphs on shared lab networks.
 
 ## Zenoh
 
