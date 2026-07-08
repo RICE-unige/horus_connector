@@ -35,9 +35,9 @@ log_run() {
 
 if [[ "${ROLE_ARG}" == "-h" || "${ROLE_ARG}" == "--help" ]]; then
   echo -e "\n${BOLD}${FG_CYAN}HORUS Bootstrap${RESET}"
-  echo -e "${FG_MUTED}Prepare dependencies for robot, machine, or cloud roles${RESET}\n"
+  echo -e "${FG_MUTED}Prepare dependencies for robot, machine, teammate, or cloud roles${RESET}\n"
   echo -e "${BOLD}Usage${RESET}"
-  echo -e "  ./scripts/bootstrap.sh ${FG_GREEN}[robot|machine|cloud|auto]${RESET}\n"
+  echo -e "  ./scripts/bootstrap.sh ${FG_GREEN}[robot|machine|teammate|cloud|auto]${RESET}\n"
   echo -e "${BOLD}What it prepares${RESET}"
   echo -e "  - Zenoh ROS 2 DDS bridge binary or Docker fallback"
   echo -e "  - Python WebRTC and GLib dependencies"
@@ -540,10 +540,10 @@ if [[ -z "${ROLE}" || "${ROLE}" == "auto" ]]; then
 fi
 
 case "${ROLE}" in
-  robot|machine|cloud) ;;
+  robot|machine|teammate|cloud) ;;
   *)
     log_error "Unknown role: ${ROLE}"
-    log_warn "Supported roles: robot, machine, cloud, auto"
+    log_warn "Supported roles: robot, machine, teammate, cloud, auto"
     exit 2
     ;;
 esac
@@ -569,7 +569,7 @@ prepare_zenoh_tls() {
     cloud:*|machine:direct)
       bash "${SCRIPT_DIR}/setup_zenoh_tls.sh" server
       ;;
-    robot:*|machine:hub)
+    robot:*|machine:hub|teammate:*)
       if [[ -n "${ZENOH_TLS_ROOT_CA:-}" && -f "${ZENOH_TLS_ROOT_CA/#\~/${HOME}}" ]]; then
         log_success "Zenoh QUIC root certificate is installed."
       elif [[ "${ZENOH_TRANSPORT:-auto}" == "quic" ]]; then

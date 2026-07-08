@@ -1,0 +1,96 @@
+{
+  plugins: {
+    ros2dds: {
+      // Field-teammate profile: export HoloLens-derived teammate topics to
+      // Zenoh and import ONLY guidance messages from operators. This is the
+      // transport-layer mirror of the SDK's default-deny capability contract
+      // (field_teammate.v1): no cmd_vel, no services, no actions can cross.
+      //
+      // ASSUMPTION: the teammate host runs ONLY the relay on this ROS graph.
+      // The patterns below use a single-segment namespace wildcard
+      // (^/[^/]+/...), so any other node sharing this host's graph would have
+      // its matching topics exported/imported too. If the relay ever shares a
+      // graph, scope these patterns to the configured teammate name.
+      ros_localhost_only: true,
+      ros_automatic_discovery_range: "LOCALHOST",
+
+      allow: {
+        publishers: [
+          "^/tf$",
+          "^/tf_static$",
+          "^/[^/]+/status$",
+          "^/[^/]+/localization_confidence$",
+          "^/[^/]+/fpv/image_raw/compressed$",
+          "^/[^/]+/fpv/camera_info$",
+          "^/[^/]+/guidance/response$",
+          "^/[^/]+/guidance/state$",
+        ],
+        subscribers: [
+          "^/[^/]+/guidance/request$",
+          "^/[^/]+/guidance/annotation$",
+          "^/[^/]+/guidance/route$",
+          "^/[^/]+/guidance/warning$",
+        ],
+        // Local-only by design in field_teammate.v1:
+        // - /<name>/fpv/image_raw is a decoded viewer/debug helper.
+        // - /<name>/audio/message is reserved for local relay handling until
+        //   a study explicitly requires teammate audio over the connector.
+        service_servers: [],
+        service_clients: [],
+        action_servers: [],
+        action_clients: [],
+      },
+
+      pub_max_frequencies: [
+        ".*/tf$=60",
+        ".*/tf_static$=1",
+        ".*/status$=2",
+        ".*/localization_confidence$=20",
+        // Belt-and-braces: the relay's video profile governs FPV rate, but a
+        // misconfigured profile must not be able to flood the link.
+        ".*/fpv/image_raw/compressed$=60",
+        ".*/fpv/camera_info$=60",
+      ],
+
+      pub_priorities: [
+        ".*/guidance/.*$=1:express",
+        ".*/tf$=2:express",
+        ".*/tf_static$=2:express",
+        ".*/localization_confidence$=3:express",
+        ".*/status$=4",
+        ".*/fpv/camera_info$=4",
+        ".*/fpv/image_raw/compressed$=5",
+      ],
+
+      reliable_routes_blocking: false,
+      transient_local_cache_multiplier: 1,
+      queries_timeout: {
+        default: 1.0,
+        transient_local_subscribers: 0.5,
+        services: 1.0,
+        actions: {
+          send_goal: 1.0,
+          cancel_goal: 1.0,
+          get_result: 30.0,
+        },
+      },
+    },
+  },
+
+  scouting: {
+    multicast: { enabled: false },
+    gossip: { enabled: false },
+  },
+
+  transport: {
+    unicast: { qos: { enabled: true } },
+    link: {
+      tx: {
+        queue: {
+          batching: { enabled: false },
+          congestion_control: { drop: { wait_before_drop: 0 } },
+        },
+      },
+    },
+  },
+}
