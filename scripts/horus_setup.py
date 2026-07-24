@@ -42,6 +42,7 @@ VIDEO_PRESETS = {
 TEAMMATE_VIDEO_PROFILES = {
     "fast60": "640x360@60, low-latency first-person view. Recommended.",
     "balanced": "640x360@30, lower CPU/network load.",
+    "mapping": "640x360@15 q80, stable high-quality color with Research Mode depth.",
     "hd720": "1280x720@30, higher detail.",
     "app": "Keep the HoloLens app's current video profile.",
 }
@@ -374,7 +375,7 @@ class Wizard:
                 hololens_host,
                 required=True,
                 validator=is_host,
-                hint="Use the address shown by the HORUS Lenses status panel.",
+                hint="Use the address shown by the HORUS Field status panel.",
             )
             teammate_video_profile = self.prompt_choice(
                 "HoloLens video profile",
@@ -392,8 +393,10 @@ class Wizard:
             output_topic = camera_topic
             if teammate_video_profile == "hd720":
                 width, height, fps = 1280, 720, 30
-            elif teammate_video_profile == "balanced":
+            elif teammate_video_profile in {"balanced", "mapping"}:
                 width, height, fps = 640, 360, 30
+                if teammate_video_profile == "mapping":
+                    fps = 15
             else:
                 width, height, fps = 640, 360, 60
             bitrate = int(self.existing.get("VIDEO_BITRATE_KBIT", "6000"))

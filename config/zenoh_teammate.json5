@@ -22,6 +22,7 @@
           "^/[^/]+/localization_confidence$",
           "^/[^/]+/fpv/image_raw/compressed$",
           "^/[^/]+/fpv/camera_info$",
+          "^/[^/]+/fpv/camera_pose$",
           "^/[^/]+/guidance/response$",
           "^/[^/]+/guidance/state$",
         ],
@@ -50,6 +51,7 @@
         // misconfigured profile must not be able to flood the link.
         ".*/fpv/image_raw/compressed$=60",
         ".*/fpv/camera_info$=60",
+        ".*/fpv/camera_pose$=60",
       ],
 
       pub_priorities: [
@@ -59,6 +61,7 @@
         ".*/localization_confidence$=3:express",
         ".*/status$=4",
         ".*/fpv/camera_info$=4",
+        ".*/fpv/camera_pose$=4:express",
         ".*/fpv/image_raw/compressed$=5",
       ],
 

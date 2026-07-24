@@ -1569,6 +1569,7 @@ launch_field_teammate() {
   local py="python3"
   local name="${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}"
   local hololens_host="${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-}}"
+  local voice_host="${FIELD_TEAMMATE_VOICE_SIGNALING_HOST:-${HORUS_WEBRTC_SIGNAL_IP:-}}"
   local relay_args=()
 
   required_value FIELD_TEAMMATE_HOLOLENS_HOST "${hololens_host}"
@@ -1589,6 +1590,24 @@ launch_field_teammate() {
     --reconnect-delay "${FIELD_TEAMMATE_RECONNECT_DELAY:-1.0}"
     --video-profile "${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}"
   )
+
+  if [[ "${HORUS_VOICE_ENABLED:-1}" == "0" ]]; then
+    relay_args+=(--disable-voice)
+  else
+    [[ -n "${voice_host}" ]] && relay_args+=(--voice-signaling-host "${voice_host}")
+    relay_args+=(--voice-signaling-port "${WEBRTC_SIGNAL_PORT:-8765}")
+    if [[ "$(webrtc_signal_scheme)" == "wss" ]]; then
+      relay_args+=(--voice-signaling-secure)
+    fi
+    [[ -n "${FIELD_TEAMMATE_VOICE_TOKEN:-}" ]] && relay_args+=(--voice-token "${FIELD_TEAMMATE_VOICE_TOKEN}")
+    if [[ -n "${WEBRTC_ICE_SERVERS:-}" ]]; then
+      local voice_ice_servers=()
+      IFS=',' read -r -a voice_ice_servers <<< "${WEBRTC_ICE_SERVERS}"
+      for voice_ice_server in "${voice_ice_servers[@]}"; do
+        [[ -n "${voice_ice_server}" ]] && relay_args+=(--voice-ice-server "${voice_ice_server}")
+      done
+    fi
+  fi
 
   if [[ "${FIELD_TEAMMATE_RAW_IMAGE:-0}" == "1" ]]; then
     relay_args+=(--raw-image)
@@ -1755,6 +1774,9 @@ case "${cmd}" in
           launch_zenoh_client teammate "$(zenoh_connect_target teammate)"
         else
           log_warn "Zenoh is disabled for this launch."
+        fi
+        if [[ "${HORUS_VOICE_ENABLED:-1}" != "0" && -z "${FIELD_TEAMMATE_VOICE_SIGNALING_HOST:-${HORUS_WEBRTC_SIGNAL_IP:-}}" ]]; then
+          launch_signal_relay
         fi
         launch_field_teammate
         ;;
