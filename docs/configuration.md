@@ -104,6 +104,11 @@ Role configs:
 | `teammate` | `config/zenoh_teammate.json5` |
 | `cloud` | `config/zenoh_cloud.json5` |
 
+The teammate profile exports only the field-teammate observability topics and
+imports only guidance topics. It deliberately excludes velocity, service, and
+action interfaces so the connector mirrors the SDK's default-deny human entity
+contract.
+
 The default robot profile exports robot ROS topics through Zenoh and imports command topics from the operator machine. The machine profile imports robot topics and exports only command topics:
 
 ```text
@@ -144,15 +149,22 @@ Zenoh priority `1` is highest, `7` is lowest. `:express` reduces latency for sma
 
 ## Field Teammate
 
-The `teammate` role is for a field teammate endpoint that relays local teammate/HoloLens data into the HORUS ROS 2 graph through Zenoh. It is not a cloud hub and it does not run the robot camera WebRTC sender/receiver path.
+The `teammate` role runs the HoloLens relay and a restricted Zenoh bridge. The
+relay converts HoloLens pose, hand, PV, status, and guidance data to ordinary
+ROS 2 topics. Zenoh carries only the allow-listed teammate topics to the
+operator network; live voice uses its separate WebRTC signaling path.
 
 Normal setup:
 
 ```bash
-./horus setup
+./horus setup teammate
 ./horus bootstrap teammate
 ./horus launch teammate
 ```
+
+The teammate setup wizard configures the endpoint identity, HoloLens address,
+ROS 2 environment, hub or direct topology, and Zenoh transport. It leaves the
+robot camera WebRTC settings independent from the HoloLens PV relay.
 
 | Variable | Purpose |
 |---|---|
@@ -182,6 +194,9 @@ Normal setup:
 |---|---|
 | `WEBRTC_MEDIA_MODE` | `h264` is the supported path. `jpeg` is legacy direct-mode fallback only. |
 | `WEBRTC_SIGNAL_PORT` | WebRTC signaling port. Default: `8765`. |
+| `HORUS_WEBRTC_SIGNAL_TLS` | Set `1` to use WSS signaling. |
+| `HORUS_WEBRTC_SIGNAL_TLS_CERT` | Relay TLS certificate for WSS. |
+| `HORUS_WEBRTC_SIGNAL_TLS_KEY` | Relay TLS private key for WSS. |
 | `WEBRTC_DURATION` | Runtime duration in seconds. Use `86400` for long runs. |
 | `WEBRTC_ICE_SERVERS` | Comma-separated STUN/TURN servers. |
 | `WEBRTC_ICE_TRANSPORT_POLICY` | `all` for normal direct-first behavior, or `relay` to force TURN validation. |
@@ -198,6 +213,8 @@ Normal setup:
 | `WEBRTC_ROS_IMAGE_FRAME_ID` | Frame ID for decoded ROS images. |
 | `WEBRTC_ROS_IMAGE_QOS` | `auto` is recommended. |
 | `HORUS_STREAMS_CONFIG` | Optional JSON config for multiple WebRTC camera streams. Usually written by `./horus setup`. |
+| `HORUS_WEBRTC_SESSION_MODE` | `auto`, `bundled`, or `isolated`. Version-2 configs default to `bundled`. |
+| `HORUS_WEBRTC_SESSION_ROOM` | Optional override for the bundled robot session room. |
 | `VIDEO_BITRATE_KBIT` | Starting H.264 bitrate. |
 | `WEBRTC_ADAPTIVE_BITRATE` | Enable adaptive bitrate control. Default: `1`. |
 | `WEBRTC_CONTROL_ENABLED` | Legacy/debug option for WebRTC DataChannel publishing to `ROS_CMD_TOPIC`. Keep `0` for normal runs. Default: `0`. |
@@ -207,18 +224,33 @@ Normal setup:
 | `WEBRTC_CMD_MAX_LINEAR_MPS` | Clamp each linear Twist component. Default: `0.5`. |
 | `WEBRTC_CMD_MAX_ANGULAR_RPS` | Clamp each angular Twist component. Default: `1.0`. |
 | `HORUS_WEBRTC_RELAY_TOKEN` | Shared token required by public hub signaling relays. |
+| `HORUS_WEBRTC_CREDENTIALS_FILE` | Relay-side JSON file containing per-client role and room credentials. Preferred over the shared token. |
+| `HORUS_WEBRTC_CLIENT_ID` | Stable endpoint identity, for example `robot:robot-a`. |
+| `HORUS_WEBRTC_CLIENT_TOKEN` | Endpoint-specific signaling token. |
 | `HORUS_WEBRTC_RELAY_ALLOW_UNAUTHENTICATED` | Allow a public signaling relay without a token for trusted test networks. Default: `0`. |
+| `HORUS_VOICE_TRUSTED_DEVELOPMENT` | Allow tokenless `operator` and `field_teammate` voice registration only. Default: `1`; credential files still take precedence. |
+| `HORUS_VOICE_ENABLED` | Start and configure field-teammate live voice. Default: `1`. |
+| `FIELD_TEAMMATE_VOICE_SIGNALING_HOST` | Optional remote signaling override. Empty uses the bridge-side/local relay route automatically. |
+| `FIELD_TEAMMATE_VOICE_TOKEN` | Optional production field-teammate credential. Empty selects trusted-development mode. |
 | `WEBRTC_MIN_BITRATE_KBIT` | Minimum adaptive bitrate. |
 | `WEBRTC_MAX_BITRATE_KBIT` | Maximum adaptive bitrate. |
 | `WEBRTC_H264_KEY_INT_MAX` | H.264 keyframe interval. |
 | `WEBRTC_CMD_WATCHDOG_TIMEOUT` | Robot command timeout before publishing zero velocity. |
 | `WEBRTC_CMD_RATE_LIMIT_HZ` | Maximum accepted command rate. |
+| `WEBRTC_CMD_MAX_AGE_MS` | Reject commands older than this deadline. Set `0` only when clocks cannot be synchronized. |
+| `WEBRTC_CMD_MAX_FUTURE_MS` | Reject commands whose timestamp is too far in the future. |
+| `WEBRTC_BITRATE_BAD_LOSS` | Packet-loss fraction that immediately reduces bitrate. |
+| `WEBRTC_BITRATE_GOOD_LOSS` | Packet-loss ceiling used for a healthy sample. |
+| `WEBRTC_BITRATE_BAD_RTT_MS` | RTT that immediately reduces bitrate. |
+| `WEBRTC_BITRATE_GOOD_RTT_MS` | RTT ceiling used for a healthy sample. |
 
 ### Multiple Camera Streams
 
 Use `./horus setup` and choose the number of WebRTC camera streams. The setup writes `config/webrtc_streams.json`, which is ignored by git because each deployment usually has different cameras and room names.
 
-Each stream has its own internal WebRTC room, input topic, output topic, resolution, frame rate, and bitrate. `./horus launch robot` starts one sender per enabled stream, and `./horus launch machine` starts one receiver per enabled stream. The machine republishes each decoded stream to its configured ROS 2 output topic.
+New version-2 configurations bundle all camera tracks for one robot into one `webrtcbin` peer connection and one ICE/DTLS session. Each track keeps its own input topic, output topic, resolution, frame rate, and bitrate. The machine maps the SDP track ID back to the configured ROS 2 output topic.
+
+Version-1 configurations remain supported as `isolated` mode and continue to launch one sender, receiver, and signaling room per stream. Use that mode only for compatibility or fault-isolation testing.
 
 Example template:
 
@@ -227,7 +259,13 @@ cp config/webrtc_streams.example.json config/webrtc_streams.json
 ./horus setup
 ```
 
-Per-stream logs use the stream service name:
+Bundled sessions use one media log:
+
+```bash
+./horus logs webrtc
+```
+
+Version-1 isolated streams use the stream service name:
 
 ```bash
 ./horus logs webrtc-primary
@@ -267,6 +305,9 @@ TURN is optional. Use it when WebRTC cannot establish media through NAT/firewall
 | `TURN_USER` | TURN username. |
 | `TURN_PASSWORD` | TURN password. |
 | `TURN_PRIVATE_IP` | Optional VM/private IP for cloud NAT mapping. Auto-detected during bootstrap when empty. |
+| `HORUS_WEBRTC_TURN_PUBLIC_HOST` | Public TURN DNS name or IP advertised by signaling. |
+| `HORUS_WEBRTC_TURN_SECRET` | Coturn REST API shared secret used to mint expiring credentials. |
+| `HORUS_WEBRTC_TURN_TTL_SEC` | Lifetime of issued TURN credentials. Default: `3600`. |
 
 Example:
 
@@ -286,7 +327,21 @@ udp/3478
 udp/49152-65535
 ```
 
-Robot and machine roles do not run TURN. They only need the same `WEBRTC_ICE_SERVERS` value that points to the cloud relay.
+Robot and machine roles do not run TURN. With static credentials they use the same `WEBRTC_ICE_SERVERS`; with REST credentials the authenticated signaling relay supplies the expiring TURN URLs before media negotiation.
+
+For production, configure `HORUS_WEBRTC_TURN_SECRET` on the hub instead of a static `TURN_USER`/`TURN_PASSWORD`. `setup_turn.sh` then enables coturn's REST credential mode, and the signaling relay issues a fresh credential to each authenticated session. The static credential path remains available for existing deployments.
+
+## Signaling Identity
+
+The shared relay token remains compatible, but per-client credentials prevent one robot or machine from registering under another room or role.
+
+Generate a room credential file on the hub:
+
+```bash
+python3 scripts/generate_webrtc_credentials.py --room robot-a
+```
+
+Set `HORUS_WEBRTC_CREDENTIALS_FILE` on the hub. Put only the printed robot identity/token on the robot and only the machine identity/token on the operator machine. Do not copy the complete credential file to endpoints.
 
 ## Synthetic Data
 
