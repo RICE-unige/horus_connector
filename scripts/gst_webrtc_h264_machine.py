@@ -2,14 +2,16 @@
 """Machine-side H.264 WebRTC video receiver."""
 
 import argparse
-from collections import deque
+from collections import defaultdict, deque
 import json
 import logging
 import math
 import os
+import re
 import signal
 import statistics
 import time
+import uuid
 from pathlib import Path
 
 import gi
@@ -20,10 +22,12 @@ from gst_webrtc_common import (
     ServerSignaling,
     configure_webrtcbin,
     ensure_webrtc_runtime,
+    ice_servers_from_registration,
     load_env_file,
     make_session_description,
 )
 from ros_image_io import RosImagePublisher
+from webrtc_streams import load_session, load_streams, ros_safe_name
 
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
@@ -55,35 +59,76 @@ def load_clock_offset(path: str | None) -> tuple[float, str]:
 class H264MachineReceiver:
     def __init__(self, args):
         self.args = args
+        self.session, self.streams = self._load_stream_configuration()
+        if len(self.streams) > 1:
+            self.args.room = self.session["room"]
         self.profile = load_env_file(args.profile)
         self.loop = GLib.MainLoop()
         self.pipeline = None
         self.webrtc = None
         self.cmd_channel = None
         self.cmd_seq = 0
+        self.control_session_id = uuid.uuid4().hex
         self.cmd_rtts = []
         self.cmd_acks = 0
         self.video_frames = 0
+        self.video_frames_by_stream = defaultdict(int)
+        self.video_first_sec_by_stream = {}
+        self.video_last_sec_by_stream = {}
         self.video_first_sec = None
         self.video_last_sec = None
         self.frame_clock = deque()
+        self.frame_clock_by_stream = defaultdict(deque)
         self.frame_latency_samples = []
         self.frame_clock_dropped = 0
         self.frame_clock_overflow_dropped = 0
         self.ros_image_publisher = None
+        self.ros_image_publishers = {}
+        self.attached_streams = set()
         self.recovering = False
         self.answer_in_progress = False
         self.last_remote_offer_sdp = ""
         self.stopped = False
         if self.args.video_output in {"ros2", "both"}:
-            self.ros_image_publisher = RosImagePublisher(
-                self.args.ros_image_topic,
-                self.args.ros_image_encoding,
-                self.args.ros_image_frame_id,
-                self.args.ros_image_qos,
-            )
-            self.ros_image_publisher.start()
+            for stream in self.streams:
+                publisher = RosImagePublisher(
+                    stream["output_topic"],
+                    self.args.ros_image_encoding,
+                    stream["frame_id"],
+                    stream["ros_image_qos"],
+                    node_name=f"horus_webrtc_publisher_{ros_safe_name(stream['id'])}",
+                )
+                publisher.start()
+                self.ros_image_publishers[stream["id"]] = publisher
+            self.ros_image_publisher = next(iter(self.ros_image_publishers.values()), None)
         self.signaling = self._make_signaling()
+
+    def _load_stream_configuration(self):
+        if not self.args.streams_config:
+            stream = {
+                "id": "primary",
+                "label": "primary",
+                "room": self.args.room,
+                "input_topic": "",
+                "output_topic": self.args.ros_image_topic,
+                "width": 0,
+                "height": 0,
+                "fps": 0,
+                "bitrate_kbit": 0,
+                "min_bitrate_kbit": 0,
+                "max_bitrate_kbit": 0,
+                "video_source": "ros2",
+                "source_pipeline": "",
+                "ros_image_qos": self.args.ros_image_qos,
+                "frame_id": self.args.ros_image_frame_id,
+            }
+            return {"mode": "isolated", "room": self.args.room, "id": self.args.room}, [stream]
+        os.environ["HORUS_STREAMS_CONFIG"] = self.args.streams_config
+        root = Path(self.args.root).resolve()
+        session = load_session(root, "machine")
+        if session["mode"] != "bundled":
+            raise SystemExit("--streams-config requires session.mode=bundled (or HORUS_WEBRTC_SESSION_MODE=bundled)")
+        return session, load_streams(root, "machine")
 
     def _make_signaling(self):
         if self.args.signaling_url:
@@ -104,13 +149,29 @@ class H264MachineReceiver:
         if self.webrtc is None:
             raise RuntimeError("failed to create webrtcbin")
         configure_webrtcbin(self.webrtc, self.args.ice_servers, self.args.ice_transport_policy)
+        self._connect_webrtc_diagnostics()
         pipeline.add(self.webrtc)
         return pipeline
+
+    def _connect_webrtc_diagnostics(self):
+        for name in ("signaling-state", "ice-gathering-state", "ice-connection-state", "connection-state"):
+            try:
+                self.webrtc.connect(f"notify::{name}", self._on_webrtc_state_change, name)
+            except TypeError:
+                logger.debug("WebRTC state property is unavailable: %s", name, exc_info=True)
+
+    def _on_webrtc_state_change(self, element, _pspec, name: str):
+        try:
+            value = element.get_property(name)
+        except Exception:
+            logger.debug("Failed to read WebRTC state property: %s", name, exc_info=True)
+            return
+        label = getattr(value, "value_nick", str(value))
+        print(f"WebRTC {name}: {label}", flush=True)
 
     def start(self):
         Gst.init(None)
         ensure_webrtc_runtime()
-        self.signaling.start()
         print("Machine media pipeline: webrtcbin receiver", flush=True)
         self.pipeline = self._build_pipeline()
         bus = self.pipeline.get_bus()
@@ -125,6 +186,7 @@ class H264MachineReceiver:
         signal.signal(signal.SIGTERM, self._handle_stop_signal)
         signal.signal(signal.SIGINT, self._handle_stop_signal)
         self.pipeline.set_state(Gst.State.PLAYING)
+        self.signaling.start()
         if self.args.duration > 0:
             GLib.timeout_add_seconds(int(self.args.duration), self.stop)
         try:
@@ -145,6 +207,18 @@ class H264MachineReceiver:
                 "video_frames": self.video_frames,
                 "video_observed_sec": observed_sec,
                 "video_decoded_fps": self.video_frames / observed_sec,
+                "video_tracks": {
+                    stream_id: {
+                        "frames": frames,
+                        "decoded_fps": frames
+                        / max(
+                            self.video_last_sec_by_stream.get(stream_id, 0.0)
+                            - self.video_first_sec_by_stream.get(stream_id, 0.0),
+                            0.001,
+                        ),
+                    }
+                    for stream_id, frames in sorted(self.video_frames_by_stream.items())
+                },
             }
             if self.frame_latency_samples:
                 latencies = [sample["latency_ms"] for sample in self.frame_latency_samples]
@@ -203,9 +277,10 @@ class H264MachineReceiver:
             )
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
-        if self.ros_image_publisher is not None:
-            self.ros_image_publisher.close()
-            self.ros_image_publisher = None
+        for publisher in self.ros_image_publishers.values():
+            publisher.close()
+        self.ros_image_publishers = {}
+        self.ros_image_publisher = None
         if self.loop.is_running():
             self.loop.quit()
         return False
@@ -220,6 +295,24 @@ class H264MachineReceiver:
 
     def _handle_signaling_message_in_loop(self, message):
         kind = message.get("type")
+        if kind == "registered":
+            ice_servers = ice_servers_from_registration(self.args.ice_servers, message)
+            if ice_servers != self.args.ice_servers:
+                self.args.ice_servers = ice_servers
+                if self.webrtc is not None:
+                    configure_webrtcbin(self.webrtc, self.args.ice_servers, self.args.ice_transport_policy)
+                print("Applied broker-issued TURN credentials to the machine session", flush=True)
+            return False
+        if kind == "peer-ready" and message.get("role") == "robot":
+            if self.last_remote_offer_sdp:
+                print("Robot peer was replaced; resetting the machine WebRTC session", flush=True)
+                self._recover_pipeline()
+            return False
+        if kind == "peer-left" and message.get("role") == "robot":
+            if self.last_remote_offer_sdp:
+                print("Robot peer left; resetting the machine WebRTC session", flush=True)
+                self._recover_pipeline()
+            return False
         if kind == "offer":
             sdp = message.get("sdp", "")
             if not sdp or sdp == self.last_remote_offer_sdp:
@@ -271,6 +364,8 @@ class H264MachineReceiver:
             self.webrtc = None
             self.cmd_channel = None
             self.frame_clock.clear()
+            self.frame_clock_by_stream.clear()
+            self.attached_streams.clear()
             self.answer_in_progress = False
             self.last_remote_offer_sdp = ""
 
@@ -301,22 +396,32 @@ class H264MachineReceiver:
         postprocess = self._decoder_postprocess()
         decoder = f"{name} {props}".strip()
         tail = f"{postprocess} ! " if postprocess else ""
-        description = self._media_description(decoder, tail)
-        print(f"Incoming RTP video; decoder={decoder}; postprocess={postprocess or 'none'}", flush=True)
+        stream = self._stream_for_pad(pad)
+        if stream is None:
+            print(f"Ignoring unconfigured incoming WebRTC track {pad.get_name()}", flush=True)
+            return
+        stream_id = stream["id"]
+        self.attached_streams.add(stream_id)
+        description = self._media_description(decoder, tail, stream)
+        print(
+            f"Incoming RTP video track={stream_id}; decoder={decoder}; postprocess={postprocess or 'none'}",
+            flush=True,
+        )
         media = Gst.parse_bin_from_description(description, True)
-        sink = media.get_by_name("video_sink")
-        ros_sink = media.get_by_name("ros_image_sink")
+        suffix = ros_safe_name(stream_id)
+        sink = media.get_by_name(f"video_sink_{suffix}")
+        ros_sink = media.get_by_name(f"ros_image_sink_{suffix}")
         if self.args.video_output in {"display", "both"} and sink is None:
             raise RuntimeError("failed to create video sink")
         if ros_sink is not None:
             ros_sink.set_property("emit-signals", True)
-            ros_sink.connect("new-sample", self._on_ros_image_sample)
+            ros_sink.connect("new-sample", self._on_ros_image_sample, stream_id)
         if sink is not None:
             if self.args.video_sink.split()[0] == "fakesink":
                 sink.set_property("sync", False)
                 if self.args.video_output == "display":
                     sink.set_property("signal-handoffs", True)
-                    sink.connect("handoff", self._on_video_frame)
+                    sink.connect("handoff", self._on_video_frame, stream_id)
             else:
                 if sink.find_property("sync"):
                     sink.set_property("sync", False)
@@ -326,7 +431,23 @@ class H264MachineReceiver:
         if result != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"failed to link WebRTC pad: {result}")
 
-    def _media_description(self, decoder: str, tail: str) -> str:
+    def _stream_for_pad(self, pad):
+        try:
+            msid = str(pad.get_property("msid") or "") if pad.find_property("msid") else ""
+        except Exception:
+            msid = ""
+        for stream in self.streams:
+            if stream["id"] and stream["id"] in msid:
+                return stream
+        match = re.search(r"(\d+)$", pad.get_name() or "")
+        if match:
+            index = int(match.group(1))
+            if 0 <= index < len(self.streams):
+                return self.streams[index]
+        return next((stream for stream in self.streams if stream["id"] not in self.attached_streams), None)
+
+    def _media_description(self, decoder: str, tail: str, stream: dict) -> str:
+        suffix = ros_safe_name(stream["id"])
         base = (
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
             "rtph264depay ! h264parse ! "
@@ -335,59 +456,65 @@ class H264MachineReceiver:
         )
 
         if self.args.video_output == "ros2":
-            caps = self.ros_image_publisher.caps_filter()
+            caps = self.ros_image_publishers[stream["id"]].caps_filter()
             return (
                 base
                 + "videoconvert ! "
                 + caps
-                + " ! appsink name=ros_image_sink emit-signals=true sync=false max-buffers=1 drop=true"
+                + f" ! appsink name=ros_image_sink_{suffix} emit-signals=true sync=false max-buffers=1 drop=true"
             )
 
         if self.args.video_output == "both":
-            caps = self.ros_image_publisher.caps_filter()
+            caps = self.ros_image_publishers[stream["id"]].caps_filter()
             return (
                 base
                 + "videoconvert ! "
                 + caps
                 + " ! tee name=video_tee "
                 + "video_tee. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
-                + "! appsink name=ros_image_sink emit-signals=true sync=false max-buffers=1 drop=true "
+                + f"! appsink name=ros_image_sink_{suffix} emit-signals=true sync=false max-buffers=1 drop=true "
                 + "video_tee. ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
-                + f"! videoconvert ! {self.args.video_sink} name=video_sink"
+                + f"! videoconvert ! {self.args.video_sink} name=video_sink_{suffix}"
             )
 
-        return base + f"videoconvert ! {self.args.video_sink} name=video_sink"
+        return base + f"videoconvert ! {self.args.video_sink} name=video_sink_{suffix}"
 
-    def _on_video_frame(self, _sink, _buffer, _pad):
+    def _on_video_frame(self, _sink, _buffer, _pad, stream_id="primary"):
         now = time.monotonic()
-        if self.video_first_sec is None:
-            self.video_first_sec = now
-        self.video_last_sec = now
-        self.video_frames += 1
-        self._record_frame_latency(now, "display")
+        self._count_video_frame(stream_id, now)
+        self._record_frame_latency(now, "display", stream_id)
 
-    def _on_ros_image_sample(self, sink):
+    def _on_ros_image_sample(self, sink, stream_id="primary"):
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.ERROR
         now = time.monotonic()
+        self._count_video_frame(stream_id, now)
+        publisher = self.ros_image_publishers.get(stream_id)
+        if publisher is not None:
+            publisher.publish_sample(sample)
+        self._record_frame_latency(now, "ros2", stream_id)
+        return Gst.FlowReturn.OK
+
+    def _count_video_frame(self, stream_id: str, now: float):
         if self.video_first_sec is None:
             self.video_first_sec = now
         self.video_last_sec = now
         self.video_frames += 1
-        if self.ros_image_publisher is not None:
-            self.ros_image_publisher.publish_sample(sample)
-        self._record_frame_latency(now, "ros2")
-        return Gst.FlowReturn.OK
+        if stream_id not in self.video_first_sec_by_stream:
+            self.video_first_sec_by_stream[stream_id] = now
+        self.video_last_sec_by_stream[stream_id] = now
+        self.video_frames_by_stream[stream_id] += 1
 
-    def _record_frame_latency(self, now: float, output_stage: str):
-        if not self.frame_clock:
+    def _record_frame_latency(self, now: float, output_stage: str, stream_id: str = "primary"):
+        frame_clock = self.frame_clock_by_stream[stream_id]
+        if not frame_clock:
             return
-        dropped = max(0, len(self.frame_clock) - 1)
+        dropped = max(0, len(frame_clock) - 1)
         if dropped:
             self.frame_clock_dropped += dropped
-        sent = self.frame_clock.pop()
-        self.frame_clock.clear()
+        sent = frame_clock.pop()
+        frame_clock.clear()
         receive_wall_ns = time.time_ns()
         raw_latency_ms = (receive_wall_ns - int(sent["sent_ns"])) / 1_000_000.0
         latency_ms = raw_latency_ms - self.args.clock_offset_ms
@@ -396,6 +523,7 @@ class H264MachineReceiver:
             {
                 "seq": sent.get("seq"),
                 "output_stage": output_stage,
+                "stream_id": stream_id,
                 "receive_t_sec": now - (self.video_first_sec or now),
                 "latency_ms": latency_ms,
                 "raw_latency_ms": raw_latency_ms,
@@ -426,10 +554,12 @@ class H264MachineReceiver:
             return
         if message.get("type") != "frame_clock" or "sent_ns" not in message:
             return
-        self.frame_clock.append(message)
-        while len(self.frame_clock) > 600:
+        stream_id = str(message.get("stream_id") or "primary")
+        frame_clock = self.frame_clock_by_stream[stream_id]
+        frame_clock.append(message)
+        while len(frame_clock) > 600:
             self.frame_clock_overflow_dropped += 1
-            self.frame_clock.popleft()
+            frame_clock.popleft()
 
     def _on_cmd_channel_open(self, _channel):
         print("cmd-vel DataChannel open", flush=True)
@@ -444,6 +574,7 @@ class H264MachineReceiver:
             "type": "cmd_vel",
             "seq": self.cmd_seq,
             "sent_ns": time.time_ns(),
+            "session_id": self.control_session_id,
             "linear_x": self.args.cmd_linear_x,
             "linear_y": 0.0,
             "linear_z": 0.0,
@@ -451,6 +582,8 @@ class H264MachineReceiver:
             "angular_y": 0.0,
             "angular_z": self.args.cmd_angular_z,
         }
+        if self.args.control_token:
+            command["control_token"] = self.args.control_token
         self.cmd_channel.emit("send-string", json.dumps(command, separators=(",", ":")))
         self.cmd_seq += 1
         return True
@@ -461,7 +594,9 @@ class H264MachineReceiver:
         except Exception:
             logger.debug("Ignoring malformed cmd_vel ack message: %s", text, exc_info=True)
             return
-        if ack.get("type") != "cmd_vel_ack":
+        if ack.get("type") not in {"cmd_vel_ack", "control_ack"}:
+            return
+        if ack.get("command_type", "cmd_vel") != "cmd_vel":
             return
         sent_ns = int(ack.get("sent_ns") or 0)
         if sent_ns > 0:
@@ -471,6 +606,8 @@ class H264MachineReceiver:
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--streams-config", default="")
     parser.add_argument("--signaling-url", default="")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
@@ -487,6 +624,7 @@ def parse_args():
     parser.add_argument("--cmd-rate", type=float, default=0.0)
     parser.add_argument("--cmd-linear-x", type=float, default=0.0)
     parser.add_argument("--cmd-angular-z", type=float, default=0.0)
+    parser.add_argument("--control-token", default=os.environ.get("HORUS_WEBRTC_CONTROL_TOKEN", ""))
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--clock-offset-ms", type=float, default=None)
     parser.add_argument("--clock-offset-json", default="")

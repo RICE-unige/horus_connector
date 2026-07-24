@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -76,6 +77,22 @@ def turn_property(servers: str) -> str:
 def normalize_ice_transport_policy(value: str) -> str:
     policy = (value or "all").strip().lower()
     return policy if policy in {"all", "relay"} else "all"
+
+
+def ice_servers_from_registration(current: str, message: dict) -> str:
+    """Merge broker-issued TURN URLs with configured STUN/TURN fallbacks."""
+    turn = message.get("turn") if isinstance(message, dict) else None
+    urls = turn.get("urls", []) if isinstance(turn, dict) else []
+    configured = [item.strip() for item in str(current or "").split(",") if item.strip()]
+    merged = [item for item in configured if item.startswith("stun:")]
+    for value in urls if isinstance(urls, list) else []:
+        item = str(value or "").strip()
+        if item and item not in merged:
+            merged.append(item)
+    for item in configured:
+        if item not in merged:
+            merged.append(item)
+    return ",".join(merged)
 
 
 def webrtcbin_properties(ice_servers: str, ice_transport_policy: str = "all") -> str:
@@ -149,6 +166,14 @@ def make_session_description(kind: str, sdp_text: str):
     return GstWebRTC.WebRTCSessionDescription.new(sdp_type, sdp)
 
 
+def data_channel_options(ordered: bool = True, max_retransmits: int | None = None):
+    options = Gst.Structure.new_empty("application/data-channel")
+    options.set_value("ordered", bool(ordered))
+    if max_retransmits is not None:
+        options.set_value("max-retransmits", int(max_retransmits))
+    return options
+
+
 def env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
         return max(minimum, int(os.environ.get(name, str(default))))
@@ -157,13 +182,19 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 class JsonSignaling:
-    def __init__(self, on_message, on_connected=None):
+    def __init__(self, on_message, on_connected=None, wait_for_registration: bool = False):
         self.on_message = on_message
         self.on_connected = on_connected
+        self.wait_for_registration = wait_for_registration
         self.ws = None
         self.connected = threading.Event()
+        self.ready = threading.Event()
         self.closed = threading.Event()
         self.send_lock = threading.Lock()
+        self.ready_lock = threading.Lock()
+        self.connection_lock = threading.Lock()
+        self.connection_generation = 0
+        self.ready_notified = False
         self.pending: queue.Queue[str] = queue.Queue(maxsize=env_int("HORUS_WEBRTC_SIGNAL_PENDING_MAX", 256))
 
     @staticmethod
@@ -172,6 +203,12 @@ class JsonSignaling:
         if kind == "register":
             print(
                 f"WebRTC peer registered: role={message.get('role', 'unknown')} room={message.get('room', 'default')}",
+                flush=True,
+            )
+        elif kind == "registered":
+            print(
+                f"WebRTC session accepted: role={message.get('role', 'unknown')} "
+                f"room={message.get('room', 'default')} client={message.get('client_id', 'legacy')}",
                 flush=True,
             )
         elif kind == "peer-ready":
@@ -210,37 +247,114 @@ class JsonSignaling:
             with self.send_lock:
                 self.ws.send(self.pending.get_nowait())
 
-    def _read_loop(self):
-        self.connected.set()
+    def _begin_connection(self) -> int:
+        with self.connection_lock:
+            self.connection_generation += 1
+            generation = self.connection_generation
+            self.connected.set()
         self._flush_pending()
+        return generation
+
+    def _is_current_connection(self, generation: int) -> bool:
+        with self.connection_lock:
+            return generation == self.connection_generation and self.connected.is_set()
+
+    def _notify_ready(self, generation: int | None = None):
+        with self.ready_lock:
+            if generation is not None and not self._is_current_connection(generation):
+                return
+            if self.ready_notified or not self.connected.is_set():
+                return
+            self.ready_notified = True
+            self.ready.set()
         if self.on_connected is not None:
             self.on_connected()
+
+    def _clear_ready(self, generation: int | None = None):
+        with self.ready_lock:
+            if generation is not None and not self._is_current_connection(generation):
+                return
+            self.ready_notified = False
+            self.ready.clear()
+
+    def _dispatch_text(self, text: str, generation: int | None = None):
+        message = json.loads(text)
+        self._log_control_message(message)
+        self.on_message(message)
+        if message.get("type") == "registered":
+            self._notify_ready(generation)
+
+    def _read_loop(self):
+        generation = self._begin_connection()
+        if self.wait_for_registration:
+            threading.Timer(1.0, self._notify_ready, args=(generation,)).start()
+        else:
+            self._notify_ready(generation)
         try:
             for text in self.ws:
+                if not self._is_current_connection(generation):
+                    break
                 try:
-                    message = json.loads(text)
-                    self._log_control_message(message)
-                    self.on_message(message)
+                    self._dispatch_text(text, generation)
                 except Exception as exc:
                     print(f"ignoring signaling message: {exc}", flush=True)
         finally:
-            print("WebRTC signaling disconnected", flush=True)
-            self.connected.clear()
+            with self.connection_lock:
+                is_current = generation == self.connection_generation
+                if is_current:
+                    self.connected.clear()
+            if is_current:
+                print("WebRTC signaling disconnected", flush=True)
+                self._clear_ready()
 
 
 class ClientSignaling(JsonSignaling):
-    def __init__(self, url: str, role: str, room: str, on_message, on_connected=None):
-        super().__init__(on_message, on_connected)
+    def __init__(
+        self,
+        url: str,
+        role: str,
+        room: str,
+        on_message,
+        on_connected=None,
+        client_id: str = "",
+        client_token: str = "",
+        session_id: str = "",
+    ):
+        super().__init__(on_message, on_connected, wait_for_registration=True)
         self.url = url
         self.role = role
         self.room = room
+        self.client_id = (
+            client_id
+            or os.environ.get("HORUS_WEBRTC_CLIENT_ID", "").strip()
+            or f"{role}:{room}"
+        )
+        self.client_token = (
+            client_token
+            or os.environ.get("HORUS_WEBRTC_CLIENT_TOKEN", "").strip()
+            or os.environ.get("HORUS_WEBRTC_RELAY_TOKEN", "").strip()
+        )
+        self.session_id = session_id or os.environ.get("HORUS_WEBRTC_SESSION_ID", "").strip() or uuid.uuid4().hex
 
     def _registration_text(self) -> str:
-        payload = {"type": "register", "role": self.role, "room": self.room}
-        token = os.environ.get("HORUS_WEBRTC_RELAY_TOKEN", "").strip()
-        if token:
-            payload["token"] = token
+        payload = {
+            "type": "register",
+            "protocol_version": 2,
+            "role": self.role,
+            "room": self.room,
+            "client_id": self.client_id,
+            "session_id": self.session_id,
+        }
+        if self.client_token:
+            payload["token"] = self.client_token
         return json.dumps(payload, separators=(",", ":"))
+
+    def send(self, payload: dict):
+        enriched = dict(payload)
+        enriched.setdefault("protocol_version", 2)
+        enriched.setdefault("client_id", self.client_id)
+        enriched.setdefault("session_id", self.session_id)
+        super().send(enriched)
 
     def start(self):
         if connect is None and websocket is None:
@@ -273,24 +387,27 @@ class ClientSignaling(JsonSignaling):
         threading.Thread(target=run, daemon=True).start()
 
     def _legacy_read_loop(self):
-        self.connected.set()
-        self._flush_pending()
-        if self.on_connected is not None:
-            self.on_connected()
+        generation = self._begin_connection()
+        threading.Timer(1.0, self._notify_ready, args=(generation,)).start()
         try:
             while not self.closed.is_set():
                 text = self.ws.recv()
                 if not text:
                     break
+                if not self._is_current_connection(generation):
+                    break
                 try:
-                    message = json.loads(text)
-                    self._log_control_message(message)
-                    self.on_message(message)
+                    self._dispatch_text(text, generation)
                 except Exception as exc:
                     print(f"ignoring signaling message: {exc}", flush=True)
         finally:
-            print("WebRTC signaling disconnected", flush=True)
-            self.connected.clear()
+            with self.connection_lock:
+                is_current = generation == self.connection_generation
+                if is_current:
+                    self.connected.clear()
+            if is_current:
+                print("WebRTC signaling disconnected", flush=True)
+                self._clear_ready()
 
 
 class ServerSignaling(JsonSignaling):
@@ -313,7 +430,10 @@ class ServerSignaling(JsonSignaling):
                 remote_text = str(remote or "unknown")
             print(f"WebRTC signaling peer connected: {remote_text}", flush=True)
             try:
-                self._read_loop()
+                try:
+                    self._read_loop()
+                except Exception as exc:
+                    print(f"WebRTC signaling peer connection ended: {exc}", flush=True)
             finally:
                 print(f"WebRTC signaling peer disconnected: {remote_text}", flush=True)
 
