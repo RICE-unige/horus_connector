@@ -7,6 +7,9 @@
 .zenoh_profile.env
 .zenoh_tls_profile.env
 config/webrtc_streams.json
+config/webrtc_streams.json.backup-*
+config/webrtc_credentials.json
+config/field_teammate_voice_credentials.json
 __pycache__/
 *.pyc
 *.log

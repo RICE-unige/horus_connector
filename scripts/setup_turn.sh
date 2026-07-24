@@ -12,13 +12,14 @@ TURN_MAX_PORT="${TURN_MAX_PORT:-65535}"
 TURN_REALM="${TURN_REALM:-horus}"
 TURN_USER="${TURN_USER:-horus}"
 TURN_PASSWORD="${TURN_PASSWORD:-}"
+TURN_SECRET="${HORUS_WEBRTC_TURN_SECRET:-}"
 TURN_PUBLIC_IP="${TURN_PUBLIC_IP:-${HORUS_CLOUD_IP:-}}"
 TURN_PRIVATE_IP="${TURN_PRIVATE_IP:-${HORUS_PRIVATE_IP:-}}"
 TURN_LISTEN_IP="${TURN_LISTEN_IP:-0.0.0.0}"
 
-if [[ -z "${TURN_PASSWORD}" || "${TURN_PASSWORD}" == "change-me" ]]; then
+if [[ -z "${TURN_SECRET}" && ( -z "${TURN_PASSWORD}" || "${TURN_PASSWORD}" == "change-me" ) ]]; then
   echo "HORUS_CLOUD_RUN_TURN=1 requires TURN_PASSWORD in .env." >&2
-  echo "Set a real password, then rerun ./horus bootstrap cloud." >&2
+  echo "Set TURN_PASSWORD, or configure HORUS_WEBRTC_TURN_SECRET for expiring credentials." >&2
   exit 2
 fi
 
@@ -65,9 +66,14 @@ tmp_conf="$(mktemp)"
   echo "listening-ip=${TURN_LISTEN_IP}"
   echo "listening-port=${TURN_PORT}"
   echo "fingerprint"
-  echo "lt-cred-mech"
   echo "realm=${TURN_REALM}"
-  echo "user=${TURN_USER}:${TURN_PASSWORD}"
+  if [[ -n "${TURN_SECRET}" ]]; then
+    echo "use-auth-secret"
+    echo "static-auth-secret=${TURN_SECRET}"
+  else
+    echo "lt-cred-mech"
+    echo "user=${TURN_USER}:${TURN_PASSWORD}"
+  fi
   echo "min-port=${TURN_MIN_PORT}"
   echo "max-port=${TURN_MAX_PORT}"
   echo "no-cli"
