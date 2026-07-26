@@ -685,6 +685,19 @@ webrtc_signal_target() {
   fi
 }
 
+webrtc_signal_scheme() {
+  if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" && "${HORUS_WEBRTC_SIGNAL_TLS:-0}" == "1" ]]; then
+    echo "wss"
+  else
+    echo "ws"
+  fi
+}
+
+webrtc_signal_url() {
+  local target="$1"
+  echo "$(webrtc_signal_scheme)://${target}:${WEBRTC_SIGNAL_PORT:-8765}"
+}
+
 ensure_webrtc_media_supported() {
   if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" && "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
     echo "WEBRTC_MEDIA_MODE=jpeg is the legacy direct-mode fallback and does not use the cloud signaling relay." >&2
@@ -1228,6 +1241,11 @@ webrtc_stream_rows() {
   python3 "${ROOT}/scripts/webrtc_streams.py" list --root "${ROOT}" --role "${role}"
 }
 
+webrtc_session_row() {
+  local role="$1"
+  python3 "${ROOT}/scripts/webrtc_streams.py" session-tsv --root "${ROOT}" --role "${role}"
+}
+
 print_webrtc_stream_summary() {
   local role="$1"
   local rows=()
@@ -1254,32 +1272,72 @@ launch_webrtc_robot_h264_streams() {
   local rows=()
   local optional_args=()
   local row service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos source_pipeline
+  local session_mode session_room session_id
   "${ROOT}/scripts/detect_video_stack.sh" --role robot --out "${ROOT}/.webrtc_profile.env" >/dev/null
   build_webrtc_latency_probe_args optional_args
   mapfile -t rows < <(webrtc_stream_rows robot)
+  IFS=$'\t' read -r session_mode session_room session_id < <(webrtc_session_row robot)
+  if [[ "${session_mode}" == "bundled" ]]; then
+    start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
+      --root "${ROOT}" \
+      --streams-config "${HORUS_STREAMS_CONFIG:-config/webrtc_streams.json}" \
+      --signaling-url "$(webrtc_signal_url "${target}")" \
+      --room "${session_room}" \
+      --profile "${ROOT}/.webrtc_profile.env" \
+      --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+      --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
+      --enable-control "${control_enabled}" \
+      --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
+      --allow-unauthenticated-control "${WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL:-0}" \
+      --cmd-max-linear-mps "${WEBRTC_CMD_MAX_LINEAR_MPS:-0.5}" \
+      --cmd-max-angular-rps "${WEBRTC_CMD_MAX_ANGULAR_RPS:-1.0}" \
+      --cmd-watchdog-timeout "${WEBRTC_CMD_WATCHDOG_TIMEOUT:-0.3}" \
+      --cmd-rate-limit-hz "${WEBRTC_CMD_RATE_LIMIT_HZ:-100.0}" \
+      --cmd-max-age-ms "${WEBRTC_CMD_MAX_AGE_MS:-2000.0}" \
+      --cmd-max-future-ms "${WEBRTC_CMD_MAX_FUTURE_MS:-5000.0}" \
+      --adaptive-bitrate "${WEBRTC_ADAPTIVE_BITRATE:-1}" \
+      --min-bitrate-kbit "${WEBRTC_MIN_BITRATE_KBIT:-1000}" \
+      --max-bitrate-kbit "${WEBRTC_MAX_BITRATE_KBIT:-6000}" \
+      --bitrate-step-kbit "${WEBRTC_BITRATE_STEP_KBIT:-500}" \
+      --bitrate-check-sec "${WEBRTC_BITRATE_CHECK_SEC:-2.0}" \
+      --bitrate-bad-loss "${WEBRTC_BITRATE_BAD_LOSS:-0.08}" \
+      --bitrate-good-loss "${WEBRTC_BITRATE_GOOD_LOSS:-0.02}" \
+      --bitrate-bad-rtt-ms "${WEBRTC_BITRATE_BAD_RTT_MS:-350.0}" \
+      --bitrate-good-rtt-ms "${WEBRTC_BITRATE_GOOD_RTT_MS:-150.0}" \
+      --bitrate-good-samples "${WEBRTC_BITRATE_GOOD_SAMPLES:-3}" \
+      "${optional_args[@]}" \
+      --duration "${WEBRTC_DURATION:-86400}"
+    return
+  fi
   for row in "${rows[@]}"; do
     IFS=$'\t' read -r service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos <<< "${row}"
     source_pipeline="$(decode_b64 "${source_pipeline_b64}")"
     start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
-      --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
+      --signaling-url "$(webrtc_signal_url "${target}")" \
       --room "${room}" \
       --profile "${ROOT}/.webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
       --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
       --enable-control "${control_enabled}" \
       --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
-      --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
       --allow-unauthenticated-control "${WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL:-0}" \
       --cmd-max-linear-mps "${WEBRTC_CMD_MAX_LINEAR_MPS:-0.5}" \
       --cmd-max-angular-rps "${WEBRTC_CMD_MAX_ANGULAR_RPS:-1.0}" \
       --cmd-watchdog-timeout "${WEBRTC_CMD_WATCHDOG_TIMEOUT:-0.3}" \
       --cmd-rate-limit-hz "${WEBRTC_CMD_RATE_LIMIT_HZ:-100.0}" \
+      --cmd-max-age-ms "${WEBRTC_CMD_MAX_AGE_MS:-2000.0}" \
+      --cmd-max-future-ms "${WEBRTC_CMD_MAX_FUTURE_MS:-5000.0}" \
       --video-bitrate-kbit "${bitrate}" \
       --adaptive-bitrate "${WEBRTC_ADAPTIVE_BITRATE:-1}" \
       --min-bitrate-kbit "${WEBRTC_MIN_BITRATE_KBIT:-1000}" \
       --max-bitrate-kbit "${WEBRTC_MAX_BITRATE_KBIT:-${bitrate}}" \
       --bitrate-step-kbit "${WEBRTC_BITRATE_STEP_KBIT:-500}" \
       --bitrate-check-sec "${WEBRTC_BITRATE_CHECK_SEC:-2.0}" \
+      --bitrate-bad-loss "${WEBRTC_BITRATE_BAD_LOSS:-0.08}" \
+      --bitrate-good-loss "${WEBRTC_BITRATE_GOOD_LOSS:-0.02}" \
+      --bitrate-bad-rtt-ms "${WEBRTC_BITRATE_BAD_RTT_MS:-350.0}" \
+      --bitrate-good-rtt-ms "${WEBRTC_BITRATE_GOOD_RTT_MS:-150.0}" \
+      --bitrate-good-samples "${WEBRTC_BITRATE_GOOD_SAMPLES:-3}" \
       --video-source "${video_source}" \
       --ros-image-topic "${input_topic}" \
       --ros-image-qos "${qos}" \
@@ -1301,9 +1359,37 @@ launch_webrtc_receiver_h264_streams() {
   local optional_args=()
   local use_local_signal_relay=0
   local row service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos
+  local session_mode session_room session_id
   "${ROOT}/scripts/detect_video_stack.sh" --role "${role}" --out "${ROOT}/.webrtc_profile.env" >/dev/null
   build_webrtc_latency_receiver_args optional_args
   mapfile -t rows < <(webrtc_stream_rows machine)
+  IFS=$'\t' read -r session_mode session_room session_id < <(webrtc_session_row machine)
+  if [[ "${session_mode}" == "bundled" ]]; then
+    local bundled_signal_args=()
+    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
+      bundled_signal_args+=(--signaling-url "$(webrtc_signal_url "${target}")")
+    else
+      bundled_signal_args+=(--host 0.0.0.0 --port "${WEBRTC_SIGNAL_PORT:-8765}")
+    fi
+    start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
+      --root "${ROOT}" \
+      --streams-config "${HORUS_STREAMS_CONFIG:-config/webrtc_streams.json}" \
+      "${bundled_signal_args[@]}" \
+      --room "${session_room}" \
+      --profile "${ROOT}/.webrtc_profile.env" \
+      --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
+      --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
+      --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
+      --video-output "${WEBRTC_VIDEO_OUTPUT:-ros2}" \
+      --ros-image-encoding "${WEBRTC_ROS_IMAGE_OUTPUT_ENCODING:-rgb8}" \
+      --cmd-rate "${cmd_rate}" \
+      --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
+      --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
+      --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
+      "${optional_args[@]}" \
+      --duration "${WEBRTC_DURATION:-86400}"
+    return
+  fi
   if [[ "${HORUS_TOPOLOGY:-hub}" == "direct" && "${#rows[@]}" -gt 1 ]]; then
     launch_signal_relay
     target="127.0.0.1"
@@ -1313,7 +1399,7 @@ launch_webrtc_receiver_h264_streams() {
     IFS=$'\t' read -r service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos <<< "${row}"
     if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" || "${use_local_signal_relay}" == "1" ]]; then
       start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
-        --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
+        --signaling-url "$(webrtc_signal_url "${target}")" \
         --room "${room}" \
         --profile "${ROOT}/.webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
@@ -1365,14 +1451,13 @@ launch_webrtc_robot() {
   if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "jpeg" ]]; then
     build_ice_args optional_args
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_sender.py" \
-      --signaling-url "ws://${target}:${WEBRTC_SIGNAL_PORT:-8765}" \
+      --signaling-url "$(webrtc_signal_url "${target}")" \
       --duration "${WEBRTC_DURATION:-86400}" \
       --camera-fps-scale "${CAMERA_FPS_SCALE:-1.0}" \
       --quality-scale "${CAMERA_QUALITY_SCALE:-1.0}" \
       --max-buffer-bytes "${WEBRTC_MAX_BUFFER_BYTES:-2000000}" \
       --enable-control "${control_enabled}" \
       --ros-cmd-topic "${ROS_CMD_TOPIC:-/cmd_vel}" \
-      --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
       --allow-unauthenticated-control "${WEBRTC_ALLOW_UNAUTHENTICATED_CONTROL:-0}" \
       --cmd-max-linear-mps "${WEBRTC_CMD_MAX_LINEAR_MPS:-0.5}" \
       --cmd-max-angular-rps "${WEBRTC_CMD_MAX_ANGULAR_RPS:-1.0}" \
@@ -1417,17 +1502,34 @@ launch_webrtc_receiver() {
 launch_signal_relay() {
   local py
   local relay_auth_args=()
+  local relay_security_args=()
   py="$(signal_python_bin)"
-  if [[ -n "${HORUS_WEBRTC_RELAY_TOKEN:-}" ]]; then
-    relay_auth_args+=(--auth-token "${HORUS_WEBRTC_RELAY_TOKEN}")
-  elif [[ "${HORUS_WEBRTC_RELAY_ALLOW_UNAUTHENTICATED:-0}" == "1" ]]; then
+  if [[ -z "${HORUS_WEBRTC_RELAY_TOKEN:-}" && "${HORUS_WEBRTC_RELAY_ALLOW_UNAUTHENTICATED:-0}" == "1" ]]; then
     relay_auth_args+=(--allow-unauthenticated)
+  fi
+  if [[ "${HORUS_VOICE_TRUSTED_DEVELOPMENT:-1}" == "1" ]]; then
+    relay_auth_args+=(--allow-unauthenticated-voice)
+  fi
+  if [[ -n "${HORUS_WEBRTC_CREDENTIALS_FILE:-}" ]]; then
+    relay_security_args+=(--credentials-file "${HORUS_WEBRTC_CREDENTIALS_FILE}")
+  fi
+  if [[ "${HORUS_WEBRTC_SIGNAL_TLS:-0}" == "1" ]]; then
+    relay_security_args+=(--tls-cert "${HORUS_WEBRTC_SIGNAL_TLS_CERT:-}" --tls-key "${HORUS_WEBRTC_SIGNAL_TLS_KEY:-}")
+  fi
+  if [[ -n "${HORUS_WEBRTC_TURN_PUBLIC_HOST:-}" && -n "${HORUS_WEBRTC_TURN_SECRET:-}" ]]; then
+    relay_security_args+=(
+      --turn-host "${HORUS_WEBRTC_TURN_PUBLIC_HOST}"
+      --turn-port "${TURN_PORT:-3478}"
+      --turn-ttl-sec "${HORUS_WEBRTC_TURN_TTL_SEC:-3600}"
+      --turn-transports "${HORUS_WEBRTC_TURN_TRANSPORTS:-udp,tcp}"
+    )
   fi
   start_bg signal "${py}" "${ROOT}/scripts/webrtc_signal_relay.py" \
     --host 0.0.0.0 \
     --port "${WEBRTC_SIGNAL_PORT:-8765}" \
     --state-file "${RUN_DIR}/signal_members.json" \
-    "${relay_auth_args[@]}"
+    "${relay_auth_args[@]}" \
+    "${relay_security_args[@]}"
 }
 
 launch_metrics() {

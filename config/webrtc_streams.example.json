@@ -1,5 +1,10 @@
 {
-  "version": 1,
+  "version": 2,
+  "session": {
+    "id": "robot-a",
+    "room": "robot-a",
+    "mode": "bundled"
+  },
   "streams": [
     {
       "id": "primary",
@@ -20,10 +25,10 @@
     {
       "id": "secondary",
       "label": "Secondary camera",
-      "room": "robot-b",
+      "room": "robot-a",
       "enabled": true,
       "input_topic": "/camera/image_raw",
-      "output_topic": "/robot_b/camera/secondary/webrtc/image_raw",
+      "output_topic": "/robot_a/camera/secondary/webrtc/image_raw",
       "width": 1280,
       "height": 720,
       "fps": 30,
@@ -31,7 +36,7 @@
       "video_source": "ros2",
       "source_pipeline": "",
       "ros_image_qos": "auto",
-      "frame_id": "robot_b_secondary_webrtc_camera"
+      "frame_id": "robot_a_secondary_webrtc_camera"
     }
   ]
 }

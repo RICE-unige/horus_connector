@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "session": {
+    "id": "bundled-test",
+    "room": "bundled-test",
+    "mode": "bundled"
+  },
+  "streams": [
+    {
+      "id": "front",
+      "room": "bundled-test",
+      "input_topic": "/test/front/image_raw",
+      "output_topic": "/test/front/webrtc/image_raw",
+      "width": 640,
+      "height": 360,
+      "fps": 15,
+      "bitrate_kbit": 1000,
+      "min_bitrate_kbit": 500,
+      "max_bitrate_kbit": 1500,
+      "video_source": "testsrc",
+      "ros_image_qos": "sensor_data",
+      "frame_id": "front_camera"
+    },
+    {
+      "id": "rear",
+      "room": "bundled-test",
+      "input_topic": "/test/rear/image_raw",
+      "output_topic": "/test/rear/webrtc/image_raw",
+      "width": 320,
+      "height": 240,
+      "fps": 15,
+      "bitrate_kbit": 750,
+      "min_bitrate_kbit": 350,
+      "max_bitrate_kbit": 1000,
+      "video_source": "testsrc",
+      "ros_image_qos": "sensor_data",
+      "frame_id": "rear_camera"
+    }
+  ]
+}

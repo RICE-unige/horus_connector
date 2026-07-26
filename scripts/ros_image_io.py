@@ -95,11 +95,12 @@ def contiguous_image_bytes(data, step: int, expected_step: int, height: int) -> 
 class RosImageAppSrc:
     """Subscribes to sensor_msgs/Image and pushes raw frames into appsrc."""
 
-    def __init__(self, appsrc, topic: str, fps: int, qos_name: str):
+    def __init__(self, appsrc, topic: str, fps: int, qos_name: str, node_name: str = "horus_webrtc_image_source"):
         self.appsrc = appsrc
         self.topic = topic
         self.fps = max(1, int(fps or 30))
         self.qos_name = qos_name
+        self.node_name = node_name
         self.rclpy = None
         self.node = None
         self.executor = None
@@ -124,7 +125,7 @@ class RosImageAppSrc:
         from sensor_msgs.msg import Image
 
         self.image_type = Image
-        self.node = self.rclpy.create_node("horus_webrtc_image_source")
+        self.node = self.rclpy.create_node(self.node_name)
         for profile in subscription_qos_profiles(self.qos_name):
             self.subscriptions.append(self.node.create_subscription(Image, self.topic, self._on_image, profile))
         self.executor = SingleThreadedExecutor()
@@ -235,11 +236,19 @@ class RosImageAppSrc:
 class RosImagePublisher:
     """Publishes decoded WebRTC frames as sensor_msgs/Image."""
 
-    def __init__(self, topic: str, encoding: str, frame_id: str, qos_name: str):
+    def __init__(
+        self,
+        topic: str,
+        encoding: str,
+        frame_id: str,
+        qos_name: str,
+        node_name: str = "horus_webrtc_image_publisher",
+    ):
         self.topic = topic
         self.encoding = encoding or "rgb8"
         self.frame_id = frame_id or "webrtc_camera"
         self.qos_name = qos_name
+        self.node_name = node_name
         self.rclpy = None
         self.node = None
         self.publisher = None
@@ -257,7 +266,7 @@ class RosImagePublisher:
         from sensor_msgs.msg import Image
 
         self.image_type = Image
-        self.node = self.rclpy.create_node("horus_webrtc_image_publisher")
+        self.node = self.rclpy.create_node(self.node_name)
         self.publisher = self.node.create_publisher(Image, self.topic, qos_profile(self.qos_name))
         print(f"Publishing decoded WebRTC images to {self.topic}", flush=True)
 

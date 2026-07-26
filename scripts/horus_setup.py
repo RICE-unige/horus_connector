@@ -187,18 +187,21 @@ class Wizard:
                 return
 
         total = 6
-        self.section(1, total, "Machine role")
+        self.section(1, total, "Role")
         default_role = self.args.role or valid_or(self.existing.get("HORUS_ROLE"), ROLE_HELP, "robot")
-        while True:
-            role = self.prompt_choice("What role should this computer run?", list(ROLE_HELP), default_role, ROLE_HELP)
-            if not self.interactive or role == default_role:
-                break
-            if self.prompt_yes_no(
-                f"You changed the role from {default_role} to {role}. Continue?",
-                True,
-                "Choose no if this is accidental; the role controls which services run here.",
-            ):
-                break
+        if self.args.role:
+            role = self.args.role
+        else:
+            while True:
+                role = self.prompt_choice("What role should this computer run?", list(ROLE_HELP), default_role, ROLE_HELP)
+                if not self.interactive or role == default_role:
+                    break
+                if self.prompt_yes_no(
+                    f"You changed the role from {default_role} to {role}. Continue?",
+                    True,
+                    "Choose no if this is accidental; the role controls which services run here.",
+                ):
+                    break
         print(f"Selected role: {self.color.paint(role, 'green')} - {ROLE_HELP[role]}\n")
 
         self.section(2, total, "Connection topology")
@@ -491,6 +494,7 @@ class Wizard:
             "WEBRTC_ROS_IMAGE_OUTPUT_TOPIC": output_topic,
             "WEBRTC_ROS_IMAGE_QOS": "auto",
             "HORUS_STREAMS_CONFIG": "config/webrtc_streams.json",
+            "HORUS_WEBRTC_SESSION_MODE": "bundled",
             "VIDEO_BITRATE_KBIT": str(bitrate),
             "WEBRTC_MIN_BITRATE_KBIT": "1000",
             "WEBRTC_MAX_BITRATE_KBIT": str(bitrate),
@@ -684,7 +688,7 @@ class Wizard:
         for index in range(requested_count):
             existing_stream = existing[index] if index < len(existing) else {}
             default_id = str(existing_stream.get("id") or ("primary" if index == 0 else f"camera-{index + 1}"))
-            default_room = str(existing_stream.get("room") or (room if index == 0 else f"{room}-{default_id}"))
+            default_room = room
             identifier = default_id
             stream_room = default_room
             input_default = str(existing_stream.get("input_topic") or (camera_topic if index == 0 else f"/camera/{ros_safe_name(default_id)}/image_raw"))
@@ -692,13 +696,6 @@ class Wizard:
             if self.interactive and requested_count > 1:
                 print(self.color.paint(f"Camera stream {index + 1}", "blue"))
                 identifier = self.prompt_text("Stream ID", default_id, required=True, validator=is_name)
-                stream_room = self.prompt_text(
-                    "WebRTC room",
-                    stream_room,
-                    required=True,
-                    validator=is_name,
-                    hint="Sender and receiver must use the same room for this camera stream.",
-                )
                 if role == "robot":
                     input_default = self.prompt_text("ROS image input topic", input_default, required=True, validator=is_topic)
                     output_default = self.stream_output_default(stream_room, identifier)
@@ -759,7 +756,12 @@ class Wizard:
             backup = path.with_name(f"{path.name}.backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
             shutil.copy2(path, backup)
             print(f"Stream config backup written: {backup}")
-        payload = {"version": 1, "streams": self.streams}
+        room = self.values.get("HORUS_ROOM", "default")
+        payload = {
+            "version": 2,
+            "session": {"id": room, "room": room, "mode": "bundled"},
+            "streams": self.streams,
+        }
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(f"Stream config written: {path}\n")
 
