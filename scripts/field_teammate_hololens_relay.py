@@ -3,9 +3,9 @@
 
 This process is the ROS 2 driver for a human field teammate. The HoloLens app
 keeps running as a lightweight edge device: it exposes a pose stream on the SI
-port and JPEG personal-video frames on the PV port. This relay dials the
-headset, converts those streams into the normal HORUS field-teammate ROS
-contract, and leaves SDK registration unchanged.
+port and JPEG personal-video frames with capture-time locatable-camera metadata
+on the PV port. This relay dials the headset, converts those streams into the
+normal HORUS field-teammate ROS contract, and leaves SDK registration unchanged.
 
 Typical run:
     cd ~/horus_connector
@@ -19,6 +19,7 @@ Default video profile:
 Useful checks:
     ros2 run rqt_image_view rqt_image_view /field_teammate_1/fpv/image_raw
     ros2 topic hz /field_teammate_1/fpv/image_raw/compressed
+    ros2 topic echo /field_teammate_1/fpv/camera_pose --once
     ros2 topic echo /field_teammate_1/fpv/camera_info --once
     ros2 topic echo /field_teammate_1/localization_confidence
     ros2 run tf2_ros tf2_echo map field_teammate_1/base
@@ -27,6 +28,7 @@ Useful checks:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import math
 import queue
@@ -36,7 +38,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 # This relay is the CANONICAL live implementation of the HORUS field-teammate
 # topic contract (the SDK deliberately ships no copy). The source of truth for
@@ -44,8 +46,8 @@ from typing import Any, Callable
 #   horus_sdk/contracts/fixtures/field_teammate_hololens.json  (field_teammate.v1)
 # The SDK freezes those topic names in
 # test_field_teammate_payload.py::test_field_teammate_topic_contract_frozen;
-# this repo freezes the relay dry-run contract and teammate Zenoh transport
-# scope in tests/test_field_teammate_contract.py. If these tests ever change,
+# this repo freezes the relay dry-run contract and local ROS-only teammate role
+# in tests/test_field_teammate_contract.py. If these tests ever change,
 # update all three contract surfaces in lockstep.
 FIELD_TEAMMATE_CONTRACT_VERSION = "field_teammate.v1"
 
@@ -85,6 +87,14 @@ VIDEO_PROFILES: dict[str, dict[str, Any] | None] = {
         "fps": 30,
         "jpegQuality": 45,
     },
+    "mapping": {
+        "profile": "mapping",
+        "captureMode": "auto",
+        "width": 640,
+        "height": 360,
+        "fps": 15,
+        "jpegQuality": 80,
+    },
 }
 
 
@@ -114,6 +124,7 @@ class FieldTeammateTopics:
     first_person_video_raw_topic: str
     first_person_video_topic: str
     first_person_video_camera_info_topic: str
+    first_person_video_camera_pose_topic: str
     localization_confidence_topic: str
     guidance_request_topic: str
     guidance_response_topic: str
@@ -134,6 +145,7 @@ class FieldTeammateTopics:
             first_person_video_raw_topic=f"{prefix}/fpv/image_raw",
             first_person_video_topic=f"{prefix}/fpv/image_raw/compressed",
             first_person_video_camera_info_topic=f"{prefix}/fpv/camera_info",
+            first_person_video_camera_pose_topic=f"{prefix}/fpv/camera_pose",
             localization_confidence_topic=f"{prefix}/localization_confidence",
             guidance_request_topic=f"{prefix}/guidance/request",
             guidance_response_topic=f"{prefix}/guidance/response",
@@ -154,6 +166,31 @@ class HoloLensRelayEndpoint:
     unity_message_queue_port: int = DEFAULT_UMQ_PORT
 
 
+@dataclass(frozen=True)
+class TimedCameraPose:
+    """One HoloLens head-camera pose on the headset monotonic clock."""
+
+    timestamp: float
+    arrival_monotonic: float
+    position: tuple[float, float, float]
+    orientation: tuple[float, float, float, float]
+
+
+def _nearest_camera_pose(
+    samples: Iterable[TimedCameraPose],
+    timestamp: float,
+    max_delta_seconds: float = 0.10,
+) -> TimedCameraPose | None:
+    """Return the closest capture-clock pose within a strict time tolerance."""
+
+    if not math.isfinite(timestamp) or timestamp <= 0.0:
+        return None
+    nearest = min(samples, key=lambda sample: abs(sample.timestamp - timestamp), default=None)
+    if nearest is None or abs(nearest.timestamp - timestamp) > max_delta_seconds:
+        return None
+    return nearest
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -162,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hololens-host",
         required=True,
-        help="IPv4/hostname of the HoloLens as shown in the HORUS Lenses status panel.",
+        help="IPv4/hostname of the HoloLens as shown in the HORUS Field status panel.",
     )
     parser.add_argument("--pv-port", type=int, default=DEFAULT_PV_PORT, help="HoloLens personal-video stream port.")
     parser.add_argument(
@@ -205,7 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="camera",
         help=(
             "Interpret the HoloLens pose stream as the camera/head pose or as the floor-level base pose. "
-            "The deployed HORUS Lenses app publishes camera/head pose."
+            "The deployed HORUS Field app publishes camera/head pose."
         ),
     )
     parser.add_argument(
@@ -246,7 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Runtime HoloLens PV profile. Default: fast60. 'app' keeps the deployed app config; "
             "'balanced'=640x360@30 q55; 'fast60'=640x360@60 q25 VideoConferencing; "
-            "'hd720'=1280x720@30 q45."
+            "'hd720'=1280x720@30 q45; 'mapping'=640x360@15 q80 for concurrent Research Mode."
         ),
     )
     parser.add_argument(
@@ -258,6 +295,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video-height", type=int, help="Override runtime HoloLens PV height.")
     parser.add_argument("--video-fps", type=int, help="Override runtime HoloLens PV target FPS.")
     parser.add_argument("--video-quality", type=int, help="Override runtime HoloLens JPEG quality, 25-95.")
+    parser.add_argument(
+        "--voice-signaling-host",
+        default="",
+        help="Voice signaling host. Default: use the relay's network route to the HoloLens.",
+    )
+    parser.add_argument("--voice-signaling-port", type=int, default=8765)
+    parser.add_argument("--voice-signaling-secure", action="store_true")
+    parser.add_argument(
+        "--voice-token",
+        default="",
+        help="Optional production client credential. Empty enables trusted-development voice.",
+    )
+    parser.add_argument(
+        "--voice-ice-server",
+        action="append",
+        default=[],
+        help="Fallback STUN/TURN URI sent to HORUS Field. May be repeated.",
+    )
+    parser.add_argument("--disable-voice", action="store_true")
     parser.add_argument(
         "--check-endpoint",
         action="store_true",
@@ -279,6 +335,7 @@ def _topic_contract(name: str) -> dict[str, Any]:
             "first_person_video_raw": config.first_person_video_raw_topic,
             "first_person_video": config.first_person_video_topic,
             "first_person_video_camera_info": config.first_person_video_camera_info_topic,
+            "first_person_video_camera_pose": config.first_person_video_camera_pose_topic,
             "guidance_response": config.guidance_response_topic,
             "guidance_state": config.guidance_state_topic,
         },
@@ -344,6 +401,33 @@ def _build_video_profile_command(args: argparse.Namespace) -> dict[str, Any] | N
     if has_override and args.video_profile == "app":
         command["profile"] = "custom"
     return command
+
+
+def _build_voice_config_command(
+    args: argparse.Namespace,
+    fallback_host: str = "",
+) -> dict[str, Any] | None:
+    if bool(args.disable_voice):
+        return None
+    host = str(args.voice_signaling_host or fallback_host or "").strip()
+    if not host:
+        return None
+    room = str(args.name or "field_teammate_1").strip()
+    token = str(args.voice_token or "")
+    scheme = "wss" if bool(args.voice_signaling_secure) else "ws"
+    return {
+        "type": "configure_voice",
+        "signalingUrl": f"{scheme}://{host}:{int(args.voice_signaling_port)}",
+        "room": room,
+        "clientId": f"field_teammate:{room}",
+        "token": token,
+        "trustedDevelopment": not bool(token),
+        "autoConnect": True,
+        "relayOnly": False,
+        "fallbackIceServers": [
+            str(value).strip() for value in args.voice_ice_server if str(value).strip()
+        ],
+    }
 
 
 def _unity_vec_to_ros(vector: dict[str, Any]) -> tuple[float, float, float]:
@@ -551,7 +635,7 @@ def _read_control_ack(stream, timeout: float) -> dict[str, Any] | None:
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
-            if text.startswith("HORUS_UMQ_STREAM") or text.startswith("HORUS Lenses"):
+            if text.startswith("HORUS_UMQ_STREAM") or text.startswith("HORUS Field"):
                 continue
             return {"type": "unexpected_control_line", "line": text}
         if isinstance(parsed, dict):
@@ -562,7 +646,7 @@ def _read_control_ack(stream, timeout: float) -> dict[str, Any] | None:
 def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
     try:
         import rclpy
-        from geometry_msgs.msg import TransformStamped
+        from geometry_msgs.msg import PoseStamped, TransformStamped
         from rclpy.executors import ExternalShutdownException
         from rclpy.node import Node
         from sensor_msgs.msg import CameraInfo, CompressedImage, Image
@@ -606,6 +690,8 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             self._fpv_pub = self.create_publisher(CompressedImage, contract_config.first_person_video_topic, 10)
             self._camera_info_topic = contract_config.first_person_video_camera_info_topic
             self._camera_info_pub = self.create_publisher(CameraInfo, self._camera_info_topic, 10)
+            self._camera_pose_topic = contract_config.first_person_video_camera_pose_topic
+            self._camera_pose_pub = self.create_publisher(PoseStamped, self._camera_pose_topic, 10)
             self._guidance_state_pub = self.create_publisher(String, contract_config.guidance_state_topic, 10)
             self._guidance_response_pub = self.create_publisher(String, contract_config.guidance_response_topic, 10)
             self._guidance_subscriptions = [
@@ -655,7 +741,13 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             self._video_count = 0
             self._last_video_width = 0
             self._last_video_height = 0
+            self._video_pose_count = 0
+            self._video_native_pose_count = 0
+            self._video_fallback_pose_count = 0
+            self._pose_history_lock = threading.Lock()
+            self._pose_history: deque[TimedCameraPose] = deque(maxlen=240)
             self._last_video_profile_ack: dict[str, Any] | None = None
+            self._last_voice_config_ack: dict[str, Any] | None = None
             self._control_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=32)
             if self._video_profile_command is not None:
                 self._enqueue_control(self._video_profile_command)
@@ -726,6 +818,14 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                             if greeting and not greeting.startswith(UMQ_GREETING):
                                 self.get_logger().warning(f"Unexpected UMQ greeting: {greeting!r}")
                             self.get_logger().info("Connected to HoloLens control stream.")
+                            local_host = str(sock.getsockname()[0])
+                            voice_command = _build_voice_config_command(args, local_host)
+                            if voice_command is not None:
+                                self._enqueue_control(voice_command)
+                                self.get_logger().info(
+                                    "Configured HoloLens voice from the HORUS relay route: "
+                                    f"{voice_command['signalingUrl']} room={voice_command['room']}"
+                                )
                             while not self._stop.is_set():
                                 try:
                                     command = self._control_queue.get(timeout=0.1)
@@ -743,6 +843,8 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                                     break
                                 if ack.get("type") == "video_profile_ack":
                                     self._last_video_profile_ack = ack
+                                elif ack.get("type") == "voice_config_ack":
+                                    self._last_voice_config_ack = ack
                                 self.get_logger().info(
                                     "HoloLens control acknowledged: " + json.dumps(ack, sort_keys=True)
                                 )
@@ -821,6 +923,16 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
         def _publish_pose(self, payload: dict[str, Any]) -> None:
             position = _unity_vec_to_ros(payload.get("position") or {})
             head_rotation = _orientation_from_pose(payload)
+            source_timestamp = float(payload.get("timestamp") or 0.0)
+            if math.isfinite(source_timestamp) and source_timestamp > 0.0:
+                sample = TimedCameraPose(
+                    timestamp=source_timestamp,
+                    arrival_monotonic=time.monotonic(),
+                    position=(float(position[0]), float(position[1]), float(position[2])),
+                    orientation=head_rotation,
+                )
+                with self._pose_history_lock:
+                    self._pose_history.append(sample)
             base_rotation = _yaw_to_quaternion(_yaw_from_pose(payload))
             camera_rotation = _quaternion_multiply(_quaternion_inverse(base_rotation), head_rotation)
             base_z = float(position[2])
@@ -1011,33 +1123,103 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             msg.header.frame_id = self._camera_frame
             msg.format = "jpeg"
             msg.data = data
-            self._fpv_pub.publish(msg)
             width = int(header.get("width") or 0)
             height = int(header.get("height") or 0)
+            self._publish_frame_camera_pose(msg, header)
             if width > 0 and height > 0:
                 if width != self._last_video_width or height != self._last_video_height:
                     self.get_logger().info(f"HoloLens PV frame size: {width}x{height}")
                 self._last_video_width = width
                 self._last_video_height = height
-                self._publish_camera_info(msg, width, height)
+                self._publish_camera_info(msg, width, height, header)
+            # Pose and calibration are deliberately published first with this
+            # exact timestamp so downstream capture can persist one atomic frame.
+            self._fpv_pub.publish(msg)
             self._publish_raw_image(msg, data)
             self._video_count += 1
             self._publish_status(1.0)
 
-        def _publish_camera_info(self, compressed: CompressedImage, width: int, height: int) -> None:
-            # Temporary uncalibrated pinhole model. Replace with HoloLens PV
-            # intrinsics once the hl2ss capture backend is used.
-            fx = float(width) * 0.8
-            fy = float(width) * 0.8
-            cx = float(width) * 0.5
-            cy = float(height) * 0.5
+        def _publish_frame_camera_pose(self, compressed: CompressedImage, header: dict[str, Any]) -> None:
+            position = None
+            orientation = None
+            if bool(header.get("tracking_valid")):
+                camera_pose = header.get("camera_pose")
+                if isinstance(camera_pose, dict) and isinstance(camera_pose.get("position"), dict):
+                    position = _unity_vec_to_ros(camera_pose["position"])
+                    orientation = _orientation_from_pose(camera_pose)
+                    self._video_native_pose_count += 1
+
+            if position is None or orientation is None:
+                source_timestamp = float(header.get("timestamp") or 0.0)
+                with self._pose_history_lock:
+                    history = tuple(self._pose_history)
+                nearest = _nearest_camera_pose(history, source_timestamp)
+                if nearest is None and history:
+                    # Current HORUS Field builds timestamp WinMD PV callbacks
+                    # with Unix time while the pose stream uses Unity uptime.
+                    # Until the corrected app is redeployed, use the newest
+                    # pose received on this same relay clock, but only while it
+                    # is fresh enough to represent this video frame.
+                    latest = history[-1]
+                    if time.monotonic() - latest.arrival_monotonic <= 0.10:
+                        nearest = latest
+                if nearest is None:
+                    return
+                position = nearest.position
+                orientation = nearest.orientation
+                self._video_fallback_pose_count += 1
+
+            pose = PoseStamped()
+            pose.header.stamp = compressed.header.stamp
+            pose.header.frame_id = self._map_frame
+            pose.pose.position.x = float(position[0])
+            pose.pose.position.y = float(position[1])
+            pose.pose.position.z = float(position[2])
+            pose.pose.orientation.x = orientation[0]
+            pose.pose.orientation.y = orientation[1]
+            pose.pose.orientation.z = orientation[2]
+            pose.pose.orientation.w = orientation[3]
+            self._camera_pose_pub.publish(pose)
+            self._video_pose_count += 1
+
+        def _publish_camera_info(
+            self,
+            compressed: CompressedImage,
+            width: int,
+            height: int,
+            frame_header: dict[str, Any],
+        ) -> None:
+            intrinsics = frame_header.get("camera_intrinsics")
+            calibrated = isinstance(intrinsics, dict)
+            if calibrated:
+                source_width = max(1, int(intrinsics.get("width") or width))
+                source_height = max(1, int(intrinsics.get("height") or height))
+                scale_x = float(width) / float(source_width)
+                scale_y = float(height) / float(source_height)
+                fx = float(intrinsics.get("fx") or 0.0) * scale_x
+                fy = float(intrinsics.get("fy") or 0.0) * scale_y
+                cx = float(intrinsics.get("cx") or 0.0) * scale_x
+                cy = float(intrinsics.get("cy") or 0.0) * scale_y
+                distortion = [
+                    float(intrinsics.get("k1") or 0.0),
+                    float(intrinsics.get("k2") or 0.0),
+                    float(intrinsics.get("p1") or 0.0),
+                    float(intrinsics.get("p2") or 0.0),
+                    float(intrinsics.get("k3") or 0.0),
+                ]
+            else:
+                fx = float(width) * 0.8
+                fy = float(width) * 0.8
+                cx = float(width) * 0.5
+                cy = float(height) * 0.5
+                distortion = [0.0, 0.0, 0.0, 0.0, 0.0]
 
             info = CameraInfo()
             info.header = compressed.header
             info.width = int(width)
             info.height = int(height)
-            info.distortion_model = "plumb_bob"
-            info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+            info.distortion_model = "plumb_bob" if calibrated else "synthetic_pinhole"
+            info.d = distortion
             info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
             info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
             info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
@@ -1079,6 +1261,10 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                             "localization_confidence": round(float(confidence), 3),
                             "pose_frames": self._pose_count,
                             "video_frames": self._video_count,
+                            "video_frames_with_locatable_pose": self._video_native_pose_count,
+                            "video_frames_with_color_pose": self._video_pose_count,
+                            "video_frames_with_native_pv_pose": self._video_native_pose_count,
+                            "video_frames_with_head_pose_fallback": self._video_fallback_pose_count,
                             "video_width": self._last_video_width,
                             "video_height": self._last_video_height,
                             "video_profile_ack": self._last_video_profile_ack,
@@ -1086,7 +1272,7 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                             "pose_origin": self._pose_origin,
                             "camera_height_m": round(self._camera_height, 3),
                             "floor_height_m": round(self._floor_height, 3),
-                            "source": "horus_lenses",
+                            "source": "horus_field",
                         }
                     )
                 )
