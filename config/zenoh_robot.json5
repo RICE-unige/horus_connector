@@ -9,8 +9,19 @@
       allow: {
         publishers: ["^/.*$"],
         subscribers: [
+          // Registration replies, heartbeat, model requests, leases and task state.
+          "^/(.*/)?horus/.*$",
           "^/cmd_vel$",
           "^/.*/cmd_vel$",
+          "^/cmd/velocity$",
+          "^/.*/cmd/velocity$",
+          "^/goal$",
+          "^/.*/goal$",
+          "^/goal_pose$",
+          "^/.*/goal_pose$",
+          "^/move_base_simple/goal$",
+          "^/.*/move_base_simple/goal$",
+          "^/.*/command$",
         ],
         service_servers: ["^/.*$"],
         service_clients: ["^/.*$"],
@@ -18,30 +29,38 @@
         action_clients: ["^/.*$"],
       },
 
-      pub_max_frequencies: [
-        ".*/tf$=20",
-        ".*/tf_static$=1",
-        ".*/odom$=20",
-        ".*/joint_states$=20",
-        ".*/scan$=10",
-        ".*/points$=1",
-      ],
+      // Sampling a TFMessage can lose unrelated child frames. Rate limits
+      // are opt-in workload settings, never implicit transport defaults.
+      pub_max_frequencies: [],
 
       pub_priorities: [
+        ".*/tf(_static)?$=1:express",
+        ".*/clock$=1:express",
+        ".*/(client_signal|server_signal|indexed_request|request_keyframe)$=1:express",
+        ".*/(indexed_manifest|manifest)$=2:express",
+        ".*/(image_raw|image|compressed)(/compressed)?$=2:express",
+        ".*/horus/robot_description/chunk_.*$=6",
+        ".*/horus/gaussian_splat/chunk_.*$=6",
+        ".*/(mesh|mesh_map|gaussian_splat)(/.*)?$=6",
+        ".*/(cloud_map|octomap_.*|mesh.*|map|points)(/.*)?$=6",
+        ".*/horus/(registration(_ack)?|heartbeat|teleop|leases?|multi_operator)(/.*)?$=1:express",
+        ".*/cmd/velocity$=1:express",
+        ".*/goal(_pose)?$=1:express",
+        ".*/command$=1:express",
         ".*/cmd_vel$=1:express",
-        ".*/tf$=2:express",
-        ".*/tf_static$=2:express",
+        ".*/(shared_map|global_map|local_map|grid_prob_map|occupancy_grid)$=6",
         ".*/odom$=3:express",
         ".*/joint_states$=3",
         ".*/scan$=4",
-        ".*/points$=6",
+        ".*/horus/.*$=4",
       ],
 
-      reliable_routes_blocking: false,
-      transient_local_cache_multiplier: 1,
+      // Reliable incremental data must not be silently dropped by Zenoh.
+      reliable_routes_blocking: true,
+      transient_local_cache_multiplier: 10,
       queries_timeout: {
-        default: 1.0,
-        transient_local_subscribers: 0.5,
+        default: 5.0,
+        transient_local_subscribers: 5.0,
         services: 1.0,
         actions: {
           send_goal: 1.0,
@@ -51,6 +70,10 @@
       },
     },
   },
+
+  // Keep the endpoint alive when the operator/router starts later.
+  connect: { timeout_ms: -1, exit_on_failure: false,
+    retry: { period_init_ms: 1000, period_max_ms: 10000, period_increase_factor: 2 } },
 
   scouting: {
     multicast: { enabled: false },
@@ -62,8 +85,10 @@
     link: {
       tx: {
         queue: {
-          batching: { enabled: false },
-          congestion_control: { drop: { wait_before_drop: 0 } },
+          // Bound declaration/data bursts; express control and TF bypass batching.
+          batching: { enabled: true, time_limit: 1 },
+          // Allow a bounded 1 ms enqueue window; zero drops even small bursts.
+          congestion_control: { drop: { wait_before_drop: 1000 } },
         },
       },
     },

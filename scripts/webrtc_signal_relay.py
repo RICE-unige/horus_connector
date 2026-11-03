@@ -90,10 +90,33 @@ class Relay:
             return False
         source_session = self.peer_meta.get(source, {}).get("session_id", "")
         try:
-            message_session = str(json.loads(text).get("session_id") or "")
+            message = json.loads(text)
+            message_session = str(message.get("session_id") or "")
         except Exception:
             return False
-        return not source_session or not message_session or source_session == message_session
+        current_negotiation = self.peer_meta.get(source, {}).get("negotiation_id", "")
+        negotiation = message.get("negotiation_id", "")
+        return (not source_session or not message_session or source_session == message_session) and (
+            not current_negotiation or not negotiation or current_negotiation == negotiation)
+
+    @staticmethod
+    async def send(websocket, text):
+        await asyncio.wait_for(websocket.send(text), timeout=5)
+
+    @staticmethod
+    async def close(websocket, reason):
+        await asyncio.wait_for(websocket.close(reason=reason), timeout=5)
+
+    async def expire_pending(self):
+        while True:
+            await asyncio.sleep(5)
+            async with self.lock:
+                cutoff = time.monotonic() - self.pending_ttl_sec
+                for key, entries in list(self.pending.items()):
+                    if self.pending_ttl_sec > 0:
+                        entries[:] = [entry for entry in entries if entry[0] >= cutoff]
+                    if not entries:
+                        self.pending.pop(key, None)
 
     async def register(
         self,
@@ -107,10 +130,25 @@ class Relay:
         notify_peer = None
         reset_peer = None
         old_peer = None
+        replaced_voice_peer = None
+        previous_peers = []
         async with self.lock:
+            for previous_key, peer in list(self.peers.items()):
+                if peer is websocket and previous_key != key:
+                    del self.peers[previous_key]
+                    counterpart = self.peers.get(
+                        (previous_key[0], self.target_role(previous_key[1]))
+                    )
+                    if counterpart is not None:
+                        previous_peers.append((counterpart, previous_key))
             old_peer = self.peers.get(key)
             if old_peer is websocket:
                 old_peer = None
+            if old_peer is not None and role in VOICE_ROLES:
+                self.voice_registry.remove_room(room)
+                self.pending.pop(key, None)
+                self.pending.pop((room, self.target_role(role)), None)
+                replaced_voice_peer = self.peers.get((room, self.target_role(role)))
             self.peers[key] = websocket
             self.peer_meta[websocket] = {
                 "client_id": client_id,
@@ -121,10 +159,12 @@ class Relay:
             self.write_state()
             queued = [
                 text
-                for _created_at, text in self.pending.pop(key, [])
-                if self._queued_signal_is_current(room, role, text)
+                for created_at, text in self.pending.pop(key, [])
+                if (self.pending_ttl_sec <= 0 or time.monotonic() - created_at <= self.pending_ttl_sec)
+                and self._queued_signal_is_current(room, role, text)
             ]
             notify_peer = self.peers.get((room, self.target_role(role)))
+            notify_meta = dict(self.peer_meta.get(notify_peer, {}))
             if (
                 role == "machine"
                 and notify_peer is not None
@@ -133,9 +173,23 @@ class Relay:
                 reset_peer = notify_peer
         if old_peer is not None:
             try:
-                await old_peer.close(reason="endpoint session replaced")
+                await self.close(old_peer, "endpoint session replaced")
             except Exception as exc:
                 print(f"warning: could not close replaced role={role} room={room}: {exc}", flush=True)
+        if replaced_voice_peer is not None:
+            try:
+                await self.send(replaced_voice_peer, json.dumps({"type": "peer-left", "role": role, "room": room}))
+            except (TimeoutError, websockets.ConnectionClosed):
+                pass
+        for peer, previous_key in previous_peers:
+            try:
+                await self.send(peer,
+                    json.dumps(
+                        {"type": "peer-left", "role": previous_key[1], "room": previous_key[0]}
+                    )
+                )
+            except Exception as exc:
+                print(f"warning: could not notify peer-left room={previous_key[0]}: {exc}", flush=True)
         credential = self.turn_issuer.issue(client_id)
         accepted = {
             "type": "registered",
@@ -145,20 +199,23 @@ class Relay:
             "client_id": client_id,
             "session_id": session_id,
             "peer_ready": notify_peer is not None,
+            "peer_client_id": notify_meta.get("client_id", ""),
+            "peer_session_id": notify_meta.get("session_id", ""),
         }
         if credential is not None:
             accepted["turn"] = credential.signaling_payload()
-        await websocket.send(json.dumps(accepted, separators=(",", ":")))
+        await self.send(websocket, json.dumps(accepted, separators=(",", ":")))
         for text in queued:
-            await websocket.send(text)
+            await self.send(websocket, text)
         if notify_peer is not None:
             try:
-                await notify_peer.send(json.dumps({"type": "peer-ready", "role": role, "room": room}))
+                await self.send(notify_peer, json.dumps({"type": "peer-ready", "role": role, "room": room,
+                                                        "peer_client_id": client_id, "peer_session_id": session_id}))
             except Exception as exc:
                 print(f"warning: could not notify peer-ready role={role} room={room}: {exc}", flush=True)
         if reset_peer is not None:
             print(f"resetting role=robot room={room} reason=machine-joined", flush=True)
-            await reset_peer.close(reason="machine peer joined")
+            await self.close(reset_peer, "machine peer joined")
         print(f"registered role={role} room={room}", flush=True)
 
     async def unregister(self, websocket):
@@ -168,6 +225,10 @@ class Relay:
                 if peer is websocket:
                     del self.peers[key]
                     self.peer_meta.pop(websocket, None)
+                    if key[1] in VOICE_ROLES:
+                        self.voice_registry.remove_room(key[0])
+                        self.pending.pop(key, None)
+                        self.pending.pop((key[0], self.target_role(key[1])), None)
                     self.write_state()
                     notify_peer = self.peers.get((key[0], self.target_role(key[1])))
                     if notify_peer is not None:
@@ -176,7 +237,7 @@ class Relay:
             self.peer_meta.pop(websocket, None)
         for peer, role, room in notifications:
             try:
-                await peer.send(json.dumps({"type": "peer-left", "role": role, "room": room}))
+                await self.send(peer, json.dumps({"type": "peer-left", "role": role, "room": room}))
             except Exception as exc:
                 print(f"warning: could not notify peer-left role={role} room={room}: {exc}", flush=True)
 
@@ -187,6 +248,10 @@ class Relay:
         except Exception:
             kind = "invalid-json"
         async with self.lock:
+            if kind in {"offer", "answer"}:
+                source = self.peers.get((room, role))
+                if source is not None:
+                    self.peer_meta[source]["negotiation_id"] = json.loads(text).get("negotiation_id", "")
             peer = self.peers.get(target)
             if peer is None:
                 self._queue_pending_locked(target, text)
@@ -195,7 +260,15 @@ class Relay:
                 return
         if os.environ.get("HORUS_WEBRTC_SIGNAL_DEBUG") == "1":
             print(f"forward type={kind} from={role} room={room} target={target[1]}", flush=True)
-        await peer.send(text)
+        try:
+            await self.send(peer, text)
+        except (TimeoutError, websockets.ConnectionClosed):
+            async with self.lock:
+                self._queue_pending_locked(target, text)
+            try:
+                await self.close(peer, "signaling connection unavailable")
+            except (TimeoutError, websockets.ConnectionClosed):
+                pass
 
     def _is_authorized(self, message: dict) -> bool:
         role = str(message.get("role") or "")
@@ -243,9 +316,21 @@ class Relay:
                     continue
                 retained.append((created_at, item))
             queue[:] = retained
+        if message.get("type") in {"media-status", "heartbeat"}:
+            return
         queue.append((now, text))
         while len(queue) > self.max_pending_per_peer or self._pending_size(queue) > self.max_pending_bytes:
-            queue.pop(0)
+            # Keep the latest SDP; discard candidates first when the bounded queue fills.
+            removable = next((index for index, (_stamp, item) in enumerate(queue)
+                              if self._message_kind(item) not in {"offer", "answer"}), 0)
+            queue.pop(removable)
+
+    @staticmethod
+    def _message_kind(text):
+        try:
+            return json.loads(text).get("type")
+        except (ValueError, AttributeError):
+            return None
 
     async def handle(self, websocket):
         role = None
@@ -255,31 +340,31 @@ class Relay:
                 message = json.loads(text)
                 if message.get("type") == "register":
                     if not self._is_authorized(message):
-                        await websocket.close(reason="invalid signaling token")
+                        await self.close(websocket, "invalid signaling token")
                         return
                     role = message.get("role")
                     room = message.get("room", "default")
                     client_id = str(message.get("client_id") or f"legacy:{role}:{room}")
                     session_id = str(message.get("session_id") or "")
                     if role not in {"robot", "machine", *VOICE_ROLES}:
-                        await websocket.close(
-                            reason="role must be robot, machine, operator, or field_teammate"
-                        )
+                        await self.close(websocket, "role must be robot, machine, operator, or field_teammate")
                         return
                     await self.register(websocket, role, room, client_id, session_id)
                     continue
                 if role is None or room is None:
-                    await websocket.close(reason="first message must be register")
+                    await self.close(websocket, "first message must be register")
+                    return
+                if self.peers.get((room, role)) is not websocket:
                     return
                 current_session = str(self.peer_meta.get(websocket, {}).get("session_id") or "")
                 message_session = str(message.get("session_id") or "")
                 if current_session and message_session and current_session != message_session:
-                    await websocket.close(reason="signaling session mismatch")
+                    await self.close(websocket, "signaling session mismatch")
                     return
                 if role in VOICE_ROLES:
                     decision = self.voice_registry.validate_and_apply(room, role, message)
                     if not decision.accepted:
-                        await websocket.send(
+                        await self.send(websocket,
                             json.dumps(
                                 {
                                     "type": "signal_rejected",
@@ -290,7 +375,7 @@ class Relay:
                         )
                         continue
                 await self.forward(room, role, text)
-        except websockets.ConnectionClosed:
+        except (websockets.ConnectionClosed, TimeoutError):
             pass
         finally:
             await self.unregister(websocket)
@@ -350,7 +435,12 @@ async def main_async(args):
     ):
         scheme = "wss" if tls_context is not None else "ws"
         print(f"WebRTC signaling relay listening on {scheme}://{args.host}:{args.port}", flush=True)
-        await asyncio.Future()
+        maintenance = asyncio.create_task(relay.expire_pending())
+        try:
+            await asyncio.Future()
+        finally:
+            maintenance.cancel()
+            await asyncio.gather(maintenance, return_exceptions=True)
 
 
 def is_loopback_host(host: str) -> bool:

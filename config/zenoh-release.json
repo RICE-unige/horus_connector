@@ -1,0 +1,8 @@
+{
+  "version": "1.10.2",
+  "release_url": "https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/releases/tag/1.10.2",
+  "sha256": {
+    "x86_64-unknown-linux-gnu": "d6c3ff1c6886b9a284dd2b192a0acbdd5240aea266ad07e8febfcc0b6bce06bc",
+    "aarch64-unknown-linux-gnu": "af4ee9ee4b442a88dcff9051c56ff853025efbaf6ffb8405f7bc24a761b7b9da"
+  }
+}

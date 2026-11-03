@@ -83,6 +83,9 @@ def test_webrtc_result_counts_unreceived_frames_against_sla(tmp_path, monkeypatc
         json.dumps(
             {
                 "video_frames": 8,
+                "measurement_stage": "capture_to_decode",
+                "complete_frame_accounting": True,
+                "source_frames": 100,
                 "video_decoded_fps": 8.0,
                 "fresh_latency_samples": 4,
                 "stale_latency_samples": 4,

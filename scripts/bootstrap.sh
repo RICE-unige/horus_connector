@@ -38,6 +38,7 @@ if [[ "${ROLE_ARG}" == "-h" || "${ROLE_ARG}" == "--help" ]]; then
   echo -e "${FG_MUTED}Prepare dependencies for robot, machine, teammate, or cloud roles${RESET}\n"
   echo -e "${BOLD}Usage${RESET}"
   echo -e "  ./scripts/bootstrap.sh ${FG_GREEN}[robot|machine|teammate|cloud|auto]${RESET}\n"
+  echo "  ./scripts/bootstrap.sh --zenoh-only   Update only the project-local Zenoh bridge"
   echo -e "${BOLD}What it prepares${RESET}"
   echo -e "  - Zenoh ROS 2 DDS bridge binary or Docker fallback"
   echo -e "  - Python WebRTC and GLib dependencies"
@@ -58,31 +59,8 @@ trim_spaces() {
 }
 
 load_key_value_file() {
-  local file="$1"
-  local line key value
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    line="${line%$'\r'}"
-    line="$(trim_spaces "${line}")"
-    [[ -z "${line}" || "${line}" == \#* ]] && continue
-    if [[ "${line}" =~ ^export[[:space:]]+(.+)$ ]]; then
-      line="${BASH_REMATCH[1]}"
-    fi
-    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-      log_warn "Ignoring invalid config line in ${file}: ${line}"
-      continue
-    fi
-    key="${BASH_REMATCH[1]}"
-    value="$(trim_spaces "${BASH_REMATCH[2]}")"
-    if [[ "${#value}" -ge 2 ]]; then
-      if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
-        value="${value:1:${#value}-2}"
-      elif [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
-        value="${value:1:${#value}-2}"
-      fi
-    fi
-    printf -v "${key}" '%s' "${value}"
-    export "${key}"
-  done < "${file}"
+  source "${ROOT}/scripts/config_env.sh"
+  horus_load_config "$1" python3
 }
 
 machine_kind() {
@@ -284,6 +262,13 @@ build_apt_packages() {
     dedupe_packages output_ref
     return
   fi
+  if [[ "${ROLE}" == "teammate" ]]; then
+    if [[ "${FIELD_TEAMMATE_RAW_IMAGE:-0}" == "1" ]]; then
+      append_available_packages output_ref python3-opencv python3-numpy
+    fi
+    dedupe_packages output_ref
+    return
+  fi
 
   append_available_packages output_ref "${APT_MEDIA_COMMON_PACKAGES[@]}"
 
@@ -307,7 +292,7 @@ run_apt() {
   local packages=()
   apt_update() {
     local runner=("$@")
-    if ! "${runner[@]}" apt-get -o Acquire::ForceIPv4=true update; then
+    if ! "${runner[@]}" apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update; then
       log_warn "apt-get update failed. Continuing with the existing package cache."
       log_warn "If package installation fails, fix the broken apt source shown above and rerun bootstrap."
       return 0
@@ -316,7 +301,7 @@ run_apt() {
 
   apt_install() {
     local runner=("$@")
-    "${runner[@]}" apt-get install -y "${packages[@]}"
+    "${runner[@]}" apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y "${packages[@]}"
   }
 
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -352,6 +337,9 @@ check_ros2_runtime() {
   if [[ -n "${ROS_SETUP_PATH:-}" ]]; then
     local setup_path="${ROS_SETUP_PATH/#\~/${HOME}}"
     if [[ -f "${setup_path}" ]]; then
+      set +u
+      source "${setup_path}"
+      set -u
       return
     fi
     log_error "ROS_SETUP_PATH is set but the file does not exist: ${ROS_SETUP_PATH}"
@@ -359,7 +347,12 @@ check_ros2_runtime() {
     return 1
   fi
 
-  if [[ -f "/opt/ros/${distro}/setup.bash" || -f "/opt/ros/${distro}/local_setup.bash" ]]; then
+  local default_setup="/opt/ros/${distro}/setup.bash"
+  [[ -f "${default_setup}" ]] || default_setup="/opt/ros/${distro}/local_setup.bash"
+  if [[ -f "${default_setup}" ]]; then
+    set +u
+    source "${default_setup}"
+    set -u
     return
   fi
 
@@ -375,7 +368,7 @@ resolve_zenoh_version() {
     return
   fi
 
-  echo "1.9.0"
+  python3 "${SCRIPT_DIR}/zenoh_release.py" --default-version
 }
 
 rust_target() {
@@ -386,92 +379,139 @@ rust_target() {
   esac
 }
 
-install_zenoh() {
-  local version target archive zip download_base url sums_url sums_file expected_sha
-  local check_log="${TMPDIR:-/tmp}/horus_connector_${UID}_zenoh_bridge_check.log"
+zenoh_binary_matches() {
+  local output line
+  output="$(timeout 10 "$1" --version 2>/dev/null)" || return 1
+  # Upstream may log to stdout before printing its standalone version line.
+  while IFS= read -r line; do
+    if [[ "${line}" =~ ^zenoh-bridge-ros2dds[[:space:]]v?([0-9]+\.[0-9]+\.[0-9]+)($|[[:space:]]) ]]; then
+      [[ "${BASH_REMATCH[1]}" == "$2" ]]
+      return
+    fi
+  done <<< "${output}"
+  return 1
+}
+
+install_zenoh() (
+  local version target archive zip url expected_sha artifact staging="" backup="" updating=0
+  local temp_zip="" install_lock file
+  exec {install_lock}>"${ROOT}/.zenoh-install.lock"
+  flock -w 30 "${install_lock}" || { log_error "Another Zenoh installation is in progress."; return 1; }
+  cleanup_zenoh_install() {
+    local result="$?"
+    if [[ "${result}" != "0" && "${updating}" == "1" ]]; then
+      for file in zenoh-bridge-ros2dds libzenoh_plugin_ros2dds.so .zenoh_profile.env; do
+        if [[ -f "${backup}/${file}" ]]; then
+          cp -p -- "${backup}/${file}" "${ROOT}/${file}" || log_error "Restore ${file} from ${backup} manually."
+        else
+          rm -f -- "${ROOT}/${file}"
+        fi
+      done
+      log_error "Zenoh update failed; restored the previous installation from ${backup}."
+    fi
+    [[ -z "${temp_zip}" ]] || rm -f -- "${temp_zip}"
+    [[ -z "${staging}" ]] || rm -rf -- "${staging}"
+  }
+  trap cleanup_zenoh_install EXIT
   version="$(resolve_zenoh_version)"
   target="$(rust_target)"
-  archive="zenoh-plugin-ros2dds-${version}-${target}-standalone.zip"
-  zip="${ROOT}/${archive}"
-  download_base="${ZENOH_DOWNLOAD_BASE:-https://download.eclipse.org/zenoh/zenoh-plugin-ros2dds/${version}}"
-  url="${download_base}/${archive}"
-  sums_url="${download_base}/sha256sums.txt"
-  sums_file="${ROOT}/sha256sums-${version}.txt"
 
   log_info "Zenoh bridge target: ${version} (${target})"
-  if [[ -x "${ROOT}/zenoh-bridge-ros2dds" ]] && "${ROOT}/zenoh-bridge-ros2dds" --version 2>/dev/null | grep -q "${version}"; then
-    write_zenoh_profile "binary" "" "eclipse/zenoh-bridge-ros2dds:${version}" ""
+  if [[ -x "${ROOT}/zenoh-bridge-ros2dds" && -f "${ROOT}/libzenoh_plugin_ros2dds.so" ]] &&
+      zenoh_binary_matches "${ROOT}/zenoh-bridge-ros2dds" "${version}"; then
+    write_zenoh_profile "binary" "" "eclipse/zenoh-bridge-ros2dds:${version}" "" || return 1
     log_success "Zenoh bridge already installed."
     return
   fi
 
-  if ! have curl || ! have unzip || ! have sha256sum; then
-    log_error "curl, unzip, and sha256sum are required to install Zenoh automatically."
+  if ! have curl || ! have unzip || ! have sha256sum || ! have python3 || ! have timeout; then
+    log_error "curl, unzip, sha256sum, python3, and timeout are required to install Zenoh automatically."
     return 1
   fi
 
-  curl -fL --retry 3 --connect-timeout 20 -o "${zip}.tmp" "${url}"
-  curl -fL --retry 3 --connect-timeout 20 -o "${sums_file}.tmp" "${sums_url}"
-  mv "${sums_file}.tmp" "${sums_file}"
-  expected_sha="$(
-    awk -v archive="${archive}" '
-      {
-        path = $2
-        n = split(path, parts, "/")
-        if (path == archive || parts[n] == archive) {
-          print $1
-          exit
-        }
-      }
-    ' "${sums_file}"
-  )"
-  if [[ -z "${expected_sha}" ]]; then
-    log_error "No checksum found for ${archive} in ${sums_url}."
-    rm -f "${zip}.tmp"
+  artifact="$(python3 "${SCRIPT_DIR}/zenoh_release.py" --version "${version}" --target "${target}" \
+    --download-base "${ZENOH_DOWNLOAD_BASE:-}")" || return 1
+  IFS=$'\t' read -r archive url expected_sha <<< "${artifact}"
+  zip="${ROOT}/${archive}"
+  temp_zip="$(mktemp "${ROOT}/.zenoh-download.XXXXXX")"
+  curl -fL --retry 3 --retry-max-time 300 --max-time 180 --connect-timeout 20 \
+    --speed-limit 1024 --speed-time 30 -o "${temp_zip}" "${url}" || return 1
+  if ! printf '%s  %s\n' "${expected_sha}" "${temp_zip}" | sha256sum -c -; then
+    log_error "Zenoh archive checksum failed; existing installation was not changed."
     return 1
   fi
-  echo "${expected_sha}  ${zip}.tmp" | sha256sum -c -
-  mv "${zip}.tmp" "${zip}"
-  unzip -o "${zip}" -d "${ROOT}"
-  chmod +x "${ROOT}/zenoh-bridge-ros2dds" "${ROOT}/libzenoh_plugin_ros2dds.so" 2>/dev/null || true
-  if "${ROOT}/zenoh-bridge-ros2dds" --version >"${check_log}" 2>&1; then
-    write_zenoh_profile "binary" "" "eclipse/zenoh-bridge-ros2dds:${version}" ""
-    "${ROOT}/zenoh-bridge-ros2dds" --version || true
+  mv -- "${temp_zip}" "${zip}"
+  temp_zip=""
+  staging="$(mktemp -d "${ROOT}/.zenoh-install.XXXXXX")"
+  if ! unzip -q "${zip}" -d "${staging}"; then
+    return 1
+  fi
+  if [[ ! -f "${staging}/zenoh-bridge-ros2dds" || ! -f "${staging}/libzenoh_plugin_ros2dds.so" ]]; then
+    log_error "Zenoh archive is missing its standalone binary or matching plugin."
+    return 1
+  fi
+  chmod +x "${staging}/zenoh-bridge-ros2dds"
+  local output
+  if output="$(timeout 10 "${staging}/zenoh-bridge-ros2dds" --version 2>&1)"; then
+    if ! zenoh_binary_matches "${staging}/zenoh-bridge-ros2dds" "${version}"; then
+      log_error "Downloaded binary does not report the requested Zenoh version ${version}: ${output}"
+      return 1
+    fi
+    mkdir -p "${ROOT}/.zenoh-backups"
+    backup="$(mktemp -d "${ROOT}/.zenoh-backups/$(date -u '+%Y%m%dT%H%M%SZ').XXXXXX")"
+    for file in zenoh-bridge-ros2dds libzenoh_plugin_ros2dds.so .zenoh_profile.env; do
+      [[ ! -f "${ROOT}/${file}" ]] || cp -p -- "${ROOT}/${file}" "${backup}/${file}"
+    done
+    updating=1
+    mv -- "${staging}/libzenoh_plugin_ros2dds.so" "${ROOT}/libzenoh_plugin_ros2dds.so" || return 1
+    mv -- "${staging}/zenoh-bridge-ros2dds" "${ROOT}/zenoh-bridge-ros2dds" || return 1
+    write_zenoh_profile "binary" "" "eclipse/zenoh-bridge-ros2dds:${version}" "" || return 1
+    updating=0
+    log_success "Installed Zenoh ${version}; rollback files: ${backup}"
+    "${ROOT}/zenoh-bridge-ros2dds" --version
     return
   fi
 
-  local error
-  error="$(cat "${check_log}")"
-  if configure_zenoh_docker_fallback "${version}" "${error}"; then
+  if configure_zenoh_docker_fallback "${version}" "${output}"; then
     return
   fi
 
   log_error "Zenoh bridge binary is not usable on this host:"
-  echo -e "${FG_RED}${error}${RESET}"
+  echo -e "${FG_RED}${output}${RESET}"
   log_warn "Install Docker or use a newer OS/JetPack with glibc >= 2.28."
   return 1
-}
+)
 
 write_zenoh_profile() {
   local runtime="$1"
   local docker_sudo="$2"
   local image="$3"
   local note="$4"
-  {
+  local profile
+  profile="$(mktemp "${ROOT}/.zenoh-profile.XXXXXX")" || return 1
+  if ! {
     echo "# Generated by scripts/bootstrap.sh"
     echo "ZENOH_BRIDGE_RUNTIME='${runtime}'"
     echo "ZENOH_BRIDGE_IMAGE='${image}'"
+    echo "ZENOH_BRIDGE_VERSION='${image##*:}'"
     echo "ZENOH_BRIDGE_DOCKER_SUDO='${docker_sudo}'"
     echo "ZENOH_BRIDGE_NOTE='${note//\'/}'"
-  } > "${ROOT}/.zenoh_profile.env"
+  } > "${profile}"; then
+    rm -f -- "${profile}"
+    return 1
+  fi
+  if ! mv -- "${profile}" "${ROOT}/.zenoh_profile.env"; then
+    rm -f -- "${profile}"
+    return 1
+  fi
 }
 
 docker_command_mode() {
-  if have docker && docker ps >/dev/null 2>&1; then
+  if have docker && timeout 10 docker ps >/dev/null 2>&1; then
     echo "user"
     return 0
   fi
-  if have sudo && sudo -n docker ps >/dev/null 2>&1; then
+  if have sudo && timeout 10 sudo -n docker ps >/dev/null 2>&1; then
     echo "sudo"
     return 0
   fi
@@ -482,7 +522,7 @@ docker_command_mode() {
   if [[ -t 0 ]] && have sudo; then
     echo "Zenoh Docker fallback needs sudo Docker access."
     sudo -v
-    if sudo docker ps >/dev/null 2>&1; then
+    if timeout 30 sudo docker ps >/dev/null 2>&1; then
       echo "sudo"
       return 0
     fi
@@ -503,7 +543,7 @@ configure_zenoh_docker_fallback() {
   log_warn "Zenoh binary is not compatible with this host; using Docker fallback."
   log_warn "Binary error: ${error//$'\n'/ }"
   if [[ "${mode}" == "sudo" ]]; then
-    sudo -n docker pull "${image}" || return 1
+    timeout "${HORUS_DOCKER_PULL_TIMEOUT:-300}" sudo -n docker pull "${image}" || return 1
     write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using Docker fallback. Add the user to the docker group for passwordless launches."
   elif [[ "${mode}" == "sudo-unverified" ]]; then
     write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using sudo Docker fallback. Run sudo -v before launch, or add the user to the docker group."
@@ -511,20 +551,31 @@ configure_zenoh_docker_fallback() {
     log_info "Before launch, run: sudo -v"
     log_info "If the image is not cached yet, run: sudo docker pull ${image}"
   else
-    docker pull "${image}" || return 1
+    timeout "${HORUS_DOCKER_PULL_TIMEOUT:-300}" docker pull "${image}" || return 1
     write_zenoh_profile "docker" "0" "${image}" "Host binary incompatible; using Docker fallback."
   fi
   log_success "Configured Zenoh Docker fallback: ${image}"
   return 0
 }
 
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
+if [[ "${ROLE_ARG}" == "--zenoh-only" ]]; then
+  install_zenoh
+  exit
+fi
+
 cd "${ROOT}"
-if [[ ! -f .env ]]; then
-  cp .env.example .env
+config_file="${HORUS_ENV:-${ROOT}/.env}"
+if [[ ! -f "${config_file}" ]]; then
+  [[ -z "${HORUS_ENV:-}" ]] || { log_error "Missing selected configuration: ${config_file}"; exit 1; }
+  cp .env.example "${config_file}"
   log_success "Created new config: ${BOLD}.env${RESET} (from .env.example)"
 fi
 
-load_key_value_file .env
+load_key_value_file "${config_file}"
 if [[ -f .zenoh_tls_profile.env ]]; then
   load_key_value_file .zenoh_tls_profile.env
 fi
@@ -590,10 +641,25 @@ if [[ "${ROLE}" == "cloud" && "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
 fi
 install_zenoh
 "${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}"
-if [[ "${ROLE}" == "cloud" ]]; then
-  log_info "Cloud role: skipping media hardware detection; hub mode relays signaling only."
+if [[ "${ROLE}" == "cloud" || "${ROLE}" == "teammate" ]]; then
+  log_info "${ROLE} role: no H.264 encoder/decoder is required for its native relay."
 else
-  "${SCRIPT_DIR}/detect_video_stack.sh" --role "${ROLE}" --out "${ROOT}/.webrtc_profile.env"
+  media_python="${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python"
+  probe_args=()
+  if [[ "${WEBRTC_MEDIA_MODE:-h264}" == h264 ]]; then
+    probe_args=(--root "${ROOT}" --profile "${ROOT}/.webrtc_profile.env")
+  fi
+  "${media_python}" "${SCRIPT_DIR}/media_runtime.py" --role "${ROLE}" --need-ros \
+    --mode "${WEBRTC_MEDIA_MODE:-h264}" "${probe_args[@]}"
+  if [[ ( "${ROLE}" == "robot" || "${ROLE}" == "machine" ) && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+    if ! command -v gst-inspect-1.0 >/dev/null 2>&1 || \
+       ! gst-inspect-1.0 webrtcbin >/dev/null 2>&1 || \
+       ! gst-inspect-1.0 nice >/dev/null 2>&1; then
+      log_error "H.264 WebRTC media is incomplete: GStreamer webrtcbin and nice are required."
+      log_warn "Install gstreamer1.0-plugins-bad and gstreamer1.0-nice, then rerun bootstrap."
+      exit 1
+    fi
+  fi
 fi
 
 echo ""

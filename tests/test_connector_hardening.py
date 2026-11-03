@@ -135,10 +135,11 @@ def test_zenoh_tls_renderer_injects_tls_block(tmp_path):
 
     assert result.returncode == 0, result.stderr
     rendered = out.read_text(encoding="utf-8")
-    assert "tls: {" in rendered
-    assert 'root_ca_certificate: "/tmp/hub.cert.pem"' in rendered
-    assert 'listen_private_key: "/tmp/hub.key.pem"' in rendered
-    assert "verify_name_on_connect: false" in rendered
+    import json5
+    tls = json5.loads(rendered)["transport"]["link"]["tls"]
+    assert tls["root_ca_certificate"] == "/tmp/hub.cert.pem"
+    assert tls["listen_private_key"] == "/tmp/hub.key.pem"
+    assert tls["verify_name_on_connect"] is False
 
 
 def test_relay_rejects_non_loopback_without_auth():
@@ -186,7 +187,7 @@ def test_json_signaling_pending_queue_is_bounded(monkeypatch):
 
     queued = []
     while not signaling.pending.empty():
-        queued.append(signaling.pending.get_nowait())
+        queued.append(signaling.pending.get_nowait()[1])
     assert queued == ["two", "three"]
 
 

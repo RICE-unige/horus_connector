@@ -117,6 +117,29 @@ def test_dds_preflight_does_not_filter_machine_local_topics():
     assert "HORUS_FILTERED_TOPIC" not in codes(findings)
 
 
+def test_explicit_media_exclusions_do_not_hide_other_blocked_topics():
+    import dds_preflight
+
+    findings = dds_preflight.classify_topics("robot", ["/tf", "/front/image_raw", "/missing"],
+        {"publishers": ["^/tf$"]}, "resolved.json", ["/front/image_raw"])
+    media = next(f for f in findings if f.code == "EXPLICIT_WEBRTC_TOPICS")
+    blocked = next(f for f in findings if f.code == "HORUS_FILTERED_TOPIC")
+    assert media.severity == "info"
+    assert "1 visible topic" in blocked.message
+    assert "/missing" in blocked.detail
+    assert "/front/image_raw" not in blocked.detail
+
+
+def test_only_explicit_media_is_information_not_false_delivery_success():
+    import dds_preflight
+
+    findings = dds_preflight.classify_topics("robot", ["/tf", "/camera"],
+        {"publishers": ["^/tf$"]}, "resolved.json", ["/camera"])
+    assert "HORUS_FILTERED_TOPIC" not in codes(findings)
+    assert "EXPLICIT_WEBRTC_TOPICS" in codes(findings)
+    assert "checked separately" in findings[0].detail
+
+
 def test_dds_preflight_extracts_zenoh_allow_patterns():
     import dds_preflight
 
@@ -138,8 +161,15 @@ def test_cyclonedds_render_does_not_duplicate_loopback_for_localhost_env(tmp_pat
     )
 
     text = Path(path).read_text(encoding="utf-8")
-    assert 'NetworkInterface name="lo"' not in text
+    assert text.count('NetworkInterface name="lo"') == 1
     assert 'NetworkInterface name="eth0"' not in text
+
+
+def test_humble_bridge_owns_its_loopback_selection(tmp_path):
+    import dds_preflight
+    path = dds_preflight.render_cyclonedds_template(ROOT, tmp_path,
+        {"ROS_DISTRO": "humble", "ROS_LOCALHOST_ONLY": "1"}, {}, ROOT / "config/zenoh_robot.json5")
+    assert "<NetworkInterface " not in Path(path).read_text()
 
 
 def test_cyclonedds_render_does_not_override_localhost_zenoh_config(tmp_path):

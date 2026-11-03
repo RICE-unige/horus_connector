@@ -1,0 +1,2 @@
+websockets==15.0.1
+json5==0.12.1

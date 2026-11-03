@@ -1,0 +1,9 @@
+{
+  "version": "0.13.7",
+  "repository": "https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git",
+  "commit": "cdec77cad2d9b7348d800507bc6eeec5039717eb",
+  "cargo_lock_sha256": "dadc59a4cce2574bcd46f5ce0c85ae5855864c31dc7dfddd4501d3188ef0a84d",
+  "package": "gst-plugin-rtp",
+  "library": "libgstrsrtp.so",
+  "license": "MPL-2.0"
+}

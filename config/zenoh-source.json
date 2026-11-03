@@ -1,0 +1,16 @@
+{
+  "version": "1.10.2",
+  "repository": "https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds.git",
+  "commit": "7ced1f65dba20ffe2666380705f1e518d6036331",
+  "patch": "patches/zenoh-ros2dds-independent-bulk.patch",
+  "patch_sha256": "aa6fad9e478eeb09fa677446d26e7e56c426cc27236880318bfec4c48f4537a0",
+  "features": ["traffic_class_sessions", "route_matching_lifecycle", "serialized_slices"],
+  "new_files": ["zenoh-plugin-ros2dds/src/hmsh_queue.rs", "zenoh-plugin-ros2dds/src/bulk_budget.rs"],
+  "cyclors": {
+    "version": "0.4.0",
+    "url": "https://static.crates.io/crates/cyclors/cyclors-0.4.0.crate",
+    "crate_sha256": "6beb8dc0574f6e2184a2a67c6833ff7ab5b64a95d2459db9b009797b0bb7374e",
+    "patch": "patches/cyclors-0.4.0-serialized-slices.patch",
+    "patch_sha256": "0dbf1580608478abb0702a9852e62f2e3cac75a312bd764cafeeeb09426c3ba2"
+  }
+}

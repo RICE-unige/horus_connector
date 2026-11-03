@@ -24,6 +24,32 @@ def test_webrtc_streams_fallback_keeps_single_stream_service(monkeypatch, tmp_pa
     assert streams[0]["output_topic"] == "/robot_a/camera/webrtc/image_raw"
 
 
+def test_explicitly_disabled_streams_do_not_start_a_default_camera(monkeypatch, tmp_path):
+    import webrtc_streams
+
+    config = tmp_path / "streams.json"
+    config.write_text(
+        json.dumps({"version": 2, "streams": [{"id": "front", "enabled": False}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HORUS_STREAMS_CONFIG", str(config))
+
+    assert webrtc_streams.load_streams(tmp_path, "robot") == []
+    assert webrtc_streams.load_streams(tmp_path, "machine") == []
+
+
+def test_invalid_camera_entry_fails_instead_of_disappearing(monkeypatch, tmp_path):
+    import pytest
+    import webrtc_streams
+
+    config = tmp_path / "streams.json"
+    config.write_text(json.dumps({"version": 2, "streams": [{"id": "front"}, "rear"]}), encoding="utf-8")
+    monkeypatch.setenv("HORUS_STREAMS_CONFIG", str(config))
+
+    with pytest.raises(ValueError, match="stream 2 must be an object"):
+        webrtc_streams.load_streams(tmp_path, "robot")
+
+
 def test_webrtc_streams_config_fans_out_named_services(monkeypatch, tmp_path):
     import webrtc_streams
 

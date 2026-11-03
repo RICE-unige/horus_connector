@@ -1,0 +1,22 @@
+--- a/build.rs
++++ b/build.rs
+@@ -608,2 +608,3 @@
+                     println!("cargo:rerun-if-changed=src/lib.rs");
+                     println!("cargo:rerun-if-changed=src/functions.template");
++                    println!("cargo:rerun-if-changed=cyclocut");
+--- a/cyclocut/src/cdds_blob.c
++++ b/cyclocut/src/cdds_blob.c
+@@ -270,7 +270,12 @@ static void cdds_to_ser(const struct ddsi_serdata *serdata_common, size_t off, size_
+   CY_DEBUG_WA("Called <cdds_to_ser> size = %zu\n", sz);
+   CY_DEBUG_WA("Called <cdds_to_ser> buf = %p\n", buf);
+   struct cdds_ddsi_payload *pl = (struct cdds_ddsi_payload *)serdata_common;
+-  memcpy(buf, pl->payload, pl->size);
++  const size_t limit = (pl->size + (size_t)3) & ~(size_t)3;
++  assert(off <= limit && sz <= limit - off);
++  const size_t remaining = off < pl->size ? pl->size - off : 0;
++  const size_t copied = sz < remaining ? sz : remaining;
++  if (copied) memcpy(buf, pl->payload + off, copied);
++  if (sz > copied) memset((unsigned char *)buf + copied, 0, sz - copied);
+ }
+ 
+ static struct ddsi_serdata *cdds_from_psmx (const struct ddsi_sertype *type, dds_loaned_sample_t *loaned_sample)

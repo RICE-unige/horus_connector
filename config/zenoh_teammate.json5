@@ -43,8 +43,6 @@
       },
 
       pub_max_frequencies: [
-        ".*/tf$=60",
-        ".*/tf_static$=1",
         ".*/status$=2",
         ".*/localization_confidence$=20",
         // Belt-and-braces: the relay's video profile governs FPV rate, but a
@@ -56,8 +54,8 @@
 
       pub_priorities: [
         ".*/guidance/.*$=1:express",
-        ".*/tf$=2:express",
-        ".*/tf_static$=2:express",
+        ".*/tf$=1:express",
+        ".*/tf_static$=1:express",
         ".*/localization_confidence$=3:express",
         ".*/status$=4",
         ".*/fpv/camera_info$=4",
@@ -65,7 +63,7 @@
         ".*/fpv/image_raw/compressed$=5",
       ],
 
-      reliable_routes_blocking: false,
+      reliable_routes_blocking: true,
       transient_local_cache_multiplier: 1,
       queries_timeout: {
         default: 1.0,
@@ -90,7 +88,8 @@
     link: {
       tx: {
         queue: {
-          batching: { enabled: false },
+          // Bound declaration/data bursts; express control and TF bypass batching.
+          batching: { enabled: true, time_limit: 1 },
           congestion_control: { drop: { wait_before_drop: 0 } },
         },
       },

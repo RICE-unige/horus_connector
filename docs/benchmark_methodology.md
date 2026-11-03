@@ -1,7 +1,8 @@
 # Camera Transport Benchmark Methodology
 
-This benchmark is designed for a publication-quality comparison of practical
-camera transport paths for robot management:
+This tooling characterizes practical camera transport paths for robot management.
+The current ROS and WebRTC instruments measure different boundaries; do not
+combine their latency/SLA values as equivalent publication results:
 
 - ROS 2 DDS carrying `sensor_msgs/CompressedImage`
 - Zenoh ROS 2 DDS bridge carrying `sensor_msgs/CompressedImage`
@@ -12,25 +13,35 @@ normally use in the HORUS Connector system.
 
 In the ROS 2 DDS and Zenoh arms, the benchmark publishes cached compressed-image
 payloads so sender-side JPEG encoding does not contaminate the transport result.
-In the WebRTC arm, live H.264 encoding is part of the practical media path and
-is therefore included in the measured endpoint pipeline.
+The WebRTC arm performs live H.264 encoding, but its timing marker is generated
+at RTP packetization, **after encoding**. Exact RTP-timestamp/decoded-PTS
+correlation measures packetization-to-decoded-output delay. It excludes source
+capture, encoding delay, Quest receipt/rendering and physical display latency.
 
 ## Decision Metric
 
-The headline metric is fresh-frame SLA:
+For a fully matched capture measurement, fresh-frame SLA is:
 
 ```text
-fresh-frame SLA = frames rendered/received under the latency deadline / frames captured
+fresh-frame SLA = unique matched frames received under the latency deadline / actual source frames produced in the same measured interval
 ```
 
 Late frames and dropped frames both count as failures. This avoids rewarding a
 transport for delivering old visual information or silently dropping most of the
 stream.
 
-Default decision threshold:
+Rendered/displayed FPS requires separate instrumentation in the viewing app.
+The current H.264 endpoint retains the last 10,000 matched timing samples.
+Metadata is best effort and can be missing; the fresh fraction of those samples
+is not a delivery SLA or fresh video FPS. `fresh_fps_estimate` is therefore null.
+The renderer marks those artifacts `endpoint_timing_only` and excludes them
+from capture-latency/SLA curves, as it does legacy uncorrelated-marker data.
+No old research artifacts are rewritten or deleted.
+
+Provisional decision threshold, only when that boundary is measured:
 
 ```text
-150 ms glass-to-glass / capture-to-receive deadline
+150 ms source-to-receive target
 ```
 
 Supporting metrics:
@@ -50,17 +61,26 @@ The receiver uses the measured `offset_ms` with `--clock-offset-json`.
 Do not subtract a percentile latency baseline in the renderer. Percentile
 baseline subtraction can hide real queueing and makes the result hard to defend.
 
+Negative/non-finite corrected measurements are invalid, not fresh frames.
+Record offset uncertainty and path asymmetry; offset correction alone does not
+prove sub-millisecond cross-host accuracy. A visual sequence/timing marker or
+independent capture/display reference is required for glass-to-glass claims.
+
 ## Camera Semantics
 
 Camera streams use freshest-frame behavior:
 
 ```text
 QoS: best effort, keep last, depth 1
-Receiver: keep newest frame and drop stale buffered frames
+Receiver: keep newest complete decoded frame
 ```
 
 This matches ROS 2 sensor-data guidance: camera and sensor streams usually care
 more about the latest sample than reliable delivery of every old sample.
+
+Do not use a one-buffer leaky queue for RTP fragments. The H.264 path keeps a
+bounded packet-safe queue before depayloading and latest-frame behavior after
+decoding. ROS input pacing occurs before pixel conversion/copy.
 
 ## Test Matrix
 
@@ -79,14 +99,10 @@ run-to-run variation when space allows.
 
 ## Run Protocol
 
-Before running a publication benchmark:
-
-```bash
-sudo sysctl -w net.core.rmem_max=8388608
-sudo sysctl -w net.core.wmem_max=8388608
-sudo sysctl -w net.core.rmem_default=1048576
-sudo sysctl -w net.core.wmem_default=1048576
-```
+Use the existing host network configuration for baseline trials. Do not change
+global network buffers or shape the active LAN/Wi-Fi/VPN interface implicitly.
+Impairment trials require an explicitly configured disposable veth; the runner
+rejects ordinary interfaces and cleans up only its own qdisc handle.
 
 Run the distributed benchmark through the tracked runner:
 
@@ -103,6 +119,14 @@ before and after each condition, rejects excessive drift, and aborts if the
 requested Zenoh transport is not the transport that actually started.
 The default clock-probe port is TCP `8765`, reused before WebRTC signaling starts
 so cloud firewalls do not need an extra benchmark-only port.
+
+Ubuntu outputs default to `.run/distributed_benchmark/<timestamp>-<unique-id>/`;
+each remote endpoint has a matching `.run/bench/<run-id>/` directory.
+`HORUS_BENCH_OUTPUT_DIR` overrides the local location. Previous runs are
+preserved. Explicit resume does not erase remote evidence; missing fetches are
+errors rather than empty files. Only this run's PID/start-time-identified
+process groups are stopped. The runner does not kill other connector services
+or reset host network policy.
 
 Create one artifact name per condition:
 
@@ -164,18 +188,24 @@ python3 scripts/gst_webrtc_h264_machine.py \
   --latency-json .run/modeb_1080p30_vpn_webrtc_latency.json
 ```
 
-Render after all conditions are complete:
+The legacy renderer reads condition artifacts directly under `.run/`; it does
+not aggregate the distributed runner's unique repetition folders automatically.
+Retain raw repetitions and do not flatten separate trials into one condition.
+Rendering is not a substitute for matched-source timing validation.
+
+For compatible artifacts already arranged for that renderer:
 
 ```bash
 python3 scripts/render_transport_benchmark.py
 ```
 
-The renderer refuses to plot legacy artifacts that do not contain the current
-fresh-frame SLA and clock-correction metadata.
+The renderer excludes legacy or endpoint-only WebRTC artifacts from capture/SLA
+comparisons. Current endpoint measurements can be reported separately with
+decoded FPS, sample coverage and packetization-to-decode percentiles.
 
 ## Graph Layout
 
-Use three line charts per resolution:
+For independently validated equivalent capture boundaries, use:
 
 1. Fresh-frame SLA vs network path
 2. P95 latency vs network path
@@ -183,6 +213,10 @@ Use three line charts per resolution:
 
 Keep the same color for each transport across all charts. Label axes with
 directional guidance such as "higher is better" and "lower is better".
+
+For the current WebRTC instrument, report decoded rate and matched endpoint
+timing separately. A faster endpoint percentile does not prove lower
+capture-to-Quest latency than another transport.
 
 ## References
 

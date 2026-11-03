@@ -3,6 +3,8 @@
 .env.before_*
 .run/
 .venv-webrtc/
+.runtime/
+.venv-webrtc
 .webrtc_profile.env
 .zenoh_profile.env
 .zenoh_tls_profile.env
@@ -19,3 +21,8 @@ __pycache__/
 rosbag2_*/
 zenoh-bridge-ros2dds
 libzenoh_plugin_ros2dds.so
+.zenoh-backups/
+.zenoh-install.lock
+.zenoh-install.*/
+.zenoh-download.*
+.zenoh-profile.*

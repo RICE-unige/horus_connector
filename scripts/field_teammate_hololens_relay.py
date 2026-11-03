@@ -31,12 +31,17 @@ import argparse
 from collections import deque
 import json
 import math
+import os
 import queue
 import re
+import select
 import socket
 import sys
 import threading
 import time
+import uuid
+
+from media_health import write_status
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Iterable
 
@@ -176,6 +181,60 @@ class TimedCameraPose:
     orientation: tuple[float, float, float, float]
 
 
+def _pose_tracking_valid(payload: dict[str, Any]) -> bool:
+    """Legacy poses remain valid; explicit tracking loss must not become TF."""
+    if payload.get("tracking_valid", True) is not True:
+        return False
+    try:
+        confidence = float(payload.get("confidence", 1.0))
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(confidence) and confidence > 0.0
+
+
+def _camera_pose_fallback_allowed(header: dict[str, Any]) -> bool:
+    # Revision-aware apps explicitly withhold unlocatable/retired camera poses.
+    return "tracking_origin_revision" not in header
+
+
+def _camera_pose_epoch_matches(header: dict[str, Any], active_revision: int | None) -> bool:
+    if "tracking_origin_revision" not in header:
+        return True
+    revision = header["tracking_origin_revision"]
+    return type(revision) is int and revision >= 0 and revision == active_revision
+
+
+def _tracking_packet(payload, frame, child_frame, stamp, session_id, source):
+    """Atomic measured pose + origin identity, independent of display-base TF."""
+    revision = payload.get("tracking_origin_revision")
+    valid = (payload.get("tracking_valid") is True and _pose_tracking_valid(payload) and
+             type(revision) is int and revision >= 0)
+    position = orientation = None
+    source_timestamp = None
+    try:
+        source_timestamp = float(payload["timestamp"])
+        vectors = [tuple(float(payload[key][axis]) for axis in ("x", "y", "z"))
+                   for key in ("position", "forward", "up")]
+        valid &= (math.isfinite(source_timestamp) and source_timestamp > 0 and
+                  all(math.isfinite(v) for vector in vectors for v in vector) and
+                  _norm(vectors[1]) > 1e-6 and _norm(vectors[2]) > 1e-6 and
+                  _norm(_cross(_normalize(vectors[1], (0, 0, 0)),
+                               _normalize(vectors[2], (0, 0, 0)))) > .01)
+        if valid:
+            position = _unity_vec_to_ros(payload["position"])
+            orientation = _orientation_from_pose(payload)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        valid = False
+    if source_timestamp is not None and not math.isfinite(source_timestamp):
+        source_timestamp = None
+    return {"schema": "horus.field_tracking.v1", "session_id": session_id,
+            "header": {"frame_id": frame, "stamp": {"sec": stamp.sec, "nanosec": stamp.nanosec}},
+            "child_frame_id": child_frame, "pose_source": source,
+            "source_timestamp_sec": source_timestamp,
+            "tracking_origin_revision": revision if type(revision) is int and revision >= 0 else None,
+            "tracking_valid": bool(valid), "position": position, "orientation_xyzw": orientation}
+
+
 def _nearest_camera_pose(
     samples: Iterable[TimedCameraPose],
     timestamp: float,
@@ -189,6 +248,17 @@ def _nearest_camera_pose(
     if nearest is None or abs(nearest.timestamp - timestamp) > max_delta_seconds:
         return None
     return nearest
+
+
+def _queue_latest(mailbox, sample):
+    try:
+        mailbox.put_nowait(sample)
+    except queue.Full:
+        try:
+            mailbox.get_nowait()
+        except queue.Empty:
+            pass
+        mailbox.put_nowait(sample)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -244,6 +314,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Interpret the HoloLens pose stream as the camera/head pose or as the floor-level base pose. "
             "The deployed HORUS Field app publishes camera/head pose."
         ),
+    )
+    parser.add_argument(
+        "--no-hand-tf", "--head-only", dest="no_hand_tf", action="store_true",
+        help="Skip hand/skeleton TF for head-only presentations; head tracking is unchanged.",
     )
     parser.add_argument(
         "--connect-timeout",
@@ -542,6 +616,14 @@ def _yaw_from_pose(payload: dict[str, Any]) -> float:
     return math.atan2(forward[1], forward[0])
 
 
+def _pose_heights(source_z: float, eye_height: float, floor_height: float, origin: str):
+    if origin == "camera":
+        base_z = max(floor_height, source_z - eye_height)
+        # Clamping the display base to a floor must never move the measured head.
+        return base_z, source_z - base_z
+    return source_z, eye_height
+
+
 def _normalize_hand_joint_name(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
@@ -605,9 +687,11 @@ def _hands_from_pose(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _read_json_line(stream) -> dict[str, Any] | None:
-    line = stream.readline()
+    line = stream.readline(64 * 1024 + 1)
     if not line:
         return None
+    if len(line) > 64 * 1024:
+        raise ValueError("HoloLens JSON header exceeds 64 KiB")
     text = line.decode("utf-8", errors="replace").strip()
     if not text:
         return {}
@@ -621,6 +705,44 @@ def _connect_stream(endpoint: HoloLensRelayEndpoint, port: int, timeout: float) 
     # which would make normal frame gaps look like stream failures.
     sock.settimeout(None)
     return sock
+
+
+class DeadlineReader:
+    """Framed reads with absolute deadlines, without socket.makefile timeouts."""
+
+    def __init__(self, sock, timeout=5.0):
+        self.sock = sock
+        self.timeout = max(.1, timeout)
+        self.pending = bytearray()
+
+    def _receive(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([self.sock], [], [], remaining)[0]:
+            raise socket.timeout("HoloLens stream stalled; reconnecting")
+        chunk = self.sock.recv(65536)
+        if chunk:
+            self.pending.extend(chunk)
+        return bool(chunk)
+
+    def readline(self, limit=65537):
+        deadline = time.monotonic() + self.timeout
+        while b"\n" not in self.pending and len(self.pending) < limit:
+            if not self._receive(deadline):
+                break
+        newline = self.pending.find(b"\n")
+        count = min(limit, newline + 1 if newline >= 0 else len(self.pending))
+        result = bytes(self.pending[:count])
+        del self.pending[:count]
+        return result
+
+    def read(self, count):
+        deadline = time.monotonic() + self.timeout
+        while len(self.pending) < count:
+            if not self._receive(deadline):
+                break
+        result = bytes(self.pending[:count])
+        del self.pending[:count]
+        return result
 
 
 def _read_control_ack(stream, timeout: float) -> dict[str, Any] | None:
@@ -649,6 +771,7 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
         from geometry_msgs.msg import PoseStamped, TransformStamped
         from rclpy.executors import ExternalShutdownException
         from rclpy.node import Node
+        from rclpy.qos import QoSProfile, ReliabilityPolicy
         from sensor_msgs.msg import CameraInfo, CompressedImage, Image
         from std_msgs.msg import Float32, String
         from tf2_ros import TransformBroadcaster
@@ -685,6 +808,8 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             self._reconnect_delay = max(0.1, float(args.reconnect_delay))
             self._video_profile_command = _build_video_profile_command(args)
             self._tf_broadcaster = TransformBroadcaster(self)
+            self._hand_tf_broadcaster = TransformBroadcaster(self)
+            self._hand_samples = queue.Queue(maxsize=1)
             self._status_pub = self.create_publisher(String, contract_config.status_topic, 10)
             self._confidence_pub = self.create_publisher(Float32, contract_config.localization_confidence_topic, 10)
             self._fpv_pub = self.create_publisher(CompressedImage, contract_config.first_person_video_topic, 10)
@@ -692,6 +817,11 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             self._camera_info_pub = self.create_publisher(CameraInfo, self._camera_info_topic, 10)
             self._camera_pose_topic = contract_config.first_person_video_camera_pose_topic
             self._camera_pose_pub = self.create_publisher(PoseStamped, self._camera_pose_topic, 10)
+            # Local additive channels: never overload the image-synchronized PV pose.
+            self._tracking_session_id = uuid.uuid4().hex
+            self._head_pose_pub = self.create_publisher(String, f"/{frame_prefix}/tracking/head_pose",
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+            self._pv_pose_pub = self.create_publisher(String, f"/{frame_prefix}/tracking/pv_pose", 10)
             self._guidance_state_pub = self.create_publisher(String, contract_config.guidance_state_topic, 10)
             self._guidance_response_pub = self.create_publisher(String, contract_config.guidance_response_topic, 10)
             self._guidance_subscriptions = [
@@ -737,6 +867,11 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                         f"Raw HoloLens image topic disabled because JPEG decoding is unavailable: {exc}"
                     )
             self._last_status_time = 0.0
+            self._last_pose_time = None
+            self._last_video_time = None
+            self._last_confidence = 0.0
+            self._active_pose_revision: int | None = None
+            self._status_lock = threading.Lock()
             self._pose_count = 0
             self._video_count = 0
             self._last_video_width = 0
@@ -756,8 +891,11 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                 threading.Thread(target=self._video_loop, name="hololens_video_stream", daemon=True),
                 threading.Thread(target=self._control_loop, name="hololens_control_stream", daemon=True),
             ]
+            if not args.no_hand_tf:
+                self._threads.append(threading.Thread(target=self._hand_loop, name="hololens_hand_tf", daemon=True))
             for thread in self._threads:
                 thread.start()
+            self.create_timer(0.5, self._publish_status)
             self.get_logger().info(
                 f"Live HoloLens relay started for {args.name}: "
                 f"PV {endpoint.host}:{endpoint.personal_video_port}, "
@@ -784,6 +922,7 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                     pass
             for thread in self._threads:
                 thread.join(timeout=1.0)
+            write_status(os.environ.get("HORUS_MEDIA_STATUS_FILE"), {"role": "teammate", "state": "stopped", "tracks": {}})
 
         def _track_socket(self, sock: socket.socket) -> None:
             with self._sockets_lock:
@@ -794,6 +933,8 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                 self._sockets.discard(sock)
 
         def _enqueue_control(self, payload: dict[str, Any]) -> None:
+            payload = dict(payload)
+            payload["_queued_monotonic"] = time.monotonic()
             try:
                 self._control_queue.put_nowait(payload)
             except queue.Full:
@@ -831,7 +972,10 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                                     command = self._control_queue.get(timeout=0.1)
                                 except queue.Empty:
                                     continue
-
+                                created = command.pop("_queued_monotonic", time.monotonic())
+                                if time.monotonic() - created > 5 and command.get("type") not in {"configure_voice", "set_video_profile"}:
+                                    self.get_logger().warning("Dropped expired HoloLens control message")
+                                    continue
                                 payload = (json.dumps(command, separators=(",", ":")) + "\n").encode("utf-8")
                                 sock.sendall(payload)
                                 try:
@@ -864,7 +1008,7 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                     with _connect_stream(self._endpoint, self._endpoint.spatial_input_port, self._connect_timeout) as sock:
                         self._track_socket(sock)
                         try:
-                            stream = sock.makefile("rb")
+                            stream = DeadlineReader(sock, max(5.0, self._connect_timeout))
                             greeting = stream.readline()
                             if greeting and greeting != POSE_GREETING:
                                 self.get_logger().warning(f"Unexpected SI greeting: {greeting!r}")
@@ -891,7 +1035,7 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                     with _connect_stream(self._endpoint, self._endpoint.personal_video_port, self._connect_timeout) as sock:
                         self._track_socket(sock)
                         try:
-                            stream = sock.makefile("rb")
+                            stream = DeadlineReader(sock, max(5.0, self._connect_timeout))
                             greeting = stream.readline()
                             if greeting and greeting != VIDEO_GREETING:
                                 self.get_logger().warning(f"Unexpected PV greeting: {greeting!r}")
@@ -904,8 +1048,7 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                                     continue
                                 length = int(header.get("content_length") or 0)
                                 if length <= 0 or length > 8_000_000:
-                                    self.get_logger().warning(f"Dropping invalid HoloLens JPEG length: {length}")
-                                    continue
+                                    raise ValueError(f"Invalid HoloLens JPEG length: {length}")
                                 data = stream.read(length)
                                 if len(data) != length:
                                     raise RuntimeError(f"short JPEG frame: {len(data)}/{length}")
@@ -921,6 +1064,19 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                 self._sleep_reconnect()
 
         def _publish_pose(self, payload: dict[str, Any]) -> None:
+            stamp = self.get_clock().now().to_msg()
+            packet = _tracking_packet(payload, self._map_frame, f"{self._frame_prefix}/head",
+                                      stamp, self._tracking_session_id, "unity_head")
+            self._head_pose_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
+            if not _pose_tracking_valid(payload):
+                self._active_pose_revision = None
+                with self._pose_history_lock:
+                    self._pose_history.clear()
+                self._confidence_pub.publish(Float32(data=0.0))
+                self._publish_status(0.0)
+                return
+            revision = payload.get("tracking_origin_revision")
+            self._active_pose_revision = revision if type(revision) is int and revision >= 0 else None
             position = _unity_vec_to_ros(payload.get("position") or {})
             head_rotation = _orientation_from_pose(payload)
             source_timestamp = float(payload.get("timestamp") or 0.0)
@@ -935,12 +1091,9 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                     self._pose_history.append(sample)
             base_rotation = _yaw_to_quaternion(_yaw_from_pose(payload))
             camera_rotation = _quaternion_multiply(_quaternion_inverse(base_rotation), head_rotation)
-            base_z = float(position[2])
-            if self._pose_origin == "camera":
-                base_z = max(self._floor_height, base_z - self._camera_height)
+            base_z, relative_camera_z = _pose_heights(
+                float(position[2]), self._camera_height, self._floor_height, self._pose_origin)
             base_position = (float(position[0]), float(position[1]), base_z)
-            inverse_base_rotation = _quaternion_inverse(base_rotation)
-            stamp = self.get_clock().now().to_msg()
 
             base_tf = TransformStamped()
             base_tf.header.stamp = stamp
@@ -958,13 +1111,37 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             camera_tf.header.stamp = stamp
             camera_tf.header.frame_id = self._base_frame
             camera_tf.child_frame_id = self._camera_frame
-            camera_tf.transform.translation.z = self._camera_height
+            camera_tf.transform.translation.z = relative_camera_z
             camera_tf.transform.rotation.x = camera_rotation[0]
             camera_tf.transform.rotation.y = camera_rotation[1]
             camera_tf.transform.rotation.z = camera_rotation[2]
             camera_tf.transform.rotation.w = camera_rotation[3]
 
-            transforms = [base_tf, camera_tf]
+            self._tf_broadcaster.sendTransform([base_tf, camera_tf])
+            confidence = float(payload.get("confidence", 1.0))
+            self._last_confidence = confidence
+            self._confidence_pub.publish(Float32(data=max(0.0, min(1.0, confidence))))
+            self._pose_count += 1
+            self._last_pose_time = time.monotonic()
+            if not args.no_hand_tf:
+                _queue_latest(self._hand_samples, (payload, stamp, base_position, base_rotation, time.monotonic()))
+
+        def _hand_loop(self):
+            while not self._stop.is_set():
+                try:
+                    sample = self._hand_samples.get(timeout=.2)
+                except queue.Empty:
+                    continue
+                if time.monotonic() - sample[-1] > .25:
+                    continue
+                try:
+                    self._publish_hands(*sample[:-1])
+                except Exception as exc:
+                    self.get_logger().warning(f"HoloLens hand TF error: {exc}")
+
+        def _publish_hands(self, payload, stamp, base_position, base_rotation):
+            transforms = []
+            inverse_base_rotation = _quaternion_inverse(base_rotation)
             for hand in _hands_from_pose(payload):
                 handedness = hand["hand"]
                 hand_position = hand["position"]
@@ -1045,11 +1222,8 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                     flat_joint_tf.transform.rotation.w = joint_base_local_rotation[3]
                     transforms.append(flat_joint_tf)
 
-            self._tf_broadcaster.sendTransform(transforms)
-            confidence = float(payload.get("confidence", 1.0))
-            self._confidence_pub.publish(Float32(data=max(0.0, min(1.0, confidence))))
-            self._pose_count += 1
-            self._publish_status(confidence)
+            if transforms:
+                self._hand_tf_broadcaster.sendTransform(transforms)
 
         def _on_guidance_message(self, kind: str, msg: String) -> None:
             command = self._build_guidance_command(kind, msg.data)
@@ -1137,9 +1311,22 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             self._fpv_pub.publish(msg)
             self._publish_raw_image(msg, data)
             self._video_count += 1
-            self._publish_status(1.0)
+            self._last_video_time = time.monotonic()
+            self._publish_status()
 
         def _publish_frame_camera_pose(self, compressed: CompressedImage, header: dict[str, Any]) -> None:
+            camera_payload = header.get("camera_pose")
+            native = dict(camera_payload) if isinstance(camera_payload, dict) else {}
+            native.update(timestamp=header.get("timestamp"),
+                          tracking_origin_revision=header.get("tracking_origin_revision"),
+                          tracking_valid=(header.get("tracking_valid") is True and
+                                          _camera_pose_epoch_matches(header, self._active_pose_revision)))
+            packet = _tracking_packet(native, self._map_frame, f"{self._frame_prefix}/pv_camera",
+                                      compressed.header.stamp, self._tracking_session_id,
+                                      "hololens_locatable_pv_camera")
+            self._pv_pose_pub.publish(String(data=json.dumps(packet, allow_nan=False)))
+            if not _camera_pose_epoch_matches(header, self._active_pose_revision):
+                return
             position = None
             orientation = None
             if bool(header.get("tracking_valid")):
@@ -1150,6 +1337,8 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
                     self._video_native_pose_count += 1
 
             if position is None or orientation is None:
+                if not _camera_pose_fallback_allowed(header):
+                    return
                 source_timestamp = float(header.get("timestamp") or 0.0)
                 with self._pose_history_lock:
                     history = tuple(self._pose_history)
@@ -1246,17 +1435,38 @@ def _run_live(args: argparse.Namespace, endpoint: HoloLensRelayEndpoint) -> int:
             raw.data = rgb.tobytes()
             self._raw_image_pub.publish(raw)
 
-        def _publish_status(self, confidence: float) -> None:
+        def _publish_status(self, confidence: float | None = None) -> None:
+            if confidence is not None:
+                self._last_confidence = confidence
+            if self._stop.is_set() or not self._status_lock.acquire(blocking=False):
+                return
+            try:
+                self._publish_status_locked()
+            finally:
+                self._status_lock.release()
+
+        def _publish_status_locked(self) -> None:
             now = time.monotonic()
             if now - self._last_status_time < 0.5:
                 return
             self._last_status_time = now
+            confidence = self._last_confidence
+            tracks = {}
+            for name, last, count in (("pose", self._last_pose_time, self._pose_count),
+                                      ("video", self._last_video_time, self._video_count)):
+                age = None if last is None else now - last
+                tracks[name] = {"received_frames": count, "frame_age_sec": age,
+                                "state": "waiting" if age is None else "flowing" if age < 3 else "stale"}
+            state = "live" if tracks["pose"]["state"] == "flowing" else tracks["pose"]["state"]
+            write_status(os.environ.get("HORUS_MEDIA_STATUS_FILE"),
+                         {"role": "teammate", "state": state, "tracks": tracks})
             self._status_pub.publish(
                 String(
                     data=json.dumps(
                         {
                             "teammate": args.name,
-                            "state": "live",
+                            "state": state,
+                            "stream_health": tracks,
                             "wearable": "hololens2",
                             "localization_confidence": round(float(confidence), 3),
                             "pose_frames": self._pose_count,

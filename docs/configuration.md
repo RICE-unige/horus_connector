@@ -2,6 +2,14 @@
 
 Use `./horus setup` for normal configuration. Edit `.env` directly only when you need advanced control.
 
+Launch, bootstrap, monitoring and fleet use the same literal `KEY=VALUE`
+grammar, with optional `export` and shell-style quoting. Put comments on their
+own lines; inline `#` remains part of the value. Dollar signs and
+`${VARIABLE}` remain literal; command substitutions and shell statements are
+not executed. Quote values containing spaces, quotes or JSON. Generated fleet
+files use this same grammar. See [reliability and performance](performance.md)
+for routing, camera delivery, recovery budgets and qualification instructions.
+
 ## Core Environment
 
 | Variable | Used by | Purpose |
@@ -29,6 +37,7 @@ Use `./horus setup` for normal configuration. Edit `.env` directly only when you
 | `CYCLONEDDS_URI` | Optional existing CycloneDDS XML profile. Use this when a partner robot already has a working DDS interface profile. |
 | `HORUS_DDS_INTERFACE` | Optional CycloneDDS interface name for the connector bridge participant. |
 | `HORUS_DDS_PREFLIGHT_TOPIC_TIMEOUT` | Timeout in seconds for the preflight `ros2 topic list` probe. Default: `5.0`. |
+| `HORUS_DDS_PROBE_TOPIC` | Optional absolute topic for a bounded real-sample receive probe. `doctor` also selects visible `/tf` or odometry automatically. This proves local DDS delivery, not end-to-end delivery. |
 
 ## DDS Preflight
 
@@ -65,6 +74,7 @@ Typical diagnoses:
 | `MACHINE_IMPORT_ROUTES_NOT_SEEN` | The machine bridge log does not show remote import routes yet. |
 | `DOCKER_NETWORK_NOT_HOST` | Docker bridge runtime must use host networking for DDS discovery. |
 | `FASTDDS_SHM_CONTAINER_WARNING` | FastDDS shared-memory transport may break data flow across container IPC boundaries. |
+| `DDS_SAMPLE_NOT_RECEIVED` | Discovery found an interface but the read-only local subscriber received no sample within its deadline. Check source activity, QoS and DDS selection. |
 
 For Docker bridge runtime, HORUS mounts either the existing `CYCLONEDDS_URI` XML or the rendered CycloneDDS XML into the bridge container, passes the DDS environment explicitly, and runs the bridge with host networking.
 
@@ -83,7 +93,7 @@ Use a robot Zenoh config where `ros_localhost_only` is `false`; the default robo
 | Variable | Purpose |
 |---|---|
 | `ZENOH_PORT` | Zenoh TCP port. Default: `7447`. |
-| `ZENOH_VERSION` | Bridge version installed by bootstrap. |
+| `ZENOH_VERSION` | Exact bridge release installed by full bootstrap; template default is `1.10.2`. `./horus update-zenoh [version]` updates only the project-local bridge/plugin and does not rewrite this setting. |
 | `ZENOH_CONFIG` | `auto` selects the role config, or set a custom JSON5 path. |
 | `ZENOH_TRANSPORT` | `auto`, `tcp`, or `quic`. Default: `auto`. |
 | `ZENOH_AUTO_ENABLE_QUIC` | Set `1` to let `auto` try QUIC first when TLS is configured, with TCP fallback. |
@@ -109,14 +119,43 @@ imports only guidance topics. It deliberately excludes velocity, service, and
 action interfaces so the connector mirrors the SDK's default-deny human entity
 contract.
 
-The default robot profile exports robot ROS topics through Zenoh and imports command topics from the operator machine. The machine profile imports robot topics and exports only command topics:
+The default robot profile exports robot ROS topics through Zenoh and imports command and goal topics from the operator machine. The machine profile imports robot topics and exports command and goal topics, plus service and action clients:
 
 ```text
 /cmd_vel
 /<robot>/cmd_vel
+/goal
+/<robot>/goal
+/<robot>/command
 ```
 
-The operator camera path uses WebRTC media. ROS image topics can still cross Zenoh when the robot profile is left open for experiments, but that is not required for the low-latency camera view. For bandwidth-limited runs, use a custom `ZENOH_CONFIG` to filter high-rate image topics.
+The default topic routes also cover `/cmd/velocity`, `/goal_pose`, and `/move_base_simple/goal`. Check custom `ZENOH_CONFIG` profiles separately; they can override these defaults.
+
+Both endpoint profiles also route `/horus/**` and `/<namespace>/horus/**` in the
+return direction, including registration acknowledgements, heartbeat, replay,
+model requests and teleop runtime state. Static TF is not rate-limited; retained
+history uses a cache multiplier of 10 and a five-second late-join query budget.
+If more than ten independent retained writers share a topic, size that cache
+for the actual writer count and history depth.
+
+Control/HORUS events have higher priority than maps and model chunks. The queue
+allows a bounded 1 ms enqueue wait instead of dropping immediately on a burst.
+The cloud router uses the same bounded enqueue wait. Initial DDS route
+discovery can retain startup samples; report startup and steady-state latency
+separately rather than treating a newly opened connection as a ready graph.
+Reliable routes now preserve the publisher's requested reliability through
+blocking enqueue; best-effort routes may still drop. Backpressure can reach
+DDS, and priorities do not guarantee lossless end-to-end delivery or remove
+TCP head-of-line blocking. Nonreplaceable transfers still require application
+revision/acknowledgement/retry protocols and bounded source histories. Keep
+camera/map rates and bitrates within measured link capacity. Default endpoint
+profiles no longer impose whole-message TF or hidden sensor-frequency caps.
+
+The operator camera path uses WebRTC media. ROS image topics can still cross
+Zenoh when a remote subscriber matches them. Use per-stream `webrtc_only` with
+`HORUS_ZENOH_CAMERA_POLICY=configured` or an explicit custom profile to avoid
+duplicate camera traffic. Capability-derived custom command routes are
+configured with `HORUS_ROUTES_CONFIG`; see [routing details](performance.md#routing-and-backpressure).
 
 `ZENOH_TRANSPORT=auto` uses QUIC first only when the local TLS profile is ready; TCP remains available as fallback. Use `ZENOH_TRANSPORT=tcp` to force the conservative path. Use `ZENOH_TRANSPORT=quic` only when you want the launch to fail if QUIC TLS is missing.
 
@@ -197,7 +236,8 @@ robot camera WebRTC settings independent from the HoloLens PV relay.
 | `HORUS_WEBRTC_SIGNAL_TLS` | Set `1` to use WSS signaling. |
 | `HORUS_WEBRTC_SIGNAL_TLS_CERT` | Relay TLS certificate for WSS. |
 | `HORUS_WEBRTC_SIGNAL_TLS_KEY` | Relay TLS private key for WSS. |
-| `WEBRTC_DURATION` | Runtime duration in seconds. Use `86400` for long runs. |
+| `WEBRTC_DURATION` | `0` (default) runs until stopped; positive seconds are for finite tests. |
+| `WEBRTC_JITTER_BUFFER_MS` | Explicit receive jitter budget. Defaults to 50 ms for direct/VPN profiles and 100 ms otherwise; tune against measured loss/jitter, not to zero indiscriminately. |
 | `WEBRTC_ICE_SERVERS` | Comma-separated STUN/TURN servers. |
 | `WEBRTC_ICE_TRANSPORT_POLICY` | `all` for normal direct-first behavior, or `relay` to force TURN validation. |
 | `HORUS_WEBRTC_DEBUG_ICE` | Set `1` to log sanitized ICE candidate exchange while debugging connectivity. |
@@ -212,9 +252,12 @@ robot camera WebRTC settings independent from the HoloLens PV relay.
 | `WEBRTC_ROS_IMAGE_OUTPUT_ENCODING` | ROS encoding for decoded frames. |
 | `WEBRTC_ROS_IMAGE_FRAME_ID` | Frame ID for decoded ROS images. |
 | `WEBRTC_ROS_IMAGE_QOS` | `auto` is recommended. |
+| `HORUS_WEBRTC_PYTHON` | Exact media interpreter; launch checks synchronous websockets, GI, NICE and ROS imports before starting services. |
+| `WEBRTC_VENV` | Optional media virtualenv path used by setup and interpreter selection. |
 | `HORUS_STREAMS_CONFIG` | Optional JSON config for multiple WebRTC camera streams. Usually written by `./horus setup`. |
 | `HORUS_WEBRTC_SESSION_MODE` | `auto`, `bundled`, or `isolated`. Version-2 configs default to `bundled`. |
 | `HORUS_WEBRTC_SESSION_ROOM` | Optional override for the bundled robot session room. |
+| `HORUS_WEBRTC_ADDITIONAL_ROOMS` | Comma-separated extra bundled-session rooms on the robot for additional operators in hub topology. Each extra room launches a separate encoder; not available in direct or isolated mode. |
 | `VIDEO_BITRATE_KBIT` | Starting H.264 bitrate. |
 | `WEBRTC_ADAPTIVE_BITRATE` | Enable adaptive bitrate control. Default: `1`. |
 | `WEBRTC_CONTROL_ENABLED` | Legacy/debug option for WebRTC DataChannel publishing to `ROS_CMD_TOPIC`. Keep `0` for normal runs. Default: `0`. |
@@ -250,7 +293,58 @@ Use `./horus setup` and choose the number of WebRTC camera streams. The setup wr
 
 New version-2 configurations bundle all camera tracks for one robot into one `webrtcbin` peer connection and one ICE/DTLS session. Each track keeps its own input topic, output topic, resolution, frame rate, and bitrate. The machine maps the SDP track ID back to the configured ROS 2 output topic.
 
+For two operators in hub mode, set `HORUS_WEBRTC_ADDITIONAL_ROOMS=operator_b` on the robot. Keep the original room on operator A; set `HORUS_WEBRTC_SESSION_ROOM=operator_b` on operator B. Each operator machine runs its own connector instance and receives the same configured tracks. The robot runs one sender/encoder per room, so this is a static fan-out mechanism, not a shared-encode broadcast or automatic join system. Ensure the relay credentials authorize both rooms. With zero enabled streams in an explicit config, no WebRTC media process is started.
+
 Version-1 configurations remain supported as `isolated` mode and continue to launch one sender, receiver, and signaling room per stream. Use that mode only for compatibility or fault-isolation testing.
+
+IDs are matched to exact negotiated MSID tokens, not substrings or pad order.
+Use the same camera IDs on both endpoints. Unknown tracks are ignored rather
+than silently published as another camera. Fleet launch rejects duplicate
+instance names, rooms and image/CameraInfo output topics before starting any
+services. Direct fleets share one room-aware local signaling relay.
+
+### ROS Image Metadata
+
+Bundled cameras require GStreamer 1.22+ so each incoming track has its negotiated
+MSID, not a guessed pad order. Single-camera H.264 recovery requires 1.20+.
+The MSID property is documented in [GStreamer webrtcbin](https://gstreamer.freedesktop.org/documentation/webrtc/index.html).
+
+Each input has one depth-one subscription. `auto`/`sensor_data` use best effort
+and accept reliable publishers too; `default` explicitly requests reliable QoS.
+Input pacing applies the configured FPS before copying/converting pixels. Raw
+ingress and decoded output keep the newest frame; the bounded H.264 RTP queue
+does not discard arbitrary fragments as if they were complete images.
+
+Optional fields on each camera in the JSON configuration:
+
+```json
+{
+  "id": "front",
+  "input_topic": "/robot/camera/image_raw",
+  "output_topic": "/remote/camera/image_raw",
+  "input_camera_info_topic": "/robot/camera/camera_info",
+  "output_camera_info_topic": "/remote/camera/camera_info",
+  "preserve_source_header": true,
+  "width": 640,
+  "height": 480,
+  "fps": 30
+}
+```
+
+Default image headers retain the receiver publication clock and configured
+frame ID for compatibility. Opting into `preserve_source_header` uses only an
+exact RTP-timestamp/decoded-PTS metadata match. A frame without matching
+metadata is dropped rather than given a timestamp in another clock domain.
+Metadata uses an unordered best-effort DataChannel, so coverage is not
+guaranteed for every decoded frame. Monitor `metadata_missing_frames` in the
+per-track media health file. Preserved source frames must also exist in the receiving
+ROS/TF graph, including any namespace translation.
+
+CameraInfo forwarding supports full-frame scaling: K and P are scaled to the
+decoded width/height, while D and R are preserved. Cropped ROI or binned
+calibration is not guessed. Invalid or unavailable calibration is omitted.
+These options work in bundled and isolated sessions. They do not instrument
+Quest display latency.
 
 Example template:
 
@@ -281,6 +375,12 @@ Version-1 isolated streams use the stream service name:
 | `HORUS_INTEL_MEDIA_DRIVER` | `free` by default. Use `non-free` only when required. |
 
 Bootstrap probes the local machine and writes the selected video path to `.webrtc_profile.env`.
+
+Launch uses a cached, atomic per-instance `.run/webrtc_profile.env`. Interpreter,
+detector, GStreamer version, plugin search paths, devices and video settings
+form its cache fingerprint. A codec probe proves availability, not sustained
+multi-camera capacity. `WEBRTC_H264_KEY_INT_MAX` drives supported hardware and
+software GOP properties. Launch does not change headset render quality.
 
 Expected paths:
 
@@ -372,6 +472,42 @@ Set `HORUS_WEBRTC_CREDENTIALS_FILE` on the hub. Put only the printed robot ident
 | `HORUS_LAUNCH_MONITOR` | Set `0` to prevent `launch` from opening the live console. |
 
 Runtime files are written to `.run/` and ignored by git.
+
+Each service has an owned supervisor, rotated logs (10 MiB plus three archives),
+PID/start-time identity and a `*.service.json` state file. Startup survival is
+reported separately from data readiness. The supervisor retries later crashes
+with bounded backoff, up to five failures in five minutes. Early startup
+failures roll back only services newly started by that launch. Repeating a
+launch preserves healthy services; stop waits up to ten seconds for graceful
+cleanup before escalation.
+Forced cleanup checks both supervisor and child start-time identities before
+stopping an owned child process group; it does not sweep unrelated processes.
+Coturn is a shared system service, not an instance-owned child. Launch preserves
+an already-running relay and ordinary `stop` leaves it unchanged; system-level
+relay shutdown must be explicit. This does not change its credentials or policy.
+Codec probes are cached per instance and check the actual configured camera
+sizes/FPS, not an invented combined resolution. They prove codec availability,
+not simultaneous camera capacity.
+
+Media endpoints write `*.media.json` with per-track counts and frame age.
+`WAIT` means no current data, `STALE` means old data, and `LIVE`/`PARTIAL` require
+fresh frames/pose rather than a historical log message. Silent ROS publishers
+do not trigger transport restart storms. Failed negotiation or active-sender
+decode stalls coordinate a new offer; repeated media faults back off from
+2 seconds to a 30-second maximum and reset after stable connection time.
+Relay registration owns reconnect startup. Peer notifications identify the
+endpoint session, so a delayed notification cannot discard an offer that
+already belongs to that session. Outgoing negotiation messages wait for the
+registration acknowledgement. Use matching connector versions on the sender,
+receiver and relay for these lifecycle guarantees; legacy relays without
+session identity retain the compatible but less precise replacement behavior.
+Field-teammate pose/video reads have absolute deadlines and fresh-data status.
+
+H.264 timing samples match actual RTP timestamps to decoded PTS and retain at
+most 10,000 samples. Their boundary is **packetization to decoded output**, not
+capture-to-display or glass-to-glass. Negative corrected timings are invalid.
+The benchmark renderer excludes these samples from capture-latency/SLA
+comparison curves rather than inventing fresh-frame FPS.
 
 ## Fleet
 

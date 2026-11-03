@@ -229,7 +229,7 @@ def test_version_two_streams_share_one_bundled_room(monkeypatch, tmp_path):
     session = webrtc_streams.load_session(tmp_path, "machine")
     streams = webrtc_streams.load_streams(tmp_path, "machine")
 
-    assert session == {"version": 2, "mode": "bundled", "room": "alpha", "id": "alpha", "role": "machine"}
+    assert session == {"version": 2, "mode": "bundled", "room": "alpha", "id": "alpha", "role": "machine", "bitrate_budget_kbit": 0}
     assert [stream["room"] for stream in streams] == ["alpha", "alpha"]
 
 
@@ -275,6 +275,168 @@ def test_signaling_ready_timer_cannot_activate_replaced_connection():
     assert callbacks == []
     signaling._notify_ready(generation_two)
     assert callbacks == ["ready"]
+
+
+def test_signaling_client_waits_for_registration_ack():
+    from gst_webrtc_common import JsonSignaling
+
+    callbacks = []
+    signaling = JsonSignaling(lambda _message: None, lambda: callbacks.append("ready"), wait_for_registration=True)
+    generation = signaling._begin_connection()
+    assert callbacks == []
+    signaling._dispatch_text('{"type":"registered"}', generation)
+    assert callbacks == ["ready"]
+
+
+def test_signaling_disconnected_send_never_waits(monkeypatch):
+    from gst_webrtc_common import JsonSignaling
+
+    signaling = JsonSignaling(lambda _message: None)
+
+    def forbidden_wait(*_args, **_kwargs):
+        raise AssertionError("signaling callback must not wait for the network")
+
+    monkeypatch.setattr(signaling.connected, "wait", forbidden_wait)
+    signaling.send({"type": "ice", "candidate": "candidate-one"})
+    assert json.loads(signaling.pending.get_nowait()[1])["candidate"] == "candidate-one"
+
+
+def test_signaling_failed_send_is_retained_in_order():
+    from gst_webrtc_common import JsonSignaling
+
+    class Socket:
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.messages = []
+            self.closed = False
+
+        def send(self, text):
+            if self.fail:
+                raise OSError("disconnected")
+            self.messages.append(json.loads(text)["type"])
+
+        def close(self):
+            self.closed = True
+
+    signaling = JsonSignaling(lambda _message: None)
+    signaling.ws = Socket(fail=True)
+    signaling._begin_connection()
+    signaling.send({"type": "offer"})
+    import pytest
+    with pytest.raises(OSError):
+        signaling._flush_pending()
+    signaling.reconnect()
+    assert not signaling.connected.is_set()
+    assert signaling.ws.closed
+    signaling.send({"type": "ice"})
+    signaling.ws = Socket()
+    signaling._begin_connection()
+    signaling._flush_pending()
+    assert signaling.ws.messages == ["offer", "ice"]
+    assert signaling._pending_retry is None
+
+
+def test_signaling_closed_send_is_dropped():
+    from gst_webrtc_common import JsonSignaling
+
+    signaling = JsonSignaling(lambda _message: None)
+    signaling.closed.set()
+    signaling.send({"type": "ice"})
+    assert signaling.pending.empty()
+
+
+def test_signaling_close_is_idempotent_and_invalidates_old_generation():
+    from gst_webrtc_common import JsonSignaling
+
+    class Socket:
+        def __init__(self):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    socket = Socket()
+    signaling = JsonSignaling(lambda _message: None)
+    generation = signaling._begin_connection(socket)
+    signaling.close()
+    signaling.close()
+    assert socket.close_count == 1
+    assert signaling.closed.is_set()
+    assert not signaling._is_current_connection(generation)
+    assert not signaling.connected.is_set()
+    assert not signaling.ready.is_set()
+
+
+def test_signaling_old_reader_cannot_consume_replacement_socket():
+    from gst_webrtc_common import JsonSignaling
+
+    messages = []
+    signaling = JsonSignaling(messages.append)
+
+    class OldSocket:
+        def __iter__(self):
+            signaling._begin_connection(object())
+            yield '{"type":"old-ice"}'
+
+    signaling._read_loop(OldSocket())
+    assert messages == []
+    assert signaling.connected.is_set()
+
+
+def test_relay_reregistration_removes_previous_room():
+    import asyncio
+    from webrtc_signal_relay import Relay
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, message):
+            self.messages.append(json.loads(message))
+
+        async def close(self, **_kwargs):
+            pass
+
+    relay = Relay()
+    robot = Socket()
+    machine = Socket()
+
+    async def exercise():
+        await relay.register(robot, "robot", "first")
+        await relay.register(machine, "machine", "first")
+        await relay.register(machine, "machine", "second")
+
+    asyncio.run(exercise())
+    assert relay.peers.get(("first", "machine")) is None
+    assert relay.peers[("second", "machine")] is machine
+    assert {"type": "peer-left", "role": "machine", "room": "first"} in robot.messages
+
+
+def test_relay_keeps_two_operator_rooms_independent():
+    import asyncio
+    from webrtc_signal_relay import Relay
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, message):
+            self.messages.append(json.loads(message))
+
+    relay = Relay()
+    robot_a, robot_b, machine_a, machine_b = (Socket() for _ in range(4))
+
+    async def exercise():
+        await relay.register(robot_a, "robot", "operator_a")
+        await relay.register(robot_b, "robot", "operator_b")
+        await relay.register(machine_a, "machine", "operator_a")
+        await relay.register(machine_b, "machine", "operator_b")
+        await relay.forward("operator_a", "robot", '{"type":"offer","room":"operator_a"}')
+        await relay.forward("operator_b", "robot", '{"type":"offer","room":"operator_b"}')
+
+    asyncio.run(exercise())
+    assert [message["room"] for message in machine_a.messages if message["type"] == "offer"] == ["operator_a"]
+    assert [message["room"] for message in machine_b.messages if message["type"] == "offer"] == ["operator_b"]
 
 
 def test_relay_offer_coalesces_stale_session_signaling():

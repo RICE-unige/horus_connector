@@ -31,22 +31,8 @@ gi.require_version("GstWebRTC", "1.0")
 from gi.repository import Gst, GstSdp, GstWebRTC  # noqa: E402
 
 logger = logging.getLogger(__name__)
-
-
-def load_env_file(path: Optional[str]) -> Dict[str, str]:
-    if not path:
-        return {}
-    env_path = Path(path)
-    if not env_path.exists():
-        return {}
-    values = {}
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip("'").strip('"')
-    return values
+from connector_config import load_env_file
+from native_runtime import activate
 
 
 def first_ice_server(servers: str, prefix: str) -> str:
@@ -66,12 +52,14 @@ def stun_property(servers: str) -> str:
 
 
 def turn_property(servers: str) -> str:
-    server = first_ice_server(servers, "turn:")
+    server = next((item.strip() for item in servers.split(",")
+                   if item.strip().startswith(("turn:", "turns:"))), "")
     if not server:
         return ""
     if server.startswith("turn://") or server.startswith("turns://"):
         return server
-    return "turn://" + server[len("turn:") :]
+    scheme, address = server.split(":", 1)
+    return scheme + "://" + address
 
 
 def normalize_ice_transport_policy(value: str) -> str:
@@ -110,6 +98,10 @@ def webrtcbin_properties(ice_servers: str, ice_transport_policy: str = "all") ->
 
 
 def configure_webrtcbin(element, ice_servers: str, ice_transport_policy: str = "all"):
+    # A buffering budget, not a claimed end-to-end latency. WAN remains resilient.
+    default_latency = 50 if os.environ.get("HORUS_TOPOLOGY") in {"direct", "vpn"} else 100
+    if element.find_property("latency"):
+        element.set_property("latency", env_int("WEBRTC_JITTER_BUFFER_MS", default_latency, 0))
     if element.find_property("bundle-policy"):
         element.set_property("bundle-policy", "max-bundle")
     policy = normalize_ice_transport_policy(ice_transport_policy)
@@ -120,7 +112,8 @@ def configure_webrtcbin(element, ice_servers: str, ice_transport_policy: str = "
     turn_added = None
     if stun and element.find_property("stun-server"):
         element.set_property("stun-server", stun)
-    if turn and element.find_property("turn-server"):
+    turns = [turn_property(item) for item in ice_servers.split(",") if item.strip().startswith(("turn:", "turns:"))]
+    for turn in dict.fromkeys(turns):
         turn_added = False
         try:
             turn_added = bool(element.emit("add-turn-server", turn))
@@ -139,6 +132,8 @@ def configure_webrtcbin(element, ice_servers: str, ice_transport_policy: str = "
 
 
 def ensure_webrtc_runtime():
+    for directory in activate():
+        Gst.Registry.get().scan_path(str(directory))
     missing: List[str] = []
     if Gst.ElementFactory.find("webrtcbin") is None:
         missing.append("gstreamer1.0-plugins-bad (webrtcbin)")
@@ -159,6 +154,14 @@ def make_session_description(kind: str, sdp_text: str):
     result = GstSdp.sdp_message_parse_buffer(sdp_text.encode("utf-8"), sdp)
     if result != GstSdp.SDPResult.OK:
         raise RuntimeError(f"failed to parse remote SDP: {result}")
+    # libdatachannel uses session-level transport attributes; webrtcbin 1.24
+    # validates some of them at media level. Expand inheritance, not defaults.
+    for index in range(sdp.medias_len()):
+        media = sdp.get_media(index)
+        for name in ("setup", "ice-ufrag", "ice-pwd"):
+            inherited = sdp.get_attribute_val(name)
+            if inherited and media.get_attribute_val(name) is None:
+                media.add_attribute(name, inherited)
     sdp_type = {
         "offer": GstWebRTC.WebRTCSDPType.OFFER,
         "answer": GstWebRTC.WebRTCSDPType.ANSWER,
@@ -191,11 +194,18 @@ class JsonSignaling:
         self.ready = threading.Event()
         self.closed = threading.Event()
         self.send_lock = threading.Lock()
+        self.enqueue_lock = threading.Lock()
         self.ready_lock = threading.Lock()
         self.connection_lock = threading.Lock()
         self.connection_generation = 0
         self.ready_notified = False
-        self.pending: queue.Queue[str] = queue.Queue(maxsize=env_int("HORUS_WEBRTC_SIGNAL_PENDING_MAX", 256))
+        self._pending_retry = None
+        self.thread = None
+        self.sender_thread = None
+        self.send_wakeup = threading.Event()
+        self.pending_ttl_sec = env_int("HORUS_WEBRTC_SIGNAL_PENDING_TTL_SEC", 30)
+        self.negotiation_id = ""
+        self.pending: queue.Queue[tuple[float, str]] = queue.Queue(maxsize=env_int("HORUS_WEBRTC_SIGNAL_PENDING_MAX", 256))
 
     @staticmethod
     def _log_control_message(message):
@@ -223,36 +233,134 @@ class JsonSignaling:
             )
 
     def send(self, payload: dict):
+        payload = dict(payload)
+        if self.negotiation_id and payload.get("type") in {"offer", "answer", "ice"}:
+            payload.setdefault("negotiation_id", self.negotiation_id)
         text = json.dumps(payload, separators=(",", ":"))
-        if not self.connected.wait(timeout=30):
-            self._queue_pending(text)
+        if self.closed.is_set():
             return
-        with self.send_lock:
-            self.ws.send(text)
+        self._queue_pending(text)
+        self.send_wakeup.set()
+
+    def _send_worker(self):
+        while not self.closed.is_set():
+            self.send_wakeup.wait(0.5)
+            self.send_wakeup.clear()
+            if not self.connected.is_set():
+                continue
+            socket = self.ws
+            try:
+                self._flush_pending()
+            except Exception:
+                logger.warning("WebRTC signaling send failed; reconnecting", exc_info=True)
+                self.reconnect(expected_socket=socket)
+
+    def reconnect(self, expected_socket=None):
+        with self.connection_lock:
+            if expected_socket is not None and self.ws is not expected_socket:
+                return
+            socket = self.ws
+            self.connected.clear()
+        self._clear_ready()
+        if socket is not None:
+            socket.close()
+
+    def reset_negotiation(self, negotiation_id: str):
+        self.negotiation_id = negotiation_id
+        self.send_wakeup.set()
+
+    def close(self):
+        self.closed.set()
+        self.send_wakeup.set()
+        with self.connection_lock:
+            self.connection_generation += 1
+            self.connected.clear()
+            socket = self.ws
+            self.ws = None
+        self._clear_ready()
+        if socket is not None:
+            try:
+                socket.close()
+            except Exception:
+                logger.debug("Failed to close signaling socket during shutdown", exc_info=True)
+        server = getattr(self, "server", None)
+        if server is not None:
+            server.shutdown()
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        if self.sender_thread is not None and self.sender_thread is not threading.current_thread():
+            self.sender_thread.join(timeout=2)
 
     def _queue_pending(self, text: str):
-        if self.pending.full():
-            try:
-                self.pending.get_nowait()
-            except queue.Empty:
-                pass
-            print("dropping oldest pending WebRTC signaling message", flush=True)
-        try:
-            self.pending.put_nowait(text)
-        except queue.Full:
-            print("dropping WebRTC signaling message because pending queue is full", flush=True)
+        with self.enqueue_lock:
+            if self.pending.full():
+                retained = []
+                while True:
+                    try:
+                        retained.append(self.pending.get_nowait())
+                    except queue.Empty:
+                        break
+                def is_sdp(entry):
+                    try:
+                        return json.loads(entry[1]).get("type") in {"offer", "answer"}
+                    except (ValueError, AttributeError):
+                        return False
+                # Keep negotiation messages; telemetry/candidates are replaceable.
+                removable = next((index for index, entry in enumerate(retained) if not is_sdp(entry)), 0)
+                if retained:
+                    retained.pop(removable)
+                for entry in retained:
+                    self.pending.put_nowait(entry)
+            self.pending.put_nowait((time.monotonic(), text))
 
     def _flush_pending(self):
-        while not self.pending.empty():
-            with self.send_lock:
-                self.ws.send(self.pending.get_nowait())
+        with self.send_lock:
+            self._flush_pending_locked()
 
-    def _begin_connection(self) -> int:
+    def _flush_pending_locked(self):
+        while (self.connected.is_set() and self.ws is not None
+               and (not self.wait_for_registration or self.ready.is_set())):
+            if self._pending_retry is None:
+                try:
+                    self._pending_retry = self.pending.get_nowait()
+                except queue.Empty:
+                    return
+            # Keep the head until the send succeeds, preserving SDP/ICE order.
+            created, text = self._pending_retry
+            if time.monotonic() - created > self.pending_ttl_sec:
+                self._pending_retry = None
+                continue
+            try:
+                message = json.loads(text)
+            except ValueError:
+                message = {}
+            if message.get("negotiation_id") and message["negotiation_id"] != self.negotiation_id:
+                self._pending_retry = None
+                continue
+            socket = self.ws
+            socket.send(text)
+            self._pending_retry = None
+
+    def _begin_connection(self, socket=None) -> int:
+        previous = None
         with self.connection_lock:
             self.connection_generation += 1
             generation = self.connection_generation
-            self.connected.set()
-        self._flush_pending()
+            if socket is not None:
+                previous = self.ws if self.ws is not socket else None
+                self.ws = socket
+            if not self.closed.is_set():
+                self.connected.set()
+            if socket is not None and self.sender_thread is None:
+                self.sender_thread = threading.Thread(target=self._send_worker, name="webrtc-signaling-send", daemon=True)
+                self.sender_thread.start()
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception:
+                logger.debug("Could not close replaced signaling connection", exc_info=True)
+        self.send_wakeup.set()
         return generation
 
     def _is_current_connection(self, generation: int) -> bool:
@@ -269,6 +377,7 @@ class JsonSignaling:
             self.ready.set()
         if self.on_connected is not None:
             self.on_connected()
+        self.send_wakeup.set()
 
     def _clear_ready(self, generation: int | None = None):
         with self.ready_lock:
@@ -279,19 +388,21 @@ class JsonSignaling:
 
     def _dispatch_text(self, text: str, generation: int | None = None):
         message = json.loads(text)
+        if isinstance(self, ServerSignaling) and message.get("type") == "register":
+            self.send({"type": "registered", "role": message.get("role"),
+                       "room": message.get("room"), "peer_ready": True})
         self._log_control_message(message)
         self.on_message(message)
         if message.get("type") == "registered":
             self._notify_ready(generation)
 
-    def _read_loop(self):
-        generation = self._begin_connection()
-        if self.wait_for_registration:
-            threading.Timer(1.0, self._notify_ready, args=(generation,)).start()
-        else:
-            self._notify_ready(generation)
+    def _read_loop(self, socket=None):
+        socket = socket if socket is not None else self.ws
+        generation = self._begin_connection(socket)
         try:
-            for text in self.ws:
+            if not self.wait_for_registration:
+                self._notify_ready(generation)
+            for text in socket:
                 if not self._is_current_connection(generation):
                     break
                 try:
@@ -362,36 +473,49 @@ class ClientSignaling(JsonSignaling):
 
         def run():
             while not self.closed.is_set():
+                socket = None
                 try:
                     if connect is not None:
-                        self.ws = connect(self.url, open_timeout=10)
-                        self.ws.send(self._registration_text())
+                        socket = connect(self.url, open_timeout=5, close_timeout=2)
+                        if self.closed.is_set():
+                            break
+                        socket.send(self._registration_text())
                         print(
                             f"WebRTC signaling connected: role={self.role} room={self.room} url={self.url}",
                             flush=True,
                         )
-                        self._read_loop()
+                        self._read_loop(socket)
                     else:
-                        self.ws = websocket.create_connection(self.url, timeout=10)
-                        self.ws.settimeout(None)
-                        self.ws.send(self._registration_text())
+                        socket = websocket.create_connection(self.url, timeout=10)
+                        if self.closed.is_set():
+                            break
+                        socket.settimeout(None)
+                        socket.send(self._registration_text())
                         print(
                             f"WebRTC signaling connected: role={self.role} room={self.room} url={self.url}",
                             flush=True,
                         )
-                        self._legacy_read_loop()
+                        self._legacy_read_loop(socket)
                 except Exception as exc:
-                    print(f"signaling reconnect after error: {exc}", flush=True)
-                    time.sleep(1)
+                    if not self.closed.is_set():
+                        print(f"signaling reconnect after error: {exc}", flush=True)
+                finally:
+                    if socket is not None:
+                        try:
+                            socket.close()
+                        except Exception:
+                            logger.debug("Failed to release signaling socket", exc_info=True)
+                self.closed.wait(1)
 
-        threading.Thread(target=run, daemon=True).start()
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
 
-    def _legacy_read_loop(self):
-        generation = self._begin_connection()
-        threading.Timer(1.0, self._notify_ready, args=(generation,)).start()
+    def _legacy_read_loop(self, socket=None):
+        socket = socket if socket is not None else self.ws
+        generation = self._begin_connection(socket)
         try:
             while not self.closed.is_set():
-                text = self.ws.recv()
+                text = socket.recv()
                 if not text:
                     break
                 if not self._is_current_connection(generation):
@@ -422,7 +546,9 @@ class ServerSignaling(JsonSignaling):
             raise RuntimeError("Install websockets>=12 to run the local WebRTC signaling server.")
 
         def handler(ws):
-            self.ws = ws
+            if self.closed.is_set():
+                ws.close()
+                return
             remote = getattr(ws, "remote_address", None)
             if isinstance(remote, tuple):
                 remote_text = f"{remote[0]}:{remote[1]}"
@@ -431,16 +557,20 @@ class ServerSignaling(JsonSignaling):
             print(f"WebRTC signaling peer connected: {remote_text}", flush=True)
             try:
                 try:
-                    self._read_loop()
+                    self._read_loop(ws)
                 except Exception as exc:
                     print(f"WebRTC signaling peer connection ended: {exc}", flush=True)
             finally:
                 print(f"WebRTC signaling peer disconnected: {remote_text}", flush=True)
 
+        # Bind before reporting startup; a port collision must fail the process.
+        self.server = serve(handler, self.host, self.port)
         def run():
-            with serve(handler, self.host, self.port) as server:
-                self.server = server
+            with self.server as server:
+                if self.closed.is_set():
+                    return
                 print(f"WebRTC signaling listening on ws://{self.host}:{self.port}", flush=True)
                 server.serve_forever()
 
-        threading.Thread(target=run, daemon=True).start()
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()

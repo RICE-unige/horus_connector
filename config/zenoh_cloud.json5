@@ -26,8 +26,10 @@
     link: {
       tx: {
         queue: {
-          batching: { enabled: false },
-          congestion_control: { drop: { wait_before_drop: 0 } },
+          // Bound declaration/data bursts without an unbounded latency window.
+          batching: { enabled: true, time_limit: 1 },
+          // Permit short bursts to enqueue without turning congestion into unbounded blocking.
+          congestion_control: { drop: { wait_before_drop: 1000 } },
         },
       },
     },

@@ -64,9 +64,12 @@ def load_samples_payload(path: Path) -> dict:
 
 
 def corrected_stats(samples: list[dict]) -> dict:
-    latencies = [float(sample["latency_ms"]) for sample in samples if sample.get("latency_ms") is not None]
+    valid = [sample for sample in samples if sample.get("latency_ms") is not None
+             and sample.get("timing_valid", True) and math.isfinite(float(sample["latency_ms"]))
+             and float(sample["latency_ms"]) >= 0]
+    latencies = [float(sample["latency_ms"]) for sample in valid]
     fresh = 0
-    for sample in samples:
+    for sample in valid:
         if sample.get("fresh") is True:
             fresh += 1
             continue
@@ -148,13 +151,22 @@ def webrtc_result(resolution: str, path: str) -> dict | None:
     payload = read_json(RUN_DIR / f"{name}_latency.json")
     if not payload:
         return None
-    if not payload.get("latency_method"):
+    if payload.get("measurement_stage") == "sender_rtp_frame_to_decoded_output":
+        return {
+            "resolution": resolution, "path": path, "transport": "webrtc",
+            "status": "endpoint_timing_only",
+            "reason": "Exact packetization-to-decode samples are not capture/display measurements or a fresh-frame SLA denominator.",
+            "decoded_or_received_fps": rounded(float(payload.get("video_decoded_fps") or 0.0)),
+            "packetization_to_decode_p95_ms": payload.get("video_latency_ms_p95"),
+        }
+    if (not payload.get("complete_frame_accounting") or payload.get("measurement_stage") != "capture_to_decode"
+            or not isinstance(payload.get("source_frames"), int) or payload["source_frames"] <= 0):
         return {
             "resolution": resolution,
             "path": path,
             "transport": "webrtc",
             "status": "legacy_method",
-            "reason": "Run artifact predates fresh-frame SLA and measured clock-offset metadata; rerun before publication.",
+            "reason": "Artifact lacks validated capture-to-decode matching and complete source frame accounting; it cannot establish a capture fresh-frame SLA.",
         }
     if not has_measured_clock_offset(payload.get("clock_offset_source")):
         return {
@@ -166,7 +178,7 @@ def webrtc_result(resolution: str, path: str) -> dict | None:
         }
     samples = [float(sample["latency_ms"]) for sample in payload.get("samples", [])]
     stats = corrected_stats(payload.get("samples", []))
-    expected = int(round(DURATION_SEC * TARGET_FPS))
+    expected = payload["source_frames"]
     received = int(payload.get("video_frames") or 0)
     delivery_ratio = min(received / expected, 1.0) if expected else 0.0
     fresh_samples = int(payload.get("fresh_latency_samples") if payload.get("fresh_latency_samples") is not None else stats["fresh_samples"])

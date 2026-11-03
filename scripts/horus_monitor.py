@@ -62,6 +62,8 @@ class ProcessState:
     etime: str = "-"
     cpu: str = "-"
     mem: str = "-"
+    supervisor_running: Optional[bool] = None
+    phase: str = ""
 
 
 @dataclass
@@ -96,17 +98,7 @@ def pad_visible(text: str, width: int) -> str:
     return text + " " * max(0, width - visible_len(text))
 
 
-def load_env_file(path: Path) -> Dict[str, str]:
-    values: Dict[str, str] = {}
-    if not path.exists():
-        return values
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip("'").strip('"')
-    return values
+from connector_config import load_env_file
 
 
 def load_env(root: Path, env_path: Path) -> Dict[str, str]:
@@ -158,14 +150,43 @@ def configured_webrtc_services(env: Dict[str, str], root: Path) -> List[str]:
     if not isinstance(streams, list):
         return ["webrtc"]
     enabled = [stream for stream in streams if isinstance(stream, dict) and stream.get("enabled", True) is not False]
-    if len(enabled) <= 1:
-        return ["webrtc"]
+    if not enabled:
+        return []
+    session = data.get("session", {}) if isinstance(data, dict) else {}
+    mode = env.get("HORUS_WEBRTC_SESSION_MODE", "auto").strip().lower()
+    if mode == "auto":
+        mode = str(session.get("mode") or "").strip().lower() if isinstance(session, dict) else ""
+    if not mode:
+        mode = "bundled" if isinstance(data, dict) and int(data.get("version", 1)) >= 2 else "isolated"
+    if mode == "bundled":
+        services = ["webrtc"]
+        if env.get("HORUS_ROLE", "robot") == "robot":
+            rooms = [room.strip() for room in env.get("HORUS_WEBRTC_ADDITIONAL_ROOMS", "").split(",") if room.strip()]
+            primary_room = env.get("HORUS_WEBRTC_SESSION_ROOM") or (session.get("room") if isinstance(session, dict) else "") or env.get("HORUS_ROOM", "default")
+            unique_rooms = list(dict.fromkeys([primary_room, *rooms]))
+            services.extend(f"webrtc-operator-{index}" for index in range(1, len(unique_rooms)))
+        return services
+    if len(enabled) == 1:
+        raw_id = str(enabled[0].get("id") or enabled[0].get("name") or "primary")
+        identifier = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_id.strip().lower()).strip("-") or "primary"
+        return ["webrtc"] if identifier == "primary" else [f"webrtc-{identifier}"]
     services: List[str] = []
     for index, stream in enumerate(enabled):
         raw_id = str(stream.get("id") or stream.get("name") or f"camera-{index + 1}")
         identifier = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw_id.strip().lower()).strip("-") or f"camera-{index + 1}"
         services.append(f"webrtc-{identifier}")
     return services
+
+
+def expected_media_tracks(env, root):
+    from webrtc_streams import configuration
+    try:
+        session, streams = configuration(root, env.get("HORUS_ROLE", "robot"), env)
+    except (ValueError, OSError, TypeError):
+        return {}
+    if session["mode"] == "bundled":
+        return {name: {stream["id"] for stream in streams} for name in configured_webrtc_services(env, root)}
+    return {stream["service"]: {stream["id"]} for stream in streams}
 
 
 def read_pid(path: Path) -> Optional[int]:
@@ -188,6 +209,13 @@ def pid_running(pid: Optional[int]) -> bool:
         return False
 
 
+def process_start_time(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return ""
+
+
 def run_command(args: Sequence[str], timeout: float = 1.5) -> str:
     try:
         proc = subprocess.run(
@@ -205,6 +233,7 @@ def run_command(args: Sequence[str], timeout: float = 1.5) -> str:
 
 
 def process_state(run_dir: Path, name: str) -> ProcessState:
+    from process_metrics import sampler
     if name == "turn":
         output = run_command(["pgrep", "-xo", "turnserver"], timeout=1.0)
         try:
@@ -220,18 +249,44 @@ def process_state(run_dir: Path, name: str) -> ProcessState:
                 state.etime = format_elapsed(int(float(parts[0])))
                 state.cpu = parts[1]
                 state.mem = parts[2]
+            measured = sampler.sample(pid)
+            state.cpu = "-" if measured["cpu_percent"] is None else f"{measured['cpu_percent']:.1f}"
+            state.mem = f"{measured['memory_percent']:.1f}"
         return state
 
     pid = read_pid(run_dir / f"{name}.pid")
     running = pid_running(pid)
+    start_file = run_dir / f"{name}.pid.start"
+    if running and pid and start_file.exists():
+        try:
+            running = start_file.read_text(encoding="utf-8").strip() == process_start_time(pid)
+        except OSError:
+            running = False
     state = ProcessState(name=name, pid=pid, running=running)
+    state.supervisor_running = running
     if running and pid:
-        output = run_command(["ps", "-p", str(pid), "-o", "etimes=,pcpu=,pmem="], timeout=1.0)
+        measured_pid = pid
+        try:
+            child_state = json.loads((run_dir / f"{name}.service.json").read_text())
+            if child_state.get("supervisor_pid") == pid:
+                state.phase = child_state.get("phase", "unknown")
+                child_pid = child_state.get("child_pid")
+                state.running = (state.phase in {"starting", "running"} and isinstance(child_pid, int)
+                                 and bool(child_state.get("child_start"))
+                                 and process_start_time(child_pid) == child_state["child_start"])
+                if state.running:
+                    measured_pid = child_pid
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        output = run_command(["ps", "-p", str(measured_pid), "-o", "etimes=,pcpu=,pmem="], timeout=1.0)
         parts = output.split()
         if len(parts) >= 3:
             state.etime = format_elapsed(int(float(parts[0])))
             state.cpu = parts[1]
             state.mem = parts[2]
+        measured = sampler.sample(pid)
+        state.cpu = "-" if measured["cpu_percent"] is None else f"{measured['cpu_percent']:.1f}"
+        state.mem = f"{measured['memory_percent']:.1f}"
     return state
 
 
@@ -262,11 +317,23 @@ def format_elapsed(seconds: int) -> str:
 
 
 def tail(path: Path, lines: int = 200) -> List[str]:
-    if not path.exists():
+    if lines <= 0 or not path.exists():
         return []
     try:
-        data = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except Exception:
+        chunks = []
+        newline_count = 0
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            remaining = handle.tell()
+            while remaining > 0 and newline_count <= lines:
+                size = min(8192, remaining)
+                remaining -= size
+                handle.seek(remaining)
+                chunk = handle.read(size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+        data = b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()
+    except OSError:
         logger.debug("Failed to read log tail from %s", path, exc_info=True)
         return []
     return [strip_ansi(line) for line in data[-lines:]]
@@ -551,6 +618,12 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
 
     stream_services = configured_webrtc_services(env, root)
     process_names = ["zenoh", "signal", "turn", "teammate", *stream_services, *webrtc_service_names(run_dir)]
+    if env.get("HORUS_ZENOH_SESSION_ISOLATION") == "1":
+        process_names.extend(["zenoh-sensing", "zenoh-bulk"])
+    if env.get("HORUS_SOURCE_MEDIA_ENABLED") == "1":
+        process_names.append("source-media")
+    if env.get("HORUS_MEDIA_RELAY_CONFIG"):
+        process_names.append("media-relay")
     process_names = list(dict.fromkeys(process_names))
     processes = {name: process_state(run_dir, name) for name in process_names}
     logs = {
@@ -558,6 +631,9 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
         "signal": tail(run_dir / "signal.log", lines=1000),
         "teammate": tail(run_dir / "teammate.log", lines=1000) if role == "teammate" else [],
     }
+    for name in ("zenoh-sensing", "zenoh-bulk"):
+        if name in process_names:
+            logs[name] = tail(run_dir / f"{name}.log", lines=200)
     for name in list(dict.fromkeys([*stream_services, *webrtc_service_names(run_dir)])):
         logs[name] = tail(run_dir / f"{name}.log", lines=1000)
     listeners = local_listeners([zenoh_port, signal_port, turn_port])
@@ -582,8 +658,23 @@ def extract_state(root: Path, env_path: Path, cache: Dict[str, object], force_re
         target_ports[zenoh_port] = tcp_open(target, zenoh_port)
         target_ports[signal_port] = webrtc_signaling_state(webrtc_lines)
 
+    media_health = {}
+    for name in [*stream_services, "teammate", "media-relay"]:
+        try:
+            payload = json.loads((run_dir / f"{name}.media.json").read_text())
+            age = time.time() - float(payload["updated_wall_sec"])
+            payload["status_age_sec"] = age if age >= 0 else 4.0
+            service = json.loads((run_dir / f"{name}.service.json").read_text())
+            if (payload.get("pid") != service.get("child_pid") or
+                    service.get("phase") not in {"starting", "running"} or not service.get("child_start") or
+                    process_start_time(service.get("child_pid")) != service.get("child_start")):
+                payload["status_age_sec"] = max(4.0, payload["status_age_sec"])
+            media_health[name] = payload
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     return {
         "env": env,
+        "media_health": media_health,
         "root": str(root),
         "role": role,
         "topology": topology,
@@ -671,31 +762,58 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
     else:
         services.append(ServiceState("Zenoh", "RUN", f"pid {zenoh.pid}, uptime {zenoh.etime}", "info"))
 
+    if env.get("HORUS_ZENOH_SESSION_ISOLATION") == "1":
+        for name, title in (("zenoh-sensing", "Zenoh Sensing"), ("zenoh-bulk", "Zenoh Bulk")):
+            process = processes.get(name)
+            members = active_bridge_members(logs.get(name, []))
+            running = process and process.running
+            services.append(ServiceState(title, "DOWN" if not running else "OK" if members else "WAIT",
+                "process stopped" if not running else "peer connected" if members else "waiting for peer", "down" if not running else "ok" if members else "info"))
+
+    if env.get("HORUS_SOURCE_MEDIA_ENABLED") == "1":
+        source_media = processes.get("source-media")
+        services.append(ServiceState(
+            "Source Video", "RUN" if source_media and source_media.running else "DOWN",
+            "Direct HORUS sender; decoded frames must be verified at the receiver"
+            if source_media and source_media.running else "source-side sender is stopped",
+            "info" if source_media and source_media.running else "down"))
+
+    if env.get("HORUS_MEDIA_RELAY_CONFIG"):
+        relay = processes.get("media-relay")
+        health = state.get("media_health", {}).get("media-relay", {})
+        active = sum(track.get("state") == "flowing" for track in health.get("tracks", {}).values())
+        fresh = health.get("status_age_sec", float("inf")) < 3
+        running = relay is not None and relay.running
+        services.append(ServiceState("Video Relay",
+            "ENCODED" if running and fresh and active else "IDLE" if running else "DOWN",
+            f"{active} camera(s) forwarded without decoding or re-encoding"
+            if running and fresh and active else "waiting for camera demand/frames" if running else "relay is stopped",
+            "ok" if running and fresh and active else "info" if running else "down"))
+
     if role == "teammate":
         teammate = processes["teammate"]
         teammate_log = "\n".join(logs["teammate"][-160:])
         if not teammate.running:
             services.append(ServiceState("Teammate", "DOWN", "HoloLens relay is not running", "down"))
         else:
-            connected = []
-            if "Connected to HoloLens PV video stream." in teammate_log:
-                connected.append("pv")
-            if "Connected to HoloLens pose stream." in teammate_log:
-                connected.append("pose")
-            if "Connected to HoloLens control stream." in teammate_log:
-                connected.append("control")
-            if connected:
-                services.append(ServiceState("Teammate", "OK", "HoloLens streams: " + ", ".join(connected), "ok"))
+            health = state.get("media_health", {}).get("teammate", {})
+            tracks = health.get("tracks", {})
+            fresh = health.get("status_age_sec", float("inf")) < 3
+            flowing = [name for name, track in tracks.items() if fresh and track.get("state") == "flowing"]
+            if flowing:
+                complete = len(flowing) == 2
+                services.append(ServiceState("Teammate", "LIVE" if complete else "PARTIAL", "Fresh HoloLens streams: " + ", ".join(flowing), "ok" if complete else "warn"))
+            elif tracks:
+                services.append(ServiceState("Teammate", "STALE", "No fresh HoloLens pose/video data", "warn"))
             elif "HoloLens" in teammate_log and ("unavailable" in teammate_log or "error" in teammate_log):
                 detail = find_last(logs["teammate"], ["HoloLens", "unavailable", "error"])
                 services.append(ServiceState("Teammate", "WARN", truncate(detail, 90), "warn"))
             else:
-                services.append(ServiceState("Teammate", "RUN", f"pid {teammate.pid}, uptime {teammate.etime}", "info"))
+                services.append(ServiceState("Teammate", "WAIT", "Relay running; fresh HoloLens data not yet verified", "info"))
     else:
         webrtc = processes["webrtc"]
-        webrtc_names = [name for name in processes if name == "webrtc" or name.startswith("webrtc-")]
-        configured_streams = [name for name in webrtc_names if name.startswith("webrtc-")]
-        running_streams = [name for name in webrtc_names if processes[name].running]
+        configured_streams = configured_webrtc_services(env, Path(str(state["root"]))) if role in {"robot", "machine"} else []
+        running_streams = [name for name in configured_streams if name in processes and processes[name].running]
         webrtc_log = "\n".join(combined_webrtc_logs(logs)[-200:])
         if role == "cloud":
             signal = processes["signal"]
@@ -706,15 +824,35 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
                 if state["signal_members"]:
                     detail = "members: " + ", ".join(state["signal_members"][-4:])  # type: ignore[index]
                 services.append(ServiceState("WebRTC", "OK", detail, "ok"))
-        elif configured_streams:
-            if not running_streams:
-                services.append(ServiceState("WebRTC", "DOWN", f"{len(configured_streams)} stream process(es) are stopped", "down"))
-            elif len(running_streams) == len(configured_streams):
-                names = ", ".join(name.replace("webrtc-", "") for name in running_streams[:4])
-                services.append(ServiceState("WebRTC", "OK", f"{len(running_streams)} stream(s): {names}", "ok"))
+        elif not configured_streams and env.get("WEBRTC_MEDIA_MODE", "h264") == "h264":
+            services.append(ServiceState("WebRTC", "SKIP", "no enabled camera streams", "idle"))
+        elif configured_streams and env.get("WEBRTC_MEDIA_MODE", "h264") == "h264":
+            health = state.get("media_health", {})
+            tracks = []
+            recovering = False
+            expected = expected_media_tracks(env, Path(str(state["root"])))
+            complete = bool(expected)
+            for name in running_streams:
+                payload = health.get(name, {})
+                recovering |= payload.get("state") == "recovering"
+                if payload.get("status_age_sec", float("inf")) < 4:
+                    tracks.extend(payload.get("tracks", {}).values())
+                    complete &= expected.get(name, set()) <= set(payload.get("tracks", {}))
+                else:
+                    complete = False
+            fresh = sum(track.get("state") == "flowing" for track in tracks)
+            stale = sum(track.get("state") == "stale" for track in tracks)
+            if len(running_streams) != len(configured_streams):
+                services.append(ServiceState("WebRTC", "DOWN", "one or more media processes are stopped", "down"))
+            elif recovering:
+                services.append(ServiceState("WebRTC", "RECOVER", "renegotiating media", "warn"))
+            elif stale:
+                services.append(ServiceState("WebRTC", "STALE", f"{stale} track(s) stopped producing fresh frames", "warn"))
+            elif complete and tracks and fresh == len(tracks):
+                stage = "encoded" if role == "robot" else "ROS-published" if env.get("WEBRTC_VIDEO_OUTPUT", "ros2") in {"ros2", "both"} else "decoded"
+                services.append(ServiceState("WebRTC", "VIDEO", f"{fresh} fresh {stage} track(s) in {len(running_streams)} stream process(es)", "ok"))
             else:
-                missing = [name.replace("webrtc-", "") for name in configured_streams if not processes[name].running]
-                services.append(ServiceState("WebRTC", "WARN", "missing stream(s): " + ", ".join(missing[:4]), "warn"))
+                services.append(ServiceState("WebRTC", "WAIT", "process started; waiting for fresh frames on every track", "info"))
         elif not webrtc.running:
             services.append(ServiceState("WebRTC", "DOWN", "process is not running", "down"))
         elif "Incoming RTP video" in webrtc_log:
@@ -1519,6 +1657,7 @@ def interactive(args: argparse.Namespace):
 
 
 def status_snapshot(state: Dict[str, object]) -> Dict[str, object]:
+    from gpu_metrics import sampler as gpu_sampler
     env: Dict[str, str] = state["env"]  # type: ignore[assignment]
     processes: Dict[str, ProcessState] = state["processes"]  # type: ignore[assignment]
     services = build_services(state)
@@ -1535,10 +1674,14 @@ def status_snapshot(state: Dict[str, object]) -> Dict[str, object]:
         },
         "target": state.get("target", ""),
         "ports": state.get("ports", {}),
+        "media_health": state.get("media_health", {}),
+        "gpu_devices": gpu_sampler.sample(),
         "processes": {
             name: {
                 "pid": process.pid,
                 "running": process.running,
+                "supervisor_running": process.running if process.supervisor_running is None else process.supervisor_running,
+                "phase": process.phase or ("running" if process.running else "stopped"),
                 "uptime": process.etime,
                 "cpu_percent": process.cpu,
                 "mem_percent": process.mem,

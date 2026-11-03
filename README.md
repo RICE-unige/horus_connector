@@ -15,13 +15,13 @@
 ## What It Does
 
 - **Zenoh** carries ROS 2 state topics such as TF, odometry, joint states, LaserScan, and point clouds.
-- **WebRTC** carries one or more low-latency H.264 camera tracks in a per-robot session and publishes each decoded track back to ROS 2 on the machine.
+- **WebRTC** carries latency-sensitive H.264 camera tracks. The native HORUS path forwards encoded packets to the headset without converting received video back to ROS images. The legacy decoded-ROS camera mode remains optional.
 - **HORUS Voice** uses authenticated WebRTC signaling for direct Opus calls between the MR operator and a communicative field teammate. The connector never terminates or records call media.
-- **ROS 2 commands** such as `/cmd_vel` stay on ROS 2 and cross the Zenoh bridge.
+- **Control** uses the native lease-checked WebRTC path when configured; ordinary ROS topics, tasks and service/action traffic remain supported through Zenoh. Robot-side commands ultimately reach their registered ROS interfaces.
 
-The cloud role is only a hub: it routes Zenoh traffic and relays WebRTC signaling. Camera encoding/decoding stays on the robot and machine.
+The cloud role is only a hub: it routes Zenoh traffic and relays WebRTC signaling. In the native packet-relay path, video is encoded at the robot site and decoded by the receiving headset/client, not by the hub or operator-side relay.
 
-Version-2 camera configurations use one peer connection per robot, with multiple named video tracks, expiring TURN credentials when configured, per-client signaling authorization, and bitrate adaptation driven by WebRTC packet-loss and RTT statistics. Existing version-1 per-camera rooms remain supported.
+Version-2 camera configurations use one peer connection per operator room, with multiple named video tracks, expiring TURN credentials when configured, per-client signaling authorization, and bitrate adaptation driven by WebRTC packet-loss and RTT statistics. A robot can serve additional operator rooms with `HORUS_WEBRTC_ADDITIONAL_ROOMS`; each extra room starts a separate encoder, so test the robot's media capacity before adding viewers. Existing version-1 per-camera rooms remain supported.
 
 ## Install
 
@@ -38,10 +38,33 @@ the HoloLens endpoint and its restricted Zenoh topic policy.
 
 ROS 2 must already be installed on `robot`, `machine`, and `teammate` computers. The `cloud` role does not need a local ROS 2 graph.
 
+Zenoh ROS 2 DDS is pinned to **1.10.2** in `config/zenoh-release.json`.
+To update only the project-local bridge and matching plugin, without rerunning
+apt, ROS, certificates or camera setup:
+
+```bash
+./horus update-zenoh
+# An exact older release can be selected explicitly:
+./horus update-zenoh 1.9.0
+```
+
+The updater checks the upstream archive digest and exact executable version,
+stages the pair before replacement and retains rollback files under
+`.zenoh-backups/`. It does not start or restart services. A running bridge keeps
+its existing executable until you restart that connector yourself. Existing
+`.env` files are not rewritten: keep `ZENOH_VERSION` aligned with the desired
+release for subsequent full bootstrap runs. Binary and Docker defaults use the
+same pinned release; the host-incompatibility Docker fallback remains available.
+
 Before robot, machine, or teammate launch, HORUS checks DDS visibility and
 records `.run/dds_env.json`. If the launch terminal can see topics but the
 bridge cannot safely transport them, `./horus doctor <role>` reports domain,
 discovery, interface, Docker, or Zenoh filter problems.
+
+See [Reliability and Performance](docs/performance.md) for camera timestamp and
+calibration contracts, traffic priorities, capability-derived routes, supervised
+recovery, capacity budgets and reproducible qualification checks. These do not
+change the deployment's existing authentication or network-access policy.
 
 ## Roles
 
@@ -168,6 +191,47 @@ export WEBRTC_CMD_MAX_ANGULAR_RPS=1.0
 ```
 
 For hub deployments that expose the signaling relay, also set `HORUS_WEBRTC_RELAY_TOKEN` on every authorized endpoint. Use unauthenticated relay/control flags only on trusted lab networks.
+
+## Development Checks
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv-webrtc/bin/python -m pytest tests -q
+for script in horus scripts/*.sh tests/*.sh; do bash -n "$script" || exit 1; done
+bash tests/run_webrtc_bundled_smoke.sh
+HORUS_WEBRTC_TEST_ORDER=machine-first bash tests/run_webrtc_bundled_smoke.sh
+HORUS_WEBRTC_TEST_RECONNECT=1 bash tests/run_webrtc_bundled_smoke.sh
+```
+
+The media checks use two synthetic H.264 tracks over a real local WebRTC connection. They require GStreamer `webrtcbin`, NICE, `x264enc`, a decoder, and Python `websockets>=12`. They verify startup ordering and receiver reconnect without restarting the robot endpoint; they do not establish WAN latency, Quest display performance, or physical-robot safety.
+
+Additional native checks (ROS 2 Jazzy sourced, Python 3.10+ and GStreamer 1.22+ for bundled cameras):
+
+```bash
+.venv-webrtc/bin/python tests/check_ros_webrtc.py --letterbox --latched-info --output .run/checks/ros-camera
+.venv-webrtc/bin/python tests/check_zenoh_routes.py --output .run/checks/zenoh
+.venv-webrtc/bin/python tests/check_zenoh_routes.py --bulk --custom-routes --output .run/checks/zenoh-bulk
+.venv-webrtc/bin/python tests/check_zenoh_routes.py --hub --bulk --output .run/checks/zenoh-hub-bulk
+.venv-webrtc/bin/python tests/check_connector_launch.py --output .run/checks/launcher
+.venv-webrtc/bin/python tests/check_media_recovery.py --track-only --output .run/checks/media-recovery
+.venv-webrtc/bin/python tests/check_supervised_media_recovery.py --output .run/checks/supervised-recovery
+.venv-webrtc/bin/python tests/check_multi_operator_media.py --tracks 8 --output .run/checks/two-operators
+```
+
+Use separate output directories for each trial. These checks isolate their ROS
+domains (193-197), ports and owned processes. They exercise original image
+headers/scaled calibration, publisher silence, receiver reset, late static-TF
+replay, HORUS return routes, mixed bulk traffic, both camera launch modes and
+idempotent relaunch and repeated receiver/sender/relay recovery. The Zenoh check
+reports initial discovery delays separately from steady-state timings after a
+declared three-second source warmup. They are localhost acceptance checks, not WAN/Quest or
+hardware capacity results.
+
+Normal media runs until stopped (`WEBRTC_DURATION=0`). Monitor current per-track
+frame age/counts, not just an open socket or running PID. See
+[configuration](docs/configuration.md) for recovery, metadata and jitter budgets,
+and [benchmark methodology](docs/benchmark_methodology.md) for timing boundaries.
+
+Signaling callbacks queue sends without waiting for connectivity. Pending sends are bounded, failed sends retain their position until reconnect, and shutdown closes owned sockets and listeners. ROS image publishing validates dimensions and repacks padded GStreamer rows before publishing tightly packed messages.
 
 ## Contact
 

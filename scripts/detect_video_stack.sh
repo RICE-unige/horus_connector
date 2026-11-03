@@ -37,7 +37,7 @@ have() {
 }
 
 gst_has() {
-  have gst-inspect-1.0 && gst-inspect-1.0 "$1" >/dev/null 2>&1
+  have gst-inspect-1.0 && timeout 10s gst-inspect-1.0 "$1" >/dev/null 2>&1
 }
 
 detect_machine_kind() {
@@ -58,11 +58,11 @@ is_jetson() {
 detect_video_platform() {
   if is_jetson; then
     echo "jetson"
-  elif [[ -d /dev/dri ]] && command -v vainfo >/dev/null 2>&1 && vainfo 2>/dev/null | grep -qi 'intel'; then
+  elif [[ -d /dev/dri ]] && command -v vainfo >/dev/null 2>&1 && timeout 10s vainfo 2>/dev/null | grep -qi 'intel'; then
     echo "intel-vaapi"
   elif [[ -d /dev/dri ]]; then
     echo "drm-vaapi"
-  elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  elif command -v nvidia-smi >/dev/null 2>&1 && timeout 10s nvidia-smi >/dev/null 2>&1; then
     echo "nvidia-nvenc"
   else
     echo "generic"
@@ -142,7 +142,7 @@ else
   NOTES+=("GStreamer libnice plugin is missing; install gstreamer1.0-nice for WebRTC ICE/media transport.")
 fi
 
-if is_jetson || { have nvidia-smi && nvidia-smi >/dev/null 2>&1; }; then
+if is_jetson || { have nvidia-smi && timeout 10s nvidia-smi >/dev/null 2>&1; }; then
   HAS_NVIDIA=1
 fi
 
@@ -158,18 +158,34 @@ run_probe_command() {
   fi
 }
 
+probe_all_profiles() {
+  local width height fps profiles
+  profiles="${WEBRTC_PROBE_PROFILES_TSV:-}"
+  if [[ -z "${profiles}" ]]; then
+    profiles="$(printf '%s\t%s\t%s' "${WEBRTC_VIDEO_WIDTH:-1280}" "${WEBRTC_VIDEO_HEIGHT:-720}" "${WEBRTC_VIDEO_FPS:-30}")"
+  fi
+  while IFS=$'\t' read -r width height fps; do
+    [[ "${width}" =~ ^[1-9][0-9]*$ && "${height}" =~ ^[1-9][0-9]*$ && "${fps}" =~ ^[1-9][0-9]*$ ]] || return 1
+    "$@" "${width}" "${height}" "${fps}" || return 1
+  done <<< "${profiles}"
+}
+
 probe_encoder() {
+  probe_all_profiles probe_encoder_size "$@"
+}
+
+probe_encoder_size() {
   local name="$1"
   local props="$2"
   local preprocess="$3"
-  local log="${TMPDIR:-/tmp}/horus_connector_${UID}_${name}_probe.log"
+  local log="${TMPDIR:-/tmp}/horus_connector_${UID}_$$_${name}_probe.log"
   read -r -a prop_array <<< "${props}"
   read -r -a preprocess_array <<< "${preprocess}"
   local cmd=(
     gst-launch-1.0 -q
     videotestsrc is-live=true num-buffers=8 pattern=smpte
     '!'
-    'video/x-raw,width=640,height=360,framerate=30/1'
+    "video/x-raw,width=$4,height=$5,framerate=$6/1"
     '!'
     queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream
   )
@@ -215,20 +231,20 @@ try_x264_encoder() {
 
 try_hardware_encoder() {
   if [[ "${VIDEO_PLATFORM}" == "jetson" ]]; then
-    try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 idrinterval=30 insert-sps-pps=true maxperf-enable=true" "nvvidconv ! video/x-raw(memory:NVMM),format=NV12" \
-      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 idrinterval=30 insert-sps-pps=true maxperf-enable=true" "nvvideoconvert ! video/x-raw(memory:NVMM),format=NV12" \
-      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 insert-sps-pps=true" "nvvidconv ! video/x-raw(memory:NVMM),format=NV12" \
-      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=30 insert-sps-pps=true" "nvvideoconvert ! video/x-raw(memory:NVMM),format=NV12" \
+    try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=${WEBRTC_H264_KEY_INT_MAX} idrinterval=${WEBRTC_H264_KEY_INT_MAX} insert-sps-pps=true maxperf-enable=true" "nvvidconv ! video/x-raw(memory:NVMM),format=NV12" \
+      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=${WEBRTC_H264_KEY_INT_MAX} idrinterval=${WEBRTC_H264_KEY_INT_MAX} insert-sps-pps=true maxperf-enable=true" "nvvideoconvert ! video/x-raw(memory:NVMM),format=NV12" \
+      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=${WEBRTC_H264_KEY_INT_MAX} insert-sps-pps=true" "nvvidconv ! video/x-raw(memory:NVMM),format=NV12" \
+      || try_encoder "nvidia-v4l2" "nvv4l2h264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) control-rate=1 iframeinterval=${WEBRTC_H264_KEY_INT_MAX} insert-sps-pps=true" "nvvideoconvert ! video/x-raw(memory:NVMM),format=NV12" \
       || return 1
     return 0
   fi
 
-  try_encoder "nvidia-nvenc" "nvh264enc" "rc-mode=cbr zerolatency=true bframes=0 gop-size=30 bitrate=${VIDEO_BITRATE_KBIT} aud=false" "videoconvert" \
-    || try_encoder "nvidia-nvenc" "nvautogpuh264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false tune=ultra-low-latency preset=p1 zero-reorder-delay=true repeat-sequence-header=true" "videoconvert" \
-    || try_encoder "nvidia-nvenc" "nvcudah264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=30 aud=false" "videoconvert" \
-    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" "videoconvert ! video/x-raw,format=NV12" \
-    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30" "videoconvert ! video/x-raw,format=NV12" \
-    || try_encoder "vaapi" "vaapih264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=30 tune=low-power" "videoconvert ! video/x-raw,format=NV12" \
+  try_encoder "nvidia-nvenc" "nvh264enc" "rc-mode=cbr zerolatency=true bframes=0 gop-size=${WEBRTC_H264_KEY_INT_MAX} bitrate=${VIDEO_BITRATE_KBIT} aud=false" "videoconvert" \
+    || try_encoder "nvidia-nvenc" "nvautogpuh264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=${WEBRTC_H264_KEY_INT_MAX} aud=false tune=ultra-low-latency preset=p1 zero-reorder-delay=true repeat-sequence-header=true" "videoconvert" \
+    || try_encoder "nvidia-nvenc" "nvcudah264enc" "bitrate=${VIDEO_BITRATE_KBIT} gop-size=${WEBRTC_H264_KEY_INT_MAX} aud=false" "videoconvert" \
+    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=${WEBRTC_H264_KEY_INT_MAX} tune=low-power" "videoconvert ! video/x-raw,format=NV12" \
+    || try_encoder "vaapi" "vah264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=${WEBRTC_H264_KEY_INT_MAX}" "videoconvert ! video/x-raw,format=NV12" \
+    || try_encoder "vaapi" "vaapih264enc" "bitrate=${VIDEO_BITRATE_KBIT} keyframe-period=${WEBRTC_H264_KEY_INT_MAX} tune=low-power" "videoconvert ! video/x-raw,format=NV12" \
     || try_encoder "v4l2-m2m" "v4l2h264enc" "extra-controls=controls,video_bitrate=$((VIDEO_BITRATE_KBIT * 1000)),h264_i_frame_period=30" "videoconvert ! video/x-raw,format=NV12"
 }
 
@@ -238,7 +254,7 @@ select_h264_encoder() {
     hardware)
       if try_hardware_encoder; then encoder_selected=true; fi
       if [[ "${encoder_selected}" != "true" ]] && try_x264_encoder; then encoder_selected=true; fi
-      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then encoder_selected=true; fi
+      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=${WEBRTC_H264_KEY_INT_MAX}"; then encoder_selected=true; fi
       ;;
     stable)
       if [[ "${VIDEO_PLATFORM}" == "jetson" ]]; then
@@ -248,11 +264,11 @@ select_h264_encoder() {
         if try_x264_encoder; then encoder_selected=true; fi
         if [[ "${encoder_selected}" != "true" ]] && try_hardware_encoder; then encoder_selected=true; fi
       fi
-      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then encoder_selected=true; fi
+      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=${WEBRTC_H264_KEY_INT_MAX}"; then encoder_selected=true; fi
       ;;
     software)
       if try_x264_encoder; then encoder_selected=true; fi
-      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=30"; then encoder_selected=true; fi
+      if [[ "${encoder_selected}" != "true" ]] && try_encoder "cpu-openh264" "openh264enc" "bitrate=$((VIDEO_BITRATE_KBIT * 1000)) gop-size=${WEBRTC_H264_KEY_INT_MAX}"; then encoder_selected=true; fi
       ;;
     *)
       echo "Unknown WEBRTC_ENCODER_PREFERENCE=${WEBRTC_ENCODER_PREFERENCE}. Use stable, hardware, or software." >&2
@@ -268,17 +284,21 @@ select_h264_encoder() {
 select_h264_encoder
 
 probe_decoder() {
+  probe_all_profiles probe_decoder_size "$@"
+}
+
+probe_decoder_size() {
   local name="$1"
   local props="$2"
   local postprocess="$3"
-  local log="${TMPDIR:-/tmp}/horus_connector_${UID}_${name}_decode_probe.log"
+  local log="${TMPDIR:-/tmp}/horus_connector_${UID}_$$_${name}_decode_probe.log"
   read -r -a prop_array <<< "${props}"
   read -r -a postprocess_array <<< "${postprocess}"
   local cmd=(
     gst-launch-1.0 -q
     videotestsrc num-buffers=8 pattern=smpte
     '!'
-    'video/x-raw,width=640,height=360,framerate=30/1'
+    "video/x-raw,width=$4,height=$5,framerate=$6/1"
     '!'
     x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30
     '!'

@@ -9,13 +9,18 @@ import random
 import shlex
 import subprocess
 import time
+import uuid
 
 
 ROOT_WIN = r"\\wsl.localhost\Ubuntu\home\omotoye\horus_connector"
 ROOT_POSIX = "~/horus_connector"
-LOCAL_RUN_WIN = Path(ROOT_WIN) / ".run"
-BENCH_WIN = Path(os.environ.get("HORUS_BENCH_OUTPUT_DIR", str(LOCAL_RUN_WIN / "distributed_benchmark")))
-BENCH_REMOTE = ".run/bench"
+LOCAL_ROOT = Path(ROOT_WIN) if os.name == "nt" else Path(__file__).resolve().parents[1]
+LOCAL_RUN_WIN = LOCAL_ROOT / ".run"
+RUN_ID = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+BENCH_WIN = Path(os.environ.get("HORUS_BENCH_OUTPUT_DIR", str(LOCAL_RUN_WIN / "distributed_benchmark" / RUN_ID)))
+BENCH_REMOTE = f".run/bench/{RUN_ID}"
+OWNED_LABELS = set()
+OWNED_NETWORK = set()
 DURATION = float(os.environ.get("HORUS_BENCH_DURATION", "300"))
 REPETITIONS = int(os.environ.get("HORUS_BENCH_REPETITIONS", "1"))
 FPS = 30
@@ -206,7 +211,7 @@ def node_cmd(node: str, script: str, *, input_text: str | None = None, timeout: 
 def checked(node: str, script: str, *, input_text: str | None = None, timeout: float | None = None) -> str:
     proc = node_cmd(node, script, input_text=input_text, timeout=timeout)
     if proc.returncode != 0:
-        raise RuntimeError(f"{node} command failed ({proc.returncode}):\n{script}\n--- output ---\n{proc.stdout}")
+        raise RuntimeError(f"{node} command failed ({proc.returncode}):\n{proc.stdout}")
     return proc.stdout
 
 
@@ -303,12 +308,7 @@ def setup_node(node: str) -> None:
     checked(
         node,
         f"cd {shlex.quote(NODES[node]['root'])}; "
-        f"mkdir -p {BENCH_REMOTE}; "
-        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name 'modeb_*' -delete; "
-        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name 'cmd_*' -delete; "
-        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name '*_resources.csv' -delete; "
-        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name '*_network.json' -delete; "
-        f"find {BENCH_REMOTE} -maxdepth 1 -type f -name '*_clock*.json' -delete",
+        f"mkdir -p {BENCH_REMOTE}",
         timeout=120,
     )
     put_text(node, f"{BENCH_REMOTE}/zenoh_pub.json5", ZENOH_PUB_CONFIG)
@@ -396,55 +396,48 @@ def start_bg(node: str, label: str, command: str, *, domain: int = 0, localhost_
     prefix = bash_prefix(node, domain, localhost_only) if NODES[node]["distro"] else f"cd {shlex.quote(NODES[node]['root'])}; "
     wrapped = (
         f"mkdir -p {BENCH_REMOTE}; "
-        f"nohup bash -lc {shlex.quote(prefix + command)} "
+        f"setsid nohup bash -lc {shlex.quote(prefix + command)} "
         f"> {BENCH_REMOTE}/{label}.log 2>&1 < /dev/null & "
-        f"echo $! > {BENCH_REMOTE}/{label}.pid; cat {BENCH_REMOTE}/{label}.pid"
+        f"pid=$!; echo $pid > {BENCH_REMOTE}/{label}.pid; "
+        f"awk '{{print $22}}' /proc/$pid/stat > {BENCH_REMOTE}/{label}.pid.start; "
+        f"cat {BENCH_REMOTE}/{label}.pid"
     )
     out = checked(node, f"cd {shlex.quote(NODES[node]['root'])}; {wrapped}", timeout=30).strip()
+    OWNED_LABELS.add((node, label))
     return int(out.splitlines()[-1])
 
 
 def stop_label(node: str, label: str) -> None:
+    if (node, label) not in OWNED_LABELS:
+        return
     node_cmd(
         node,
         f"cd {shlex.quote(NODES[node]['root'])}; "
         f"if [ -f {BENCH_REMOTE}/{label}.pid ]; then "
-        f"pid=$(cat {BENCH_REMOTE}/{label}.pid); kill $pid 2>/dev/null || true; sleep 0.5; "
-        f"kill -9 $pid 2>/dev/null || true; rm -f {BENCH_REMOTE}/{label}.pid; fi",
-        timeout=10,
+        f"pid=$(cat {BENCH_REMOTE}/{label}.pid); "
+        f"expected=$(cat {BENCH_REMOTE}/{label}.pid.start); "
+        "current=$(awk '{print $22}' /proc/$pid/stat 2>/dev/null || true); "
+        "if [ -n \"$expected\" ] && [ \"$expected\" = \"$current\" ]; then "
+        "kill -- -$pid 2>/dev/null || true; "
+        "for i in $(seq 1 80); do kill -0 -- -$pid 2>/dev/null || break; sleep 0.1; done; "
+        "kill -9 -- -$pid 2>/dev/null || true; fi; "
+        f"rm -f {BENCH_REMOTE}/{label}.pid {BENCH_REMOTE}/{label}.pid.start; fi",
+        timeout=15,
     )
+    OWNED_LABELS.discard((node, label))
 
 
 def stop_all(nodes: set[str] | None = None) -> None:
-    for node in nodes or set(NODES):
-        cleanup = (
-            f"cd {shlex.quote(NODES[node]['root'])} 2>/dev/null || exit 0; "
-            "sudo -n systemctl stop horus-cloud.service 2>/dev/null || true; "
-            f"for p in {BENCH_REMOTE}/*.pid; do [ -f \"$p\" ] || continue; "
-            "pid=$(cat \"$p\"); kill $pid 2>/dev/null || true; rm -f \"$p\"; done; "
-            "sleep 0.5; "
-            f"for p in {BENCH_REMOTE}/*.pid; do [ -f \"$p\" ] || continue; "
-            "pid=$(cat \"$p\"); kill -9 $pid 2>/dev/null || true; rm -f \"$p\"; done; "
-            "pkill -f '[b]enchmark_camera_ros.py' 2>/dev/null || true; "
-            "pkill -f '[g]st_webrtc_h264_' 2>/dev/null || true; "
-            "pkill -f '[w]ebrtc_signal_relay.py' 2>/dev/null || true; "
-            "pkill -f '[z]enoh-bridge-ros2dds' 2>/dev/null || true; "
-            "pkill -f '[h]orus-cloud-supervisor' 2>/dev/null || true; "
-            "sleep 0.5; "
-            "pkill -9 -f '[b]enchmark_camera_ros.py' 2>/dev/null || true; "
-            "pkill -9 -f '[g]st_webrtc_h264_' 2>/dev/null || true; "
-            "pkill -9 -f '[w]ebrtc_signal_relay.py' 2>/dev/null || true; "
-            "pkill -9 -f '[z]enoh-bridge-ros2dds' 2>/dev/null || true; "
-            "pkill -9 -f '[h]orus-cloud-supervisor' 2>/dev/null || true"
-        )
+    for node, label in list(OWNED_LABELS):
+        if nodes is not None and node not in nodes:
+            continue
         try:
-            node_cmd(
-                node,
-                f"timeout 12s bash -lc {shlex.quote(cleanup)}",
-                timeout=20,
-            )
+            stop_label(node, label)
         except subprocess.TimeoutExpired:
             print(f"warning: cleanup timed out on {node}", flush=True)
+    for node, iface in list(OWNED_NETWORK):
+        if nodes is None or node in nodes:
+            clear_network_profile(node, iface)
 
 
 def route_interface(node: str, target_ip: str) -> str:
@@ -459,9 +452,12 @@ def route_interface(node: str, target_ip: str) -> str:
 
 
 def clear_network_profile(node: str, iface: str | None) -> None:
-    if not iface:
+    if not iface or (node, iface) not in OWNED_NETWORK:
         return
-    node_cmd(node, f"{sudo_tc(node, 'qdisc', 'del', 'dev', iface, 'root')} 2>/dev/null || true", timeout=20)
+    current = checked(node, f"tc qdisc show dev {shlex.quote(iface)}", timeout=10)
+    if "1afe:" in current:
+        checked(node, sudo_tc(node, "qdisc", "del", "dev", iface, "root", "handle", "1afe:"), timeout=20)
+    OWNED_NETWORK.discard((node, iface))
 
 
 def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
@@ -477,11 +473,30 @@ def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
         **profile,
         "active": profile_needs_shaping(profile_name),
     }
-    clear_network_profile(node, iface)
     if not payload["active"]:
         payload["tc_qdisc"] = checked(node, f"tc -s qdisc show dev {shlex.quote(iface)}", timeout=10)
         return payload
 
+    disposable = os.environ.get(f"HORUS_BENCH_{node.upper()}_IMPAIRMENT_INTERFACE", "")
+    if not disposable or disposable != iface:
+        raise RuntimeError("Network impairment requires an explicit disposable veth route; the host LAN/VPN interface will not be modified")
+    link = json.loads(checked(node, f"ip -j -d link show dev {shlex.quote(iface)}", timeout=10))
+    if not link or link[0].get("linkinfo", {}).get("info_kind") != "veth":
+        raise RuntimeError("Network impairment is supported only on a disposable veth link")
+    original = checked(node, f"tc qdisc show dev {shlex.quote(iface)}", timeout=10)
+    if any(line and not line.startswith("qdisc noqueue ") for line in original.splitlines()):
+        raise RuntimeError("Refusing to replace an existing qdisc; use a fresh disposable veth link")
+    OWNED_NETWORK.add((node, iface))
+    try:
+        _configure_network_profile(node, iface, profile)
+        payload["tc_qdisc"] = checked(node, f"tc -s qdisc show dev {shlex.quote(iface)}", timeout=10)
+        return payload
+    except BaseException:
+        clear_network_profile(node, iface)
+        raise
+
+
+def _configure_network_profile(node, iface, profile):
     bandwidth = profile["bandwidth_mbps"]
     loss = float(profile["loss_percent"])
     delay = float(profile["delay_ms"])
@@ -497,7 +512,7 @@ def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
     if bandwidth:
         checked(
             node,
-            sudo_tc(node, "qdisc", "replace", "dev", iface, "root", "handle", "1:", "htb", "default", "10"),
+            sudo_tc(node, "qdisc", "add", "dev", iface, "root", "handle", "1afe:", "htb", "default", "10"),
             timeout=30,
         )
         checked(
@@ -509,9 +524,9 @@ def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
                 "dev",
                 iface,
                 "parent",
-                "1:",
+                "1afe:",
                 "classid",
-                "1:10",
+                "1afe:10",
                 "htb",
                 "rate",
                 f"{bandwidth:g}mbit",
@@ -527,13 +542,11 @@ def apply_network_profile(node: str, target_ip: str, profile_name: str) -> dict:
         if netem_args:
             checked(
                 node,
-                sudo_tc(node, "qdisc", "replace", "dev", iface, "parent", "1:10", "handle", "10:", "netem", *netem_args),
+                sudo_tc(node, "qdisc", "add", "dev", iface, "parent", "1afe:10", "handle", "10:", "netem", *netem_args),
                 timeout=30,
             )
     else:
-        checked(node, sudo_tc(node, "qdisc", "replace", "dev", iface, "root", "netem", *netem_args), timeout=30)
-    payload["tc_qdisc"] = checked(node, f"tc -s qdisc show dev {shlex.quote(iface)}", timeout=10)
-    return payload
+        checked(node, sudo_tc(node, "qdisc", "add", "dev", iface, "root", "handle", "1afe:", "netem", *netem_args), timeout=30)
 
 
 def fetch(node: str, remote_path: str, local_name: str) -> None:
@@ -541,11 +554,11 @@ def fetch(node: str, remote_path: str, local_name: str) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     info = NODES[node]
     if info["kind"] == "wsl":
-        src = Path(ROOT_WIN) / remote_path.replace("/", "\\")
-        if src.exists():
-            dest.write_bytes(src.read_bytes())
+        src = LOCAL_ROOT / (remote_path.replace("/", "\\") if os.name == "nt" else remote_path)
+        dest.write_bytes(src.read_bytes())
         return
-    subprocess.run(["scp", f"{info['alias']}:{NODES[node]['root']}/{remote_path}", str(dest)], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    subprocess.run(["scp", f"{info['alias']}:{NODES[node]['root']}/{remote_path}", str(dest)], check=True, timeout=120,
+                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
 def start_resource_samplers(name: str, node_labels: dict[str, list[str]], duration: float) -> list[tuple[str, str, str]]:
@@ -692,11 +705,13 @@ def recompute_samples(samples_payload: dict, clock: dict) -> tuple[list[dict], l
             continue
         latency = float(raw) - offset
         sample["latency_ms"] = latency
-        sample["fresh"] = latency <= DEADLINE_MS
-        sample["stale"] = latency > DEADLINE_MS
+        sample["timing_valid"] = math.isfinite(latency) and latency >= 0
+        sample["fresh"] = sample["timing_valid"] and latency <= DEADLINE_MS
+        sample["stale"] = sample["timing_valid"] and latency > DEADLINE_MS
         if sample["fresh"]:
             fresh_count += 1
-        latencies.append(latency)
+        if sample["timing_valid"]:
+            latencies.append(latency)
     samples_payload["clock_offset_ms"] = offset
     samples_payload["clock_offset_source"] = "mean_pre_post_clock_offset_probe"
     samples_payload["clock_drift_ms"] = clock["drift_ms"]
@@ -745,7 +760,6 @@ def apply_webrtc_clock_correction(name: str, clock: dict) -> None:
     payload = json.loads(path.read_text(encoding="utf-8"))
     _samples, latencies, fresh_count = recompute_samples(payload, clock)
     stale_count = max(0, len(latencies) - fresh_count)
-    observed = float(payload.get("video_observed_sec") or DURATION)
     payload.update(
         {
             "clock_offset_ms": clock["offset_ms"],
@@ -761,7 +775,9 @@ def apply_webrtc_clock_correction(name: str, clock: dict) -> None:
             "fresh_latency_samples": fresh_count,
             "stale_latency_samples": stale_count,
             "fresh_sample_sla": fresh_count / len(latencies) if latencies else 0.0,
-            "fresh_fps_estimate": fresh_count / observed if observed else 0.0,
+            # Matched metadata coverage is not a count of all fresh video frames.
+            "fresh_fps_estimate": None,
+            "timing_invalid_samples": sum(not sample.get("timing_valid", False) for sample in _samples),
         }
     )
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
@@ -1145,16 +1161,8 @@ def main() -> None:
     resume = os.environ.get("HORUS_BENCH_RESUME", "0").lower() in {"1", "true", "yes", "on"}
     continue_on_failure = os.environ.get("HORUS_BENCH_CONTINUE_ON_FAILURE", "0").lower() in {"1", "true", "yes", "on"}
     if not resume:
-        for artifact in BENCH_WIN.glob("modeb_*"):
-            artifact.unlink()
-        for artifact in BENCH_WIN.glob("cmd_*"):
-            artifact.unlink()
-        for artifact in BENCH_WIN.glob("*_resources.csv"):
-            artifact.unlink()
-        for artifact in BENCH_WIN.glob("*_network.json"):
-            artifact.unlink()
-        for artifact in BENCH_WIN.glob("*_clock*.json"):
-            artifact.unlink()
+        if any(BENCH_WIN.iterdir()):
+            raise RuntimeError("Benchmark output already contains data; choose a new directory or explicitly resume")
     selected_resolutions = set(filter(None, os.environ.get("HORUS_BENCH_RESOLUTIONS", ",".join(RESOLUTIONS)).split(",")))
     selected_paths = set(filter(None, os.environ.get("HORUS_BENCH_PATHS", ",".join(PATHS)).split(",")))
     selected_transports = set(filter(None, os.environ.get("HORUS_BENCH_TRANSPORTS", "dds,zenoh,webrtc").split(",")))

@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="${HORUS_RUN_DIR:-${ROOT}/.run}"
 ENV_FILE="${HORUS_ENV:-${ROOT}/.env}"
 mkdir -p "${RUN_DIR}"
+NEW_SERVICES=()
 
 export HORUS_TERMINAL_ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-}"
 export HORUS_TERMINAL_ROS_DISTRO="${ROS_DISTRO:-}"
@@ -64,6 +65,9 @@ usage() {
   echo -e "  ${FG_GREEN}setup${RESET}                             Guided setup wizard"
   echo -e "  ${FG_GREEN}init${RESET}                              Create .env from the template"
   echo -e "  ${FG_GREEN}bootstrap${RESET} ${FG_CYAN}[role]${RESET}                  Install dependencies for a connector role"
+  echo -e "  ${FG_GREEN}update-zenoh${RESET} ${FG_CYAN}[version]${RESET}           Update only the project-local bridge"
+  echo -e "  ${FG_GREEN}environment${RESET}                       Print non-secret software/version report"
+  echo -e "  ${FG_GREEN}reprobe${RESET} ${FG_CYAN}[robot|machine]${RESET}         Refresh the selected codec profile"
   echo -e "  ${FG_GREEN}launch${RESET} ${FG_CYAN}[role] [--no-monitor] [--skip-dds-preflight]${RESET} Start services and open the live console"
   echo -e "  ${FG_GREEN}stop${RESET}                              Stop running services"
   echo -e "  ${FG_GREEN}status${RESET} ${FG_CYAN}[--json]${RESET}                  Show service state and runtime settings"
@@ -99,31 +103,8 @@ trim_spaces() {
 }
 
 load_key_value_file() {
-  local file="$1"
-  local line key value
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    line="${line%$'\r'}"
-    line="$(trim_spaces "${line}")"
-    [[ -z "${line}" || "${line}" == \#* ]] && continue
-    if [[ "${line}" =~ ^export[[:space:]]+(.+)$ ]]; then
-      line="${BASH_REMATCH[1]}"
-    fi
-    if [[ ! "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-      log_warn "Ignoring invalid config line in ${file}: ${line}"
-      continue
-    fi
-    key="${BASH_REMATCH[1]}"
-    value="$(trim_spaces "${BASH_REMATCH[2]}")"
-    if [[ "${#value}" -ge 2 ]]; then
-      if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
-        value="${value:1:${#value}-2}"
-      elif [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
-        value="${value:1:${#value}-2}"
-      fi
-    fi
-    printf -v "${key}" '%s' "${value}"
-    export "${key}"
-  done < "${file}"
+  source "${ROOT}/scripts/config_env.sh"
+  horus_load_config "$1" "$(python_bin)"
 }
 
 load_env() {
@@ -174,7 +155,7 @@ source_ros_required() {
 }
 
 python_bin() {
-  local py="${ROOT}/.venv-webrtc/bin/python"
+  local py="${HORUS_WEBRTC_PYTHON:-${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python}"
   if [[ ! -x "${py}" ]]; then
     echo "python3"
     return
@@ -206,7 +187,7 @@ PY
 }
 
 signal_python_bin() {
-  local py="${ROOT}/.venv-webrtc/bin/python"
+  local py="${HORUS_WEBRTC_PYTHON:-${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python}"
   if [[ -x "${py}" ]] && "${py}" - <<'PY' >/dev/null 2>&1
 import websockets
 PY
@@ -237,9 +218,13 @@ build_webrtc_latency_probe_args() {
 build_webrtc_latency_receiver_args() {
   local -n output_ref="$1"
   output_ref+=(
-    --clock-offset-ms "${WEBRTC_CLOCK_OFFSET_MS:-0.0}"
     --fresh-deadline-ms "${WEBRTC_FRESH_DEADLINE_MS:-150.0}"
   )
+  if [[ -n "${WEBRTC_CLOCK_OFFSET_MS:-}" ]]; then
+    output_ref+=(--clock-offset-ms "${WEBRTC_CLOCK_OFFSET_MS}")
+  elif [[ -n "${WEBRTC_CLOCK_OFFSET_JSON:-}" ]]; then
+    output_ref+=(--clock-offset-json "${WEBRTC_CLOCK_OFFSET_JSON}")
+  fi
   if [[ "${WEBRTC_LATENCY_PROBE:-0}" == "1" || -n "${WEBRTC_LATENCY_JSON:-}" ]]; then
     output_ref+=(--latency-json "${WEBRTC_LATENCY_JSON:-${RUN_DIR}/webrtc_latency.json}")
   fi
@@ -265,7 +250,12 @@ zenoh_config_path() {
       *) configured="config/zenoh_split.json5" ;;
     esac
   fi
-  echo "${ROOT}/${configured}"
+  configured="${configured/#\~/${HOME}}"
+  if [[ "${configured}" == /* ]]; then
+    printf '%s\n' "${configured}"
+  else
+    printf '%s\n' "${ROOT}/${configured}"
+  fi
 }
 
 zenoh_runtime_config_path() {
@@ -285,18 +275,46 @@ zenoh_runtime_config_path() {
   fi
 
   if [[ "${#render_args[@]}" -gt 4 ]]; then
-    python3 "${ROOT}/scripts/render_zenoh_config.py" "${render_args[@]}"
+    "$(python_bin)" "${ROOT}/scripts/render_zenoh_config.py" "${render_args[@]}" || return 1
     echo "${out}"
   else
     echo "${base}"
   fi
 }
 
-build_zenoh_common_args() {
-  local -n output_ref="$1"
+zenoh_routing_config() {
   local config
   config="$(zenoh_config_path)"
   [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
+  if [[ "${HORUS_ROLE:-}" =~ ^(robot|machine)$ ]] && \
+     [[ -n "${HORUS_ROUTES_CONFIG:-}" || "${HORUS_ZENOH_CAMERA_POLICY:-compatible}" == "configured" ]]; then
+    local rendered="${RUN_DIR}/zenoh_routes.json" route_args=() streams="[]"
+    [[ -z "${HORUS_ROUTES_CONFIG:-}" ]] || route_args=(--routes "${HORUS_ROUTES_CONFIG}")
+    if [[ "${HORUS_ROLE:-}" == "robot" && "${HORUS_ZENOH_CAMERA_POLICY:-compatible}" == "configured" ]]; then
+      streams="$("$(python_bin)" "${ROOT}/scripts/webrtc_streams.py" json --root "${ROOT}" --role robot)" || return 1
+    fi
+    "$(python_bin)" "${ROOT}/scripts/transport_policy.py" --base "${config}" --out "${rendered}" --streams "${streams}" \
+      --role "${HORUS_ROLE:-machine}" "${route_args[@]}" || return 1
+    config="${rendered}"
+  fi
+  printf '%s\n' "${config}"
+}
+
+build_zenoh_common_args() {
+  local -n output_ref="$1"
+  local config
+  config="$(zenoh_routing_config)" || return 1
+  if zenoh_priority_links; then
+    if zenoh_quic_active; then
+      log_error "Priority-isolated TCP links require ZENOH_TRANSPORT=tcp (or auto without QUIC)."
+      return 1
+    fi
+    local linked="${RUN_DIR}/zenoh_priority_links.json"
+    "$(python_bin)" "${ROOT}/scripts/link_profile.py" --base "${config}" --out "${linked}" \
+      --target "$(zenoh_connect_target "${HORUS_ROLE:-robot}")" --port "${ZENOH_PORT:-7447}" \
+      --send-buffer "${HORUS_ZENOH_TCP_SEND_BUFFER:-65536}" || return 1
+    config="${linked}"
+  fi
   if zenoh_quic_active; then
     config="$(zenoh_runtime_config_path "${config}")"
   fi
@@ -317,7 +335,7 @@ dds_preflight_common_args() {
   local mode="$3"
   local config
   local target
-  config="$(zenoh_config_path)"
+  config="$(zenoh_routing_config)" || return 1
   target="$(dds_preflight_target "${role}")"
   output_ref+=(
     --root "${ROOT}"
@@ -417,6 +435,40 @@ zenoh_transport() {
       echo "auto"
       ;;
   esac
+}
+
+zenoh_priority_links() {
+  [[ "${HORUS_ZENOH_TRAFFIC_LANES:-0}" == "1" ]]
+}
+
+zenoh_bulk_rate() {
+  local rate="${HORUS_ZENOH_BULK_BYTES_PER_SECOND:-0}"
+  [[ "${rate}" =~ ^[0-9]{1,10}$ ]] && ((10#${rate} <= 1073741824)) || {
+    log_error "HORUS_ZENOH_BULK_BYTES_PER_SECOND must be 0..1073741824 (0 disables pacing)." >&2; return 1;
+  }
+  if ((10#${rate} > 0)) || [[ -n "${HORUS_ZENOH_BULK_BUDGET_FILE:-}" ]]; then
+    ! zenoh_uses_docker || { log_error "Bulk pacing requires the native priority bridge build." >&2; return 1; }
+    [[ -f "${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}.source.json" ]] || {
+      log_error "Bulk pacing requires the native bridge built by scripts/build_priority_bridge.py." >&2; return 1;
+    }
+  fi
+  if [[ -n "${HORUS_ZENOH_BULK_BUDGET_FILE:-}" ]]; then
+    if ! python3 - "${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}.source.json" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1]) as stream:
+        receipt = json.load(stream)
+    sys.exit(0 if "zenoh-plugin-ros2dds/src/bulk_budget.rs" in receipt.get("new_files", []) else 1)
+except (OSError, ValueError, TypeError):
+    sys.exit(1)
+PY
+    then
+      log_error "The selected bridge has no shared bulk-budget support. Rebuild with scripts/build_priority_bridge.py." >&2
+      return 1
+    fi
+  fi
+  printf '%d\n' "$((10#${rate}))"
 }
 
 zenoh_transport_label() {
@@ -539,6 +591,8 @@ append_zenoh_connect_args() {
   local target="$2"
   local endpoints=()
   local endpoint
+  # Client mode needs an allOf endpoint group, supplied by link_profile.py.
+  zenoh_priority_links && return 0
   zenoh_connect_endpoints endpoints "${target}"
   for endpoint in "${endpoints[@]}"; do
     output_ref+=(-e "${endpoint}")
@@ -549,6 +603,10 @@ append_zenoh_listen_args() {
   local -n output_ref="$1"
   local endpoints=()
   local endpoint
+  if zenoh_priority_links; then
+    output_ref+=(-l "tcp/${ZENOH_BIND:-0.0.0.0}:${ZENOH_PORT:-7447}#so_sndbuf=${HORUS_ZENOH_TCP_SEND_BUFFER:-65536}")
+    return 0
+  fi
   zenoh_listen_endpoints endpoints
   for endpoint in "${endpoints[@]}"; do
     output_ref+=(-l "${endpoint}")
@@ -636,11 +694,11 @@ check_zenoh_docker_access() {
     docker_cmd=(sudo -n docker)
   fi
 
-  if ! "${docker_cmd[@]}" ps >/dev/null 2>&1; then
+  if ! timeout 10 "${docker_cmd[@]}" ps >/dev/null 2>&1; then
     if [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" && -t 0 ]]; then
       echo "Zenoh Docker fallback needs sudo; refreshing sudo credentials."
       sudo -v
-      sudo docker ps >/dev/null 2>&1 && return
+      timeout 30 sudo docker ps >/dev/null 2>&1 && return
     fi
     if [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]]; then
       echo "Zenoh Docker fallback needs sudo Docker access. Run 'sudo -v' before launch, or add this user to the docker group and log out/in." >&2
@@ -711,10 +769,10 @@ zenoh_enabled() {
 }
 
 warn_runtime_config() {
-  local duration="${WEBRTC_DURATION:-86400}"
+  local duration="${WEBRTC_DURATION:-0}"
   local duration_int="${duration%%.*}"
   if [[ "${duration_int}" =~ ^[0-9]+$ && "${duration_int}" -gt 0 && "${duration_int}" -lt 300 ]]; then
-    echo "Warning: WEBRTC_DURATION=${duration} starts a short test session. Use 0 or 86400 for normal runs." >&2
+    echo "Warning: WEBRTC_DURATION=${duration} starts a finite test session. Use 0 for normal runs." >&2
   fi
 }
 
@@ -768,22 +826,16 @@ start_turn_relay() {
     log_error "TURN is enabled but coturn is not installed. Run ./horus bootstrap cloud."
     return 1
   fi
+  if turn_running; then
+    log_success "TURN relay is already running; preserving the shared system service."
+    return
+  fi
   if run_root_available; then
     bash "${ROOT}/scripts/setup_turn.sh"
     return
   fi
-  if turn_running; then
-    log_success "TURN relay is already running."
-    return
-  fi
-  log_warn "TURN is enabled but cannot be started without sudo. Run ./horus bootstrap cloud on the hub."
-}
-
-stop_turn_relay() {
-  turn_enabled || return 0
-  if command -v systemctl >/dev/null 2>&1 && run_root_available; then
-    run_root_cmd systemctl stop "$(turn_service_name)" >/dev/null 2>&1 || true
-  fi
+  log_error "TURN is enabled but is not running and cannot be started without sudo. Run ./horus bootstrap cloud on the hub."
+  return 1
 }
 
 status_turn() {
@@ -802,6 +854,7 @@ status_turn() {
 
 doctor() {
   local role="$1"
+  export HORUS_ROLE="${role}"
   local target=""
 
   echo -e "\n${BOLD}${FG_CYAN}Connectivity doctor${RESET}"
@@ -909,22 +962,156 @@ start_bg() {
   shift
   local log="${RUN_DIR}/${name}.log"
   local pid="${RUN_DIR}/${name}.pid"
+  local restart_args=(--retry-startup-errors)
+  if [[ "${name}" != webrtc* || "${WEBRTC_DURATION:-0}" =~ ^0+([.]0+)?$ ]]; then
+    restart_args+=(--restart-on-clean-exit)
+  fi
 
-  if [[ -f "${pid}" ]] && kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+  if service_pid_owned "${name}"; then
     log_warn "Service ${BOLD}${name}${RESET} is already running (PID $(cat "${pid}"))."
     return
   fi
+  rm -f -- "${pid}" "${pid}.start"
 
   rotate_log "${name}" "${log}"
+  rm -f -- "${RUN_DIR}/${name}.service.json" "${RUN_DIR}/${name}.media.json"
   log_run "Launching ${BOLD}${name}${RESET}... (log: ${FG_MUTED}${log}${RESET})"
-  nohup "$@" >"${log}" 2>&1 < /dev/null &
+  (
+    [[ -z "${INSTANCE_LOCK:-}" ]] || exec {INSTANCE_LOCK}>&-
+    exec nohup env "HORUS_MEDIA_STATUS_FILE=${RUN_DIR}/${name}.media.json" "HORUS_MEDIA_SUPERVISED=1" \
+      python3 "${ROOT}/scripts/service_runner.py" --log "${log}" \
+      --state "${RUN_DIR}/${name}.service.json" --max-restarts "${HORUS_SERVICE_MAX_RESTARTS:-5}" \
+      --restart-window "${HORUS_SERVICE_RESTART_WINDOW:-300}" "${restart_args[@]}" -- "$@"
+  ) >"${RUN_DIR}/${name}.supervisor.log" 2>&1 < /dev/null &
   local child_pid="$!"
   echo "${child_pid}" > "${pid}"
-  sleep 0.5
-  if kill -0 "${child_pid}" >/dev/null 2>&1; then
-    log_success "Service ${BOLD}${name}${RESET} started successfully ${FG_MUTED}(PID ${child_pid})${RESET}"
+  process_start_time "${child_pid}" > "${pid}.start" || true
+  NEW_SERVICES+=("${name}")
+  if [[ -n "${HORUS_LAUNCH_RECEIPT:-}" ]]; then
+    printf '%s\t%s\t%s\n' "${name}" "${child_pid}" "$(<"${pid}.start")" >> "${HORUS_LAUNCH_RECEIPT}"
+  fi
+  local attempt readiness="" ready=0 port=0
+  case "${name}" in
+    signal) port="${WEBRTC_SIGNAL_PORT:-8765}" ;;
+    metrics) port="${HORUS_METRICS_PORT:-9418}" ;;
+    zenoh|zenoh-sensing|zenoh-bulk)
+      if [[ "${HORUS_ROLE:-}" == "cloud" || "${HORUS_ROLE:-}:${HORUS_TOPOLOGY:-hub}" == "machine:direct" ]]; then
+        [[ "$(zenoh_transport)" == "quic" ]] || port="${ZENOH_PORT:-7447}"
+        [[ "${name}" != "zenoh-sensing" ]] || port="$((port+1))"
+        [[ "${name}" != "zenoh-bulk" ]] || port="$((port+2))"
+      fi ;;
+  esac
+  for ((attempt=0; attempt<${HORUS_SERVICE_START_ATTEMPTS:-100}; attempt++)); do
+    service_pid_owned "${name}" || break
+    if readiness="$(python3 "${ROOT}/scripts/service_readiness.py" --run-dir "${RUN_DIR}" --name "${name}" --port "${port}")"; then
+      ready=1
+      break
+    fi
+    sleep .1
+  done
+  if [[ "${ready}" == "1" ]] && service_pid_owned "${name}"; then
+    log_success "Service ${BOLD}${name}${RESET} initialized ${FG_MUTED}(${readiness}; supervisor PID ${child_pid})${RESET}"
   else
     log_error "Service ${BOLD}${name}${RESET} failed to start. Check: tail -n 20 ${log}"
+    stop_owned_service "${name}"
+    rm -f -- "${pid}" "${pid}.start"
+    return 1
+  fi
+}
+
+stop_owned_service() {
+  local name="$1" attempts
+  if service_pid_owned "${name}"; then
+    kill "$(<"${RUN_DIR}/${name}.pid")" || true
+    for ((attempts=0; attempts<100; attempts++)); do
+      service_pid_owned "${name}" || break
+      sleep 0.1
+    done
+    if service_pid_owned "${name}"; then
+      python3 "${ROOT}/scripts/service_runner.py" --state "${RUN_DIR}/${name}.service.json" \
+        --stop-owned-group --owner-pid "$(<"${RUN_DIR}/${name}.pid")" \
+        --owner-start "$(process_start_time "$(<"${RUN_DIR}/${name}.pid")")" || true
+      kill -KILL "$(<"${RUN_DIR}/${name}.pid")" || true
+    fi
+  fi
+  rm -f -- "${RUN_DIR}/${name}.pid" "${RUN_DIR}/${name}.pid.start"
+}
+
+rollback_launch() {
+  local result="$?" index
+  if [[ "${result}" != "0" ]]; then
+    log_error "Launch failed; stopping only services created by this launch."
+    for ((index=${#NEW_SERVICES[@]}-1; index>=0; index--)); do
+      stop_owned_service "${NEW_SERVICES[$index]}"
+    done
+  fi
+}
+
+lock_instance() {
+  exec {INSTANCE_LOCK}>"${RUN_DIR}/launcher.lock"
+  flock -w 20 "${INSTANCE_LOCK}" || { log_error "Another launch/stop is in progress."; return 1; }
+}
+
+preflight_media() {
+  local role="$1" rows candidate chosen="" need_ros=() profile=()
+  if [[ "${role}" == "cloud" ]]; then
+    [[ "${HORUS_CLOUD_RUN_SIGNALING:-1}" == "1" ]] || return 0
+  else
+    rows="$(webrtc_stream_rows "${role}")" || return 1
+    webrtc_session_row "${role}" >/dev/null || return 1
+    [[ -n "${rows}" ]] || return 0
+    python3 "${ROOT}/scripts/webrtc_streams.py" capacity-json --root "${ROOT}" --role "${role}" >"${RUN_DIR}/media_capacity.json" || return 1
+    source_ros_required
+    need_ros=(--need-ros)
+    if [[ "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+      profile=(--root "${ROOT}" --profile "${RUN_DIR}/webrtc_profile.env")
+    fi
+    if [[ -n "${HORUS_WEBRTC_ADDITIONAL_ROOMS:-}" && "${HORUS_TOPOLOGY:-hub}" != "hub" ]]; then
+      log_error "Additional operator rooms require hub topology."
+      return 1
+    fi
+  fi
+  if [[ -n "${HORUS_WEBRTC_PYTHON:-}" ]]; then
+    chosen="${HORUS_WEBRTC_PYTHON}"
+  else
+    for candidate in "${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python" /usr/bin/python3 python3; do
+      command -v "${candidate}" >/dev/null || continue
+      if "${candidate}" "${ROOT}/scripts/media_runtime.py" --role "${role}" \
+        --mode "${WEBRTC_MEDIA_MODE:-h264}" "${need_ros[@]}" >/dev/null 2>&1; then
+        chosen="${candidate}"
+        break
+      fi
+    done
+  fi
+  [[ -n "${chosen}" ]] || { log_error "No complete media Python runtime. Run ./horus bootstrap ${role}."; return 1; }
+  "${chosen}" "${ROOT}/scripts/media_runtime.py" --role "${role}" \
+    --mode "${WEBRTC_MEDIA_MODE:-h264}" "${need_ros[@]}" "${profile[@]}" || return 1
+  export HORUS_WEBRTC_PYTHON="${chosen}"
+}
+
+process_start_time() {
+  local pid="$1" stat
+  local fields=()
+  [[ "${pid}" =~ ^[0-9]+$ && -r "/proc/${pid}/stat" ]] || return 1
+  stat="$(<"/proc/${pid}/stat")"
+  read -r -a fields <<< "${stat##*) }"
+  [[ "${fields[0]:-}" != "Z" && -n "${fields[19]:-}" ]] || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+service_pid_owned() {
+  local name="$1" file pid recorded current
+  file="${RUN_DIR}/${name}.pid"
+  [[ -f "${file}" ]] || return 1
+  pid="$(<"${file}")"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${pid}" >/dev/null 2>&1 || return 1
+  if [[ -f "${file}.start" ]]; then
+    recorded="$(<"${file}.start")"
+    current="$(process_start_time "${pid}")" || return 1
+    [[ -n "${recorded}" && "${recorded}" == "${current}" ]]
+  else
+    project_pid_matches "${pid}"
   fi
 }
 
@@ -948,22 +1135,6 @@ rotate_log() {
   fi
 }
 
-stop_one() {
-  local name="$1"
-  local pid="${RUN_DIR}/${name}.pid"
-  if [[ -f "${pid}" ]]; then
-    if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
-      kill "$(cat "${pid}")" || true
-      sleep 1
-      if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
-        kill -KILL "$(cat "${pid}")" || true
-      fi
-      log_success "Stopped ${name}."
-    fi
-    rm -f "${pid}"
-  fi
-}
-
 project_pid_matches() {
   local pid="$1"
   local cwd cmdline
@@ -973,77 +1144,13 @@ project_pid_matches() {
   [[ "${cwd}" == "${ROOT}" || "${cmdline}" == *"${ROOT}/"* ]]
 }
 
-terminate_project_pids_by_pattern() {
-  local signal="$1"
-  shift
-  local pattern pid
-  for pattern in "$@"; do
-    while IFS= read -r pid; do
-      if project_pid_matches "${pid}"; then
-        kill "-${signal}" "${pid}" >/dev/null 2>&1 || true
-      fi
-    done < <(pgrep -f "${pattern}" 2>/dev/null || true)
-  done
-}
-
-terminate_project_pids_by_name() {
-  local signal="$1"
-  shift
-  local name pid
-  for name in "$@"; do
-    while IFS= read -r pid; do
-      if project_pid_matches "${pid}"; then
-        kill "-${signal}" "${pid}" >/dev/null 2>&1 || true
-      fi
-    done < <(pgrep -x "${name}" 2>/dev/null || true)
-  done
-}
-
-stop_stale_project_processes() {
-  local patterns=(
-    "${ROOT}/zenoh-bridge-ros2dds"
-    "${ROOT}/scripts/gst_webrtc_h264_robot.py"
-    "${ROOT}/scripts/gst_webrtc_h264_machine.py"
-    "${ROOT}/scripts/webrtc_camera_sender.py"
-    "${ROOT}/scripts/webrtc_camera_receiver.py"
-    "${ROOT}/scripts/webrtc_signal_relay.py"
-    "${ROOT}/scripts/field_teammate_hololens_relay.py"
-    "${ROOT}/scripts/fake_robot_ros2_data.py"
-    "${ROOT}/scripts/horus_metrics.py"
-    "scripts/gst_webrtc_h264_robot.py"
-    "scripts/gst_webrtc_h264_machine.py"
-    "scripts/webrtc_camera_sender.py"
-    "scripts/webrtc_camera_receiver.py"
-    "scripts/webrtc_signal_relay.py"
-    "scripts/field_teammate_hololens_relay.py"
-    "scripts/fake_robot_ros2_data.py"
-    "scripts/horus_metrics.py"
-  )
-
-  terminate_project_pids_by_pattern TERM "${patterns[@]}"
-  sleep 1
-  terminate_project_pids_by_pattern KILL "${patterns[@]}"
-}
-
-stop_zenoh() {
-  if [[ "${ZENOH_BRIDGE_RUNTIME:-binary}" == "docker" ]]; then
-    local docker_cmd=(docker)
-    [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
-    "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${HORUS_ROLE:-robot}")" >/dev/null 2>&1 || true
-  fi
-  stop_one zenoh
-  terminate_project_pids_by_name TERM zenoh-bridge-ros2dds
-  sleep 1
-  terminate_project_pids_by_name KILL zenoh-bridge-ros2dds
-}
-
 get_pid_stats() {
   local name="$1"
   local pid_file="${RUN_DIR}/${name}.pid"
   if [[ -f "${pid_file}" ]]; then
     local p_id
     p_id=$(cat "${pid_file}" 2>/dev/null || echo "")
-    if [[ -n "${p_id}" ]] && kill -0 "${p_id}" >/dev/null 2>&1; then
+    if service_pid_owned "${name}"; then
       local stats
       stats=$(ps -p "${p_id}" -o %cpu,%mem,etimes --no-headers 2>/dev/null || echo "")
       if [[ -n "${stats}" ]]; then
@@ -1068,7 +1175,7 @@ get_pid_stats() {
 status_one() {
   local name="$1"
   local pid="${RUN_DIR}/${name}.pid"
-  if [[ -f "${pid}" ]] && kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+  if service_pid_owned "${name}"; then
     local p_id
     p_id=$(cat "${pid}")
     printf "  %-10s %b\n" "${name}" "${FG_GREEN}running${RESET} ${FG_MUTED}PID ${p_id}${RESET}$(get_pid_stats "${name}")"
@@ -1079,15 +1186,47 @@ status_one() {
 
 status_webrtc_streams() {
   local role="${HORUS_ROLE:-robot}"
+  if [[ -n "${HORUS_MEDIA_RELAY_CONFIG:-}" ]]; then
+    status_one media-relay
+  fi
+  if [[ "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == "1" ]]; then
+    status_one source-media
+    printf '  source video is negotiated directly with HORUS; process state is not frame-delivery proof\n'
+  fi
   local rows=()
-  local row service rest
+  local row service rest stream_text session_text session_mode session_room session_id
+  local room extra_room existing_room duplicate room_index
+  local rooms=() configured_rooms=()
   if { [[ "${role}" != "robot" && "${role}" != "machine" ]] || [[ "${WEBRTC_MEDIA_MODE:-h264}" != "h264" ]]; }; then
     status_one webrtc
     return
   fi
-  mapfile -t rows < <(webrtc_stream_rows "${role}")
+  stream_text="$(webrtc_stream_rows "${role}")" || return 1
+  [[ -n "${stream_text}" ]] && mapfile -t rows <<< "${stream_text}"
   if [[ "${#rows[@]}" -eq 0 ]]; then
+    printf "  %-10s %b\n" "webrtc" "${FG_MUTED}no enabled camera streams${RESET}"
+    return
+  fi
+  session_text="$(webrtc_session_row "${role}")" || return 1
+  IFS=$'\t' read -r session_mode session_room session_id <<< "${session_text}"
+  if [[ "${session_mode}" == "bundled" ]]; then
     status_one webrtc
+    if [[ "${role}" == "robot" && -n "${HORUS_WEBRTC_ADDITIONAL_ROOMS:-}" ]]; then
+      rooms=("${session_room}")
+      IFS=',' read -r -a configured_rooms <<< "${HORUS_WEBRTC_ADDITIONAL_ROOMS}"
+      for extra_room in "${configured_rooms[@]}"; do
+        extra_room="$(trim_spaces "${extra_room}")"
+        [[ -n "${extra_room}" ]] || continue
+        duplicate=0
+        for existing_room in "${rooms[@]}"; do
+          [[ "${extra_room}" == "${existing_room}" ]] && duplicate=1
+        done
+        [[ "${duplicate}" == "1" ]] || rooms+=("${extra_room}")
+      done
+      for room_index in "${!rooms[@]}"; do
+        [[ "${room_index}" == "0" ]] || status_one "webrtc-operator-${room_index}"
+      done
+    fi
     return
   fi
   for row in "${rows[@]}"; do
@@ -1101,7 +1240,7 @@ status_zenoh() {
     local docker_cmd=(docker)
     local status
     [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
-    status="$("${docker_cmd[@]}" ps --filter "name=$(zenoh_docker_name "${HORUS_ROLE:-robot}")" --format '{{.Status}}' 2>/dev/null || true)"
+    status="$(timeout 10 "${docker_cmd[@]}" ps --filter "name=$(zenoh_docker_name "${HORUS_ROLE:-robot}")" --format '{{.Status}}' 2>/dev/null || true)"
     if [[ -n "${status}" ]]; then
       printf "  %-10s %b\n" "zenoh" "${FG_GREEN}running${RESET} ${FG_MUTED}Docker $(zenoh_docker_name "${HORUS_ROLE:-robot}") - ${status}${RESET}"
     else
@@ -1130,10 +1269,61 @@ open_monitor_after_launch() {
   python3 "${ROOT}/scripts/horus_monitor.py" --root "${ROOT}" --env "${ENV_FILE}"
 }
 
+zenoh_session_mode() {
+  if [[ -z "${1:-}" ]]; then
+    printf '%s\n' router
+  elif [[ "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
+    printf '%s\n' client
+  else
+    printf '%s\n' peer
+  fi
+}
+
+launch_zenoh_session_lanes() {
+  local role="$1" target="${2:-}" bridge="${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}"
+  local base uri bulk_rate name class rate budget
+  local namespace_args=()
+  local dscp_args=()
+  ! zenoh_uses_docker && [[ "$(zenoh_transport)" == "tcp" ]] || {
+    log_error "Independent sessions currently require the native TCP bridge on both endpoints."; return 1;
+  }
+  if service_pid_owned zenoh && [[ ! -f "${RUN_DIR}/session-lanes/realtime.json" ]]; then
+    log_error "Stop the existing single-session connector before enabling independent sessions."; return 1;
+  fi
+  if [[ "${role}" == "cloud" ]]; then
+    source_ros || true
+  else
+    source_ros_required
+  fi
+  bulk_rate="$(zenoh_bulk_rate)" || return 1
+  base="$(zenoh_routing_config)" || return 1
+  [[ -z "${HORUS_ZENOH_SESSION_DSCP:-}" ]] || dscp_args=(--dscp "${HORUS_ZENOH_SESSION_DSCP}")
+  "$(python_bin)" "${ROOT}/scripts/session_lanes.py" --base "${base}" --output "${RUN_DIR}/session-lanes" \
+    --binary "${bridge}" --target "${target}" --bind "${ZENOH_BIND:-0.0.0.0}" --port "${ZENOH_PORT:-7447}" \
+    --send-buffer "${HORUS_ZENOH_TCP_SEND_BUFFER:-65536}" "${dscp_args[@]}" || return 1
+  uri="$(dds_connector_uri "${role}")"
+  [[ -z "${ZENOH_NAMESPACE:-}" ]] || namespace_args=(-n "${ZENOH_NAMESPACE}")
+  for class in realtime sensing bulk; do
+    name=zenoh
+    [[ "${class}" == "realtime" ]] || name="zenoh-${class}"
+    rate=0; budget=""
+    if [[ "${class}" == "bulk" ]]; then
+      rate="${bulk_rate}"; budget="${HORUS_ZENOH_BULK_BUDGET_FILE:-}"
+    fi
+    start_bg "${name}" env "CYCLONEDDS_URI=${uri}" "HORUS_ZENOH_BULK_BYTES_PER_SECOND=${rate}" \
+      "HORUS_ZENOH_BULK_BUDGET_FILE=${budget}" "${bridge}" -c "${RUN_DIR}/session-lanes/${class}.json" \
+      "${namespace_args[@]}" --no-multicast-scouting "$(zenoh_session_mode "${target}")" || return 1
+  done
+}
+
 launch_zenoh_client() {
+  if [[ "${HORUS_ZENOH_SESSION_ISOLATION:-0}" == "1" ]]; then
+    launch_zenoh_session_lanes "$1" "$2"; return;
+  fi
+  service_pid_owned zenoh && { log_info "Zenoh is already running."; return; }
   local role="$1"
   local target="$2"
-  local bridge="${ROOT}/zenoh-bridge-ros2dds"
+  local bridge="${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}"
   local config
   local dds_uri
   local docker_cmd=(docker)
@@ -1143,12 +1333,18 @@ launch_zenoh_client() {
   local namespace_args=()
   local zenoh_args=()
   local endpoint_args=()
+  local bulk_rate
+  local transport_mode=client
+  zenoh_priority_links && transport_mode=peer
+  bulk_rate="$(zenoh_bulk_rate)" || return 1
   append_zenoh_connect_args endpoint_args "${target}"
   if zenoh_uses_docker; then
+    [[ "${bulk_rate}" == "0" ]] || { log_error "Bulk byte pacing requires the native priority bridge build."; return 1; }
     check_zenoh_docker_access
     [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
     [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
-    config="$(zenoh_config_path)"
+    build_zenoh_common_args zenoh_args
+    config="${zenoh_args[1]}"
     [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
     dds_connector_docker_args docker_dds_args "${role}"
     dds_docker_env_args docker_env_args
@@ -1156,9 +1352,9 @@ launch_zenoh_client() {
       config="$(zenoh_runtime_config_path "${config}")"
       zenoh_docker_tls_mount_args docker_mount_args
     fi
-    "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${role}")" >/dev/null 2>&1 || true
     start_bg zenoh "${docker_cmd[@]}" run --rm \
       --name "$(zenoh_docker_name "${role}")" \
+      --label "horus.run_dir=${RUN_DIR}" \
       --network host \
       -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
       -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
@@ -1166,21 +1362,27 @@ launch_zenoh_client() {
       "${docker_dds_args[@]}" \
       -v "${config}:/horus_zenoh.json5:ro" \
       "${docker_mount_args[@]}" \
-      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-1.9.0}}" \
+      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-$(python3 "${ROOT}/scripts/zenoh_release.py" --default-version)}}" \
       -c /horus_zenoh.json5 "${namespace_args[@]}" \
-      --no-multicast-scouting "${endpoint_args[@]}" client
+      --no-multicast-scouting "${endpoint_args[@]}" "${transport_mode}"
   else
     [[ -x "${bridge}" ]] || { echo "Missing Zenoh bridge. Run ./horus bootstrap ${role}." >&2; exit 1; }
     source_ros_required
     build_zenoh_common_args zenoh_args
     dds_uri="$(dds_connector_uri "${role}")"
-    start_bg zenoh env "CYCLONEDDS_URI=${dds_uri}" "${bridge}" "${zenoh_args[@]}" --no-multicast-scouting "${endpoint_args[@]}" client
+    start_bg zenoh env "CYCLONEDDS_URI=${dds_uri}" "HORUS_ZENOH_BULK_BYTES_PER_SECOND=${bulk_rate}" "HORUS_ZENOH_BULK_BUDGET_FILE=${HORUS_ZENOH_BULK_BUDGET_FILE:-}" "${bridge}" "${zenoh_args[@]}" --no-multicast-scouting "${endpoint_args[@]}" "${transport_mode}"
   fi
 }
 
 launch_zenoh_router() {
+  if [[ "${HORUS_ZENOH_SESSION_ISOLATION:-0}" == "1" ]]; then
+    launch_zenoh_session_lanes "$1"; return;
+  fi
+  service_pid_owned zenoh && { log_info "Zenoh is already running."; return; }
   local role="$1"
-  local bridge="${ROOT}/zenoh-bridge-ros2dds"
+  local bulk_rate
+  bulk_rate="$(zenoh_bulk_rate)" || return 1
+  local bridge="${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}"
   local config
   local dds_uri
   local docker_cmd=(docker)
@@ -1195,7 +1397,8 @@ launch_zenoh_router() {
     check_zenoh_docker_access
     [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
     [[ -n "${ZENOH_NAMESPACE:-}" ]] && namespace_args=(-n "${ZENOH_NAMESPACE}")
-    config="$(zenoh_config_path)"
+    build_zenoh_common_args zenoh_args
+    config="${zenoh_args[1]}"
     [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
     dds_connector_docker_args docker_dds_args "${role}"
     dds_docker_env_args docker_env_args
@@ -1203,9 +1406,9 @@ launch_zenoh_router() {
       config="$(zenoh_runtime_config_path "${config}")"
       zenoh_docker_tls_mount_args docker_mount_args
     fi
-    "${docker_cmd[@]}" rm -f "$(zenoh_docker_name "${role}")" >/dev/null 2>&1 || true
     start_bg zenoh "${docker_cmd[@]}" run --rm \
       --name "$(zenoh_docker_name "${role}")" \
+      --label "horus.run_dir=${RUN_DIR}" \
       --network host \
       -e "ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
       -e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}" \
@@ -1213,7 +1416,7 @@ launch_zenoh_router() {
       "${docker_dds_args[@]}" \
       -v "${config}:/horus_zenoh.json5:ro" \
       "${docker_mount_args[@]}" \
-      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-1.9.0}}" \
+      "${ZENOH_BRIDGE_IMAGE:-eclipse/zenoh-bridge-ros2dds:${ZENOH_VERSION:-$(python3 "${ROOT}/scripts/zenoh_release.py" --default-version)}}" \
       -c /horus_zenoh.json5 "${namespace_args[@]}" \
       "${endpoint_args[@]}" router
   else
@@ -1225,7 +1428,7 @@ launch_zenoh_router() {
     fi
     build_zenoh_common_args zenoh_args
     dds_uri="$(dds_connector_uri "${role}")"
-    start_bg zenoh env "CYCLONEDDS_URI=${dds_uri}" "${bridge}" "${zenoh_args[@]}" "${endpoint_args[@]}" router
+    start_bg zenoh env "CYCLONEDDS_URI=${dds_uri}" "HORUS_ZENOH_BULK_BYTES_PER_SECOND=${bulk_rate}" "HORUS_ZENOH_BULK_BUDGET_FILE=${HORUS_ZENOH_BULK_BUDGET_FILE:-}" "${bridge}" "${zenoh_args[@]}" "${endpoint_args[@]}" router
   fi
 }
 
@@ -1249,7 +1452,9 @@ webrtc_session_row() {
 print_webrtc_stream_summary() {
   local role="$1"
   local rows=()
-  mapfile -t rows < <(webrtc_stream_rows "${role}")
+  local stream_text
+  stream_text="$(webrtc_stream_rows "${role}")" || return 1
+  [[ -n "${stream_text}" ]] && mapfile -t rows <<< "${stream_text}"
   if [[ "${#rows[@]}" -le 1 ]]; then
     return
   fi
@@ -1273,17 +1478,45 @@ launch_webrtc_robot_h264_streams() {
   local optional_args=()
   local row service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos source_pipeline
   local session_mode session_room session_id
-  "${ROOT}/scripts/detect_video_stack.sh" --role robot --out "${ROOT}/.webrtc_profile.env" >/dev/null
+  local stream_text session_text
+  local media_rooms=() extra_room existing_room duplicate service_name room_index
   build_webrtc_latency_probe_args optional_args
-  mapfile -t rows < <(webrtc_stream_rows robot)
-  IFS=$'\t' read -r session_mode session_room session_id < <(webrtc_session_row robot)
+  stream_text="$(webrtc_stream_rows robot)" || return 1
+  if [[ -z "${stream_text}" ]]; then
+    log_info "No enabled WebRTC camera streams; robot media was not started."
+    return 0
+  fi
+  mapfile -t rows <<< "${stream_text}"
+  session_text="$(webrtc_session_row robot)" || return 1
+  IFS=$'\t' read -r session_mode session_room session_id <<< "${session_text}"
+  if [[ -n "${HORUS_WEBRTC_ADDITIONAL_ROOMS:-}" && "${HORUS_TOPOLOGY:-hub}" != "hub" ]]; then
+    log_error "Additional operator rooms require hub topology with a shared signaling relay."
+    return 2
+  fi
   if [[ "${session_mode}" == "bundled" ]]; then
-    start_bg webrtc "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
+    media_rooms=("${session_room}")
+    if [[ -n "${HORUS_WEBRTC_ADDITIONAL_ROOMS:-}" ]]; then
+      local configured_rooms=()
+      IFS=',' read -r -a configured_rooms <<< "${HORUS_WEBRTC_ADDITIONAL_ROOMS}"
+      for extra_room in "${configured_rooms[@]}"; do
+        extra_room="$(trim_spaces "${extra_room}")"
+        [[ -n "${extra_room}" ]] || continue
+        duplicate=0
+        for existing_room in "${media_rooms[@]}"; do
+          [[ "${extra_room}" == "${existing_room}" ]] && duplicate=1
+        done
+        [[ "${duplicate}" == "1" ]] || media_rooms+=("${extra_room}")
+      done
+    fi
+    for room_index in "${!media_rooms[@]}"; do
+      service_name=webrtc
+      [[ "${room_index}" == "0" ]] || service_name="webrtc-operator-${room_index}"
+      start_bg "${service_name}" env "HORUS_WEBRTC_SESSION_ROOM=${media_rooms[$room_index]}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
       --root "${ROOT}" \
       --streams-config "${HORUS_STREAMS_CONFIG:-config/webrtc_streams.json}" \
       --signaling-url "$(webrtc_signal_url "${target}")" \
-      --room "${session_room}" \
-      --profile "${ROOT}/.webrtc_profile.env" \
+      --room "${media_rooms[$room_index]}" \
+      --profile "${RUN_DIR}/webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
       --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
       --enable-control "${control_enabled}" \
@@ -1306,16 +1539,22 @@ launch_webrtc_robot_h264_streams() {
       --bitrate-good-rtt-ms "${WEBRTC_BITRATE_GOOD_RTT_MS:-150.0}" \
       --bitrate-good-samples "${WEBRTC_BITRATE_GOOD_SAMPLES:-3}" \
       "${optional_args[@]}" \
-      --duration "${WEBRTC_DURATION:-86400}"
+      --duration "${WEBRTC_DURATION:-0}"
+    done
     return
+  fi
+  if [[ -n "${HORUS_WEBRTC_ADDITIONAL_ROOMS:-}" ]]; then
+    log_error "Additional operator rooms require a bundled WebRTC session."
+    return 2
   fi
   for row in "${rows[@]}"; do
     IFS=$'\t' read -r service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos <<< "${row}"
     source_pipeline="$(decode_b64 "${source_pipeline_b64}")"
     start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_robot.py" \
+      --root "${ROOT}" --streams-config "${HORUS_STREAMS_CONFIG:-config/webrtc_streams.json}" --stream-id "${stream_id}" \
       --signaling-url "$(webrtc_signal_url "${target}")" \
       --room "${room}" \
-      --profile "${ROOT}/.webrtc_profile.env" \
+      --profile "${RUN_DIR}/webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
       --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
       --enable-control "${control_enabled}" \
@@ -1346,7 +1585,7 @@ launch_webrtc_robot_h264_streams() {
       --height "${height}" \
       --fps "${fps}" \
       "${optional_args[@]}" \
-      --duration "${WEBRTC_DURATION:-86400}"
+      --duration "${WEBRTC_DURATION:-0}"
   done
 }
 
@@ -1360,13 +1599,19 @@ launch_webrtc_receiver_h264_streams() {
   local use_local_signal_relay=0
   local row service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos
   local session_mode session_room session_id
-  "${ROOT}/scripts/detect_video_stack.sh" --role "${role}" --out "${ROOT}/.webrtc_profile.env" >/dev/null
+  local stream_text session_text
   build_webrtc_latency_receiver_args optional_args
-  mapfile -t rows < <(webrtc_stream_rows machine)
-  IFS=$'\t' read -r session_mode session_room session_id < <(webrtc_session_row machine)
+  stream_text="$(webrtc_stream_rows machine)" || return 1
+  if [[ -z "${stream_text}" ]]; then
+    log_info "No enabled WebRTC camera streams; machine media was not started."
+    return 0
+  fi
+  mapfile -t rows <<< "${stream_text}"
+  session_text="$(webrtc_session_row machine)" || return 1
+  IFS=$'\t' read -r session_mode session_room session_id <<< "${session_text}"
   if [[ "${session_mode}" == "bundled" ]]; then
     local bundled_signal_args=()
-    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" ]]; then
+    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" || "${HORUS_WEBRTC_USE_SHARED_SIGNAL:-0}" == "1" ]]; then
       bundled_signal_args+=(--signaling-url "$(webrtc_signal_url "${target}")")
     else
       bundled_signal_args+=(--host 0.0.0.0 --port "${WEBRTC_SIGNAL_PORT:-8765}")
@@ -1376,7 +1621,7 @@ launch_webrtc_receiver_h264_streams() {
       --streams-config "${HORUS_STREAMS_CONFIG:-config/webrtc_streams.json}" \
       "${bundled_signal_args[@]}" \
       --room "${session_room}" \
-      --profile "${ROOT}/.webrtc_profile.env" \
+      --profile "${RUN_DIR}/webrtc_profile.env" \
       --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
       --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
       --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
@@ -1387,21 +1632,22 @@ launch_webrtc_receiver_h264_streams() {
       --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
       --control-token "${HORUS_WEBRTC_CONTROL_TOKEN:-}" \
       "${optional_args[@]}" \
-      --duration "${WEBRTC_DURATION:-86400}"
+      --duration "${WEBRTC_DURATION:-0}"
     return
   fi
-  if [[ "${HORUS_TOPOLOGY:-hub}" == "direct" && "${#rows[@]}" -gt 1 ]]; then
+  if [[ "${HORUS_TOPOLOGY:-hub}" == "direct" && "${#rows[@]}" -gt 1 && "${HORUS_WEBRTC_USE_SHARED_SIGNAL:-0}" != "1" ]]; then
     launch_signal_relay
     target="127.0.0.1"
     use_local_signal_relay=1
   fi
   for row in "${rows[@]}"; do
     IFS=$'\t' read -r service stream_id room input_topic output_topic width height fps bitrate video_source source_pipeline_b64 frame_id qos <<< "${row}"
-    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" || "${use_local_signal_relay}" == "1" ]]; then
+    if [[ "${HORUS_TOPOLOGY:-hub}" == "hub" || "${use_local_signal_relay}" == "1" || "${HORUS_WEBRTC_USE_SHARED_SIGNAL:-0}" == "1" ]]; then
       start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
+        --root "${ROOT}" --streams-config "${HORUS_STREAMS_CONFIG:-config/webrtc_streams.json}" --stream-id "${stream_id}" \
         --signaling-url "$(webrtc_signal_url "${target}")" \
         --room "${room}" \
-        --profile "${ROOT}/.webrtc_profile.env" \
+        --profile "${RUN_DIR}/webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
         --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
@@ -1414,13 +1660,14 @@ launch_webrtc_receiver_h264_streams() {
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
         "${optional_args[@]}" \
-        --duration "${WEBRTC_DURATION:-86400}"
+        --duration "${WEBRTC_DURATION:-0}"
     else
       start_bg "${service}" "${py}" "${ROOT}/scripts/gst_webrtc_h264_machine.py" \
+        --root "${ROOT}" --streams-config "${HORUS_STREAMS_CONFIG:-config/webrtc_streams.json}" --stream-id "${stream_id}" \
         --host 0.0.0.0 \
         --port "${WEBRTC_SIGNAL_PORT:-8765}" \
         --room "${room}" \
-        --profile "${ROOT}/.webrtc_profile.env" \
+        --profile "${RUN_DIR}/webrtc_profile.env" \
         --ice-servers "${WEBRTC_ICE_SERVERS:-stun:stun.l.google.com:19302}" \
         --ice-transport-policy "${WEBRTC_ICE_TRANSPORT_POLICY:-all}" \
         --video-sink "${WEBRTC_VIDEO_SINK:-fakesink}" \
@@ -1433,7 +1680,7 @@ launch_webrtc_receiver_h264_streams() {
         --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
         --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
         "${optional_args[@]}" \
-        --duration "${WEBRTC_DURATION:-86400}"
+        --duration "${WEBRTC_DURATION:-0}"
     fi
   done
 }
@@ -1452,7 +1699,7 @@ launch_webrtc_robot() {
     build_ice_args optional_args
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_sender.py" \
       --signaling-url "$(webrtc_signal_url "${target}")" \
-      --duration "${WEBRTC_DURATION:-86400}" \
+      --duration "${WEBRTC_DURATION:-0}" \
       --camera-fps-scale "${CAMERA_FPS_SCALE:-1.0}" \
       --quality-scale "${CAMERA_QUALITY_SCALE:-1.0}" \
       --max-buffer-bytes "${WEBRTC_MAX_BUFFER_BYTES:-2000000}" \
@@ -1466,6 +1713,99 @@ launch_webrtc_robot() {
   else
     launch_webrtc_robot_h264_streams "${py}" "${target}" "${control_enabled}"
   fi
+}
+
+native_media_plugin_path() {
+  local path combined="${GST_PLUGIN_PATH:-}"
+  for path in "${HORUS_MEDIA_GST_PLUGIN_DIR:-${ROOT}/.runtime/media-gcc/plugins}" \
+      "${WEBRTC_VENV:-${ROOT}/.venv-webrtc}"/native/usr/lib/*/gstreamer-1.0; do
+    [[ -d "${path}" ]] || continue
+    combined="${path}${combined:+:${combined}}"
+  done
+  printf '%s' "${combined}"
+}
+
+native_media_configured() {
+  [[ "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == "1" ||
+     ( -n "${HORUS_MEDIA_RELAY_CONFIG:-}" && "${HORUS_MEDIA_RELAY_ENGINE:-native}" == "native" ) ]]
+}
+
+print_native_media_summary() {
+  local mode="${HORUS_OPERATOR_CONTROL_MODE:-local}"
+  [[ "${HORUS_ROLE:-}" != "robot" ]] || mode="${HORUS_SOURCE_CONTROL_MODE:-local}"
+  echo -e "  media      ${FG_CYAN}native H.264 / WebRTC${RESET}, demand-driven profiles"
+  if [[ "${mode}" == "authority" || "${mode}" == "proxy" ]]; then
+    echo -e "  control    ${FG_CYAN}independent HORUS control link${RESET}, fleet leases (${mode})"
+  else
+    echo -e "  control    ${FG_GREEN}local ROS control${RESET}"
+  fi
+  echo -e "  profiles   ${FG_MUTED}FPS, bitrate and source size are negotiated per camera${RESET}"
+}
+
+launch_source_media() {
+  [[ "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == "1" ]] || return 0
+  local binary="${HORUS_SOURCE_MEDIA_BINARY:-}" bitrate="${HORUS_SOURCE_MEDIA_BITRATE_KBPS:-1500}"
+  local fps="${HORUS_SOURCE_MEDIA_FPS:-15}"
+  local media_env=(env "GST_PLUGIN_PATH=$(native_media_plugin_path)")
+  if [[ -n "${HORUS_SOURCE_MEDIA_RMW:-}" ]]; then
+    media_env+=("RMW_IMPLEMENTATION=${HORUS_SOURCE_MEDIA_RMW}")
+  fi
+  if [[ -n "${HORUS_SOURCE_MEDIA_FASTDDS_PROFILE:-}" ]]; then
+    [[ -f "${HORUS_SOURCE_MEDIA_FASTDDS_PROFILE}" ]] || { log_error "Source media Fast DDS profile does not exist."; return 1; }
+    media_env=(-u ROS_LOCALHOST_ONLY "${media_env[@]:1}"
+      "ROS_AUTOMATIC_DISCOVERY_RANGE=SYSTEM_DEFAULT"
+      "FASTDDS_DEFAULT_PROFILES_FILE=${HORUS_SOURCE_MEDIA_FASTDDS_PROFILE}"
+      "FASTRTPS_DEFAULT_PROFILES_FILE=${HORUS_SOURCE_MEDIA_FASTDDS_PROFILE}")
+    media_env=(env "${media_env[@]}")
+  fi
+  if [[ -z "${binary}" ]]; then
+    binary="$(command -v horus_media_node || true)"
+  fi
+  [[ -x "${binary}" ]] || { log_error "Set HORUS_SOURCE_MEDIA_BINARY to the WebRTC-enabled horus_media_node executable."; return 1; }
+  [[ "${bitrate}" =~ ^[0-9]+$ && "${fps}" =~ ^[0-9]+$ ]] || { log_error "Source media bitrate and FPS must be positive integers."; return 1; }
+  ((bitrate >= 100 && bitrate <= 100000 && fps >= 1 && fps <= 60)) || { log_error "Source media bitrate or FPS is outside its supported range (100..100000 kbps, 1..60 FPS)."; return 1; }
+  [[ "${HORUS_SOURCE_CONTROL_MODE:-local}" =~ ^(local|authority)$ ]] || { log_error "HORUS_SOURCE_CONTROL_MODE must be local or authority."; return 1; }
+  start_bg source-media "${media_env[@]}" "${binary}" --ros-args \
+    -p "control.mode:=${HORUS_SOURCE_CONTROL_MODE:-local}" \
+    -p "webrtc.link_budget_kbps:=${HORUS_LINK_BUDGET_KBPS:-0}" \
+    -p "webrtc.reserved_kbps:=${HORUS_LINK_RESERVED_KBPS:-512}" \
+    -p "webrtc.bulk_floor_kbps:=${HORUS_LINK_BULK_FLOOR_KBPS:-256}" \
+    -p "webrtc.bulk_budget_file:=${HORUS_ZENOH_BULK_BUDGET_FILE:-}" \
+    -p "webrtc.share_encoders:=${HORUS_SOURCE_MEDIA_SHARE_ENCODERS:-true}" \
+    -p "webrtc.client_signal_topic:=${HORUS_SOURCE_MEDIA_CLIENT_SIGNAL_TOPIC:-/horus/remote/webrtc/client_signal}" \
+    -p "webrtc.server_signal_topic:=${HORUS_SOURCE_MEDIA_SERVER_SIGNAL_TOPIC:-/horus/remote/webrtc/server_signal}" \
+    -p "webrtc.default_encoder:=${HORUS_SOURCE_MEDIA_ENCODER:-auto}" \
+    -p "webrtc.default_bitrate_kbps:=${bitrate}" \
+    -p "webrtc.default_framerate:=${fps}"
+  log_info "Source-side video sender started; waiting for HORUS camera offers. No ROS camera payload is required across the WAN."
+}
+
+launch_media_relay() {
+  [[ -n "${HORUS_MEDIA_RELAY_CONFIG:-}" ]] || return 0
+  [[ -f "${HORUS_MEDIA_RELAY_CONFIG}" ]] || { log_error "HORUS_MEDIA_RELAY_CONFIG does not exist."; return 1; }
+  source_ros_required
+  local py dds_uri
+  dds_uri="$(dds_connector_uri machine)"
+  if [[ "${HORUS_MEDIA_RELAY_ENGINE:-native}" == "native" ]]; then
+    local binary="${HORUS_MEDIA_RELAY_BINARY:-}" native_args=()
+    [[ -n "${binary}" ]] || binary="$(command -v horus_unity_bridge_node || true)"
+    [[ -x "${binary}" ]] || { log_error "Set HORUS_MEDIA_RELAY_BINARY to the WebRTC-enabled horus_unity_bridge_node."; return 1; }
+    [[ "${HORUS_OPERATOR_CONTROL_MODE:-local}" =~ ^(local|proxy)$ ]] || { log_error "HORUS_OPERATOR_CONTROL_MODE must be local or proxy."; return 1; }
+    if [[ -n "${HORUS_MEDIA_RELAY_BRIDGE_CONFIG:-}" ]]; then
+      [[ -f "${HORUS_MEDIA_RELAY_BRIDGE_CONFIG}" ]] || { log_error "Native relay bridge configuration does not exist."; return 1; }
+      native_args+=(--params-file "${HORUS_MEDIA_RELAY_BRIDGE_CONFIG}")
+    fi
+    start_bg media-relay env "CYCLONEDDS_URI=${dds_uri}" "GST_PLUGIN_PATH=$(native_media_plugin_path)" \
+      "${binary}" --ros-args "${native_args[@]}" \
+      -p webrtc.enabled:=true -p "webrtc.relay_config:=${HORUS_MEDIA_RELAY_CONFIG}" \
+      -p "control.mode:=${HORUS_OPERATOR_CONTROL_MODE:-local}"
+    log_info "Native HORUS bridge/packet relay started; SDK registrations reuse its connection. Video does not pass through ROS."
+    return
+  fi
+  [[ "${HORUS_MEDIA_RELAY_ENGINE}" == "ros" ]] || { log_error "HORUS_MEDIA_RELAY_ENGINE must be native or ros."; return 1; }
+  py="$(python_bin)"
+  start_bg media-relay env "CYCLONEDDS_URI=${dds_uri}" "${py}" "${ROOT}/scripts/source_media_receiver.py" \
+    --config "${HORUS_MEDIA_RELAY_CONFIG}"
 }
 
 launch_webrtc_receiver() {
@@ -1487,7 +1827,7 @@ launch_webrtc_receiver() {
     start_bg webrtc "${py}" "${ROOT}/scripts/webrtc_camera_receiver.py" \
       --host 0.0.0.0 \
       --port "${WEBRTC_SIGNAL_PORT:-8765}" \
-      --duration "${WEBRTC_DURATION:-86400}" \
+      --duration "${WEBRTC_DURATION:-0}" \
       --cmd-rate "${cmd_rate}" \
       --cmd-linear-x "${CMD_LINEAR_X:-0.0}" \
       --cmd-angular-z "${CMD_ANGULAR_Z:-0.0}" \
@@ -1656,12 +1996,32 @@ case "${cmd}" in
   bootstrap)
     "${ROOT}/scripts/bootstrap.sh" "${2:-}"
     ;;
+  update-zenoh)
+    [[ "$#" -le 2 ]] || { log_error "Usage: ./horus update-zenoh [version]"; exit 2; }
+    ZENOH_VERSION="${2:-$(python3 "${ROOT}/scripts/zenoh_release.py" --default-version)}" \
+      "${ROOT}/scripts/bootstrap.sh" --zenoh-only
+    ;;
+  environment)
+    load_env
+    "$(python_bin)" "${ROOT}/scripts/environment_report.py"
+    ;;
+  reprobe)
+    load_env
+    role="${2:-${HORUS_ROLE:-machine}}"
+    [[ "${role}" == "robot" || "${role}" == "machine" ]] || { log_error "reprobe requires robot or machine"; exit 2; }
+    source_ros_required
+    rm -f -- "${RUN_DIR}/webrtc_profile.env.fingerprint"
+    "$(python_bin)" "${ROOT}/scripts/media_runtime.py" --mode h264 --role "${role}" --need-ros \
+      --root "${ROOT}" --profile "${RUN_DIR}/webrtc_profile.env"
+    ;;
   boostrap|bootsrap)
     log_warn "Interpreting '${cmd}' as 'bootstrap'."
     "${ROOT}/scripts/bootstrap.sh" "${2:-}"
     ;;
   launch)
     load_env
+    lock_instance
+    trap rollback_launch EXIT
     role="${2:-${HORUS_ROLE:-robot}}"
     no_monitor=0
     skip_dds_preflight=0
@@ -1690,6 +2050,7 @@ case "${cmd}" in
         exit 2
         ;;
     esac
+    export HORUS_ROLE="${role}"
     print_banner
     echo -e "${BOLD}${FG_CYAN}Launch ${role}${RESET} ${FG_MUTED}$(date '+%Y-%m-%d %H:%M:%S')${RESET}"
     echo -e "  role       ${BOLD}${role}${RESET}"
@@ -1721,6 +2082,8 @@ case "${cmd}" in
       echo -e "  teammate  ${FG_CYAN}${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}${RESET}"
       echo -e "  hololens  ${FG_CYAN}${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-unset}}${RESET}"
       echo -e "  fpv        ${FG_CYAN}${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}${RESET}, ROS compressed image"
+    elif native_media_configured; then
+      print_native_media_summary
     else
       if [[ "$(webrtc_control_enabled)" == "1" ]]; then
         echo -e "  control    ${FG_YELLOW}WebRTC DataChannel enabled${RESET}, ROS topic ${ROS_CMD_TOPIC:-/cmd_vel}"
@@ -1729,7 +2092,7 @@ case "${cmd}" in
       fi
       echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
     fi
-    if [[ "${role}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+    if [[ "${role}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]] && ! native_media_configured; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720}${RESET} @ ${FG_CYAN}${WEBRTC_VIDEO_FPS:-30} fps${RESET}, source ${WEBRTC_VIDEO_SOURCE:-ros2}"
       echo -e "  ros image  ${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-/camera/image_raw}"
       if [[ "${role}" == "robot" || "${role}" == "machine" ]]; then
@@ -1747,6 +2110,9 @@ case "${cmd}" in
       echo ""
     fi
 
+    if [[ "${role}" != "teammate" ]]; then
+      preflight_media "${role}"
+    fi
     log_info "Starting services for role: ${BOLD}${role}${RESET}"
     case "${role}" in
       robot)
@@ -1756,6 +2122,7 @@ case "${cmd}" in
           log_warn "Zenoh is disabled for this launch."
         fi
         launch_webrtc_robot
+        launch_source_media
         ;;
       machine)
         if zenoh_enabled; then
@@ -1768,6 +2135,7 @@ case "${cmd}" in
           log_warn "Zenoh is disabled for this launch."
         fi
         launch_webrtc_receiver machine
+        launch_media_relay
         ;;
       teammate)
         if zenoh_enabled; then
@@ -1797,10 +2165,13 @@ case "${cmd}" in
         ;;
     esac
     launch_metrics
+    trap - EXIT
+    exec {INSTANCE_LOCK}>&-
     open_monitor_after_launch "${no_monitor}"
     ;;
   stop)
     load_env
+    lock_instance
     print_banner
     echo -e "${BOLD}${FG_CYAN}Stop services${RESET}"
 
@@ -1808,24 +2179,33 @@ case "${cmd}" in
       local name="$1"
       local pid="${RUN_DIR}/${name}.pid"
       if [[ -f "${pid}" ]]; then
-        if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
+        if service_pid_owned "${name}"; then
           echo -e "  ${name}       stopping PID $(cat "${pid}")"
-          kill "$(cat "${pid}")" || true
-          sleep 1
-          if kill -0 "$(cat "${pid}")" >/dev/null 2>&1; then
-            kill -KILL "$(cat "${pid}")" || true
-          fi
+          stop_owned_service "${name}"
           echo -e "  ${name}       ${FG_GREEN}stopped${RESET}"
         else
-          echo -e "  ${name}       ${FG_MUTED}not running${RESET}"
+          echo -e "  ${name}       ${FG_MUTED}not running or PID no longer belongs to this service${RESET}"
         fi
-        rm -f "${pid}"
+        rm -f -- "${pid}" "${pid}.start"
       else
         echo -e "  ${name}       ${FG_MUTED}already stopped${RESET}"
       fi
     }
 
+    if [[ "${2:-}" == "--services" ]]; then
+      for name in "${@:3}"; do
+        [[ "${name}" =~ ^[a-zA-Z0-9_.-]+$ ]] || { log_error "Invalid service name."; exit 2; }
+        stop_one_styled "${name}"
+        if [[ "${name}" == "zenoh" ]]; then
+          stop_one_styled zenoh-sensing
+          stop_one_styled zenoh-bulk
+        fi
+      done
+      exit 0
+    fi
     stop_one_styled webrtc
+    stop_one_styled source-media
+    stop_one_styled media-relay
     for stream_pid in "${RUN_DIR}"/webrtc-*.pid; do
       [[ -e "${stream_pid}" ]] || continue
       stop_one_styled "$(basename "${stream_pid}" .pid)"
@@ -1833,13 +2213,7 @@ case "${cmd}" in
     stop_one_styled signal
     rm -f "${RUN_DIR}/signal_members.json"
     if turn_enabled; then
-      echo -e "  turn        stopping $(turn_service_name)"
-      stop_turn_relay
-      if turn_running; then
-        echo -e "  turn        ${FG_YELLOW}still running${RESET}"
-      else
-        echo -e "  turn        ${FG_GREEN}stopped${RESET}"
-      fi
+      echo -e "  turn        ${FG_MUTED}shared system service left unchanged${RESET}"
     else
       echo -e "  turn        ${FG_MUTED}disabled${RESET}"
     fi
@@ -1851,20 +2225,18 @@ case "${cmd}" in
       docker_cmd=(docker)
       [[ "${ZENOH_BRIDGE_DOCKER_SUDO:-0}" == "1" ]] && docker_cmd=(sudo -n docker)
       name="$(zenoh_docker_name "${HORUS_ROLE:-robot}")"
-      if "${docker_cmd[@]}" ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+      if [[ "$(timeout 10 "${docker_cmd[@]}" inspect --format '{{index .Config.Labels "horus.run_dir"}}' "${name}" 2>/dev/null || true)" == "${RUN_DIR}" ]]; then
         echo -e "  docker      stopping ${name}"
-        "${docker_cmd[@]}" rm -f "${name}" >/dev/null 2>&1 || true
+        timeout 15 "${docker_cmd[@]}" rm -f "${name}" >/dev/null 2>&1 || true
         echo -e "  docker      ${FG_GREEN}removed${RESET}"
       fi
     fi
 
     stop_one_styled zenoh
+    stop_one_styled zenoh-sensing
+    stop_one_styled zenoh-bulk
 
-    echo -e "  cleanup     stale connector processes"
-    stop_stale_project_processes
-    echo -e "  cleanup     ${FG_GREEN}complete${RESET}"
-
-    log_success "All services are stopped."
+    log_success "Tracked services are stopped."
     echo ""
     ;;
   status)
@@ -1886,6 +2258,8 @@ case "${cmd}" in
       echo -e "  teammate  ${FG_CYAN}${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}${RESET}"
       echo -e "  hololens  ${FG_CYAN}${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-unset}}${RESET}"
       echo -e "  fpv        ${FG_CYAN}${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}${RESET}"
+    elif native_media_configured; then
+      print_native_media_summary
     else
       echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
       if [[ "$(webrtc_control_enabled)" == "1" ]]; then
@@ -1894,7 +2268,7 @@ case "${cmd}" in
         echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}"
       fi
     fi
-    if [[ "${HORUS_ROLE:-robot}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
+    if [[ "${HORUS_ROLE:-robot}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]] && ! native_media_configured; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720} @ ${WEBRTC_VIDEO_FPS:-30} fps${RESET}"
       echo -e "  source     ${FG_CYAN}${WEBRTC_VIDEO_SOURCE:-ros2}${RESET}"
       if [[ "${WEBRTC_VIDEO_SOURCE:-ros2}" == "ros2" ]]; then
@@ -1916,8 +2290,8 @@ case "${cmd}" in
     else
       echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
     fi
-    if [[ -f "${ROOT}/.webrtc_profile.env" ]]; then
-      load_key_value_file "${ROOT}/.webrtc_profile.env"
+    if [[ -f "${RUN_DIR}/webrtc_profile.env" ]]; then
+      load_key_value_file "${RUN_DIR}/webrtc_profile.env"
       encoder="${GST_H264_ENCODER_NAME:-unknown}"
       decoder="${GST_H264_DECODER_NAME:-unknown}"
       accel="${VIDEO_ENCODER_ACCEL:-${VIDEO_DECODER_ACCEL:-auto}}"
@@ -2020,7 +2394,7 @@ case "${cmd}" in
           exit 1
         fi
         ;;
-      zenoh|webrtc|webrtc-*|signal|metrics|teammate|fake-data)
+      zenoh|webrtc|webrtc-*|source-media|media-relay|signal|metrics|teammate|fake-data)
       print_banner
         log_file="${RUN_DIR}/${service}.log"
         size_bytes=0

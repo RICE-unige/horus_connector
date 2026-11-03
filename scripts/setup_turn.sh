@@ -44,8 +44,7 @@ fi
 if ! command -v turnserver >/dev/null 2>&1; then
   echo "TURN requested, but coturn is not installed." >&2
   echo "Install it with: sudo apt-get update && sudo apt-get install -y coturn" >&2
-  echo "Continuing without a local TURN relay." >&2
-  exit 0
+  exit 1
 fi
 
 run_root() {

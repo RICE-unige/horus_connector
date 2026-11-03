@@ -50,24 +50,12 @@ def tls_block(args: argparse.Namespace, indent: str) -> list[str]:
 def insert_tls(text: str, block: list[str]) -> str:
     if not block:
         return text
-    if re.search(r"(?m)^\s*tls\s*:\s*\{", text):
-        return text
-
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        match = re.match(r"^(\s*)link\s*:\s*\{\s*(?://.*)?$", line)
-        if not match:
-            continue
-        indent = match.group(1) + "  "
-        adjusted = []
-        base_indent = len(block[0]) - len(block[0].lstrip())
-        for item in block:
-            item_indent = len(item) - len(item.lstrip())
-            adjusted.append(" " * (len(indent) + item_indent - base_indent) + item.lstrip())
-        lines[index + 1:index + 1] = adjusted
-        return "\n".join(lines) + "\n"
-
-    raise SystemExit("Could not find transport.link block in Zenoh config; cannot inject TLS settings.")
+    import json5
+    document = json5.loads(text)
+    link = document.setdefault("transport", {}).setdefault("link", {})
+    if "tls" not in link:
+        link["tls"] = json5.loads("{" + "\n".join(block) + "}")["tls"]
+    return json.dumps(document, indent=2) + "\n"
 
 
 def parse_bool(value: str | None) -> bool | None:

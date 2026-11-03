@@ -2,11 +2,14 @@
 """Robot-side H.264 WebRTC video sender."""
 
 import argparse
+import gc
 import json
 import logging
 import math
 import os
+import signal
 import time
+import uuid
 from pathlib import Path
 
 import gi
@@ -26,9 +29,12 @@ from ros_image_io import RosImageAppSrc, ensure_rclpy
 from webrtc_control import CommandGate, command_authorized
 from webrtc_stats import BitrateController, extract_network_sample
 from webrtc_streams import load_session, load_streams, ros_safe_name
+from media_health import RecoveryBackoff, allocate_bitrates, write_status
 
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
+gi.require_version("GstRtp", "1.0")
+from gi.repository import GstRtp
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +103,15 @@ class H264RobotSender:
     def __init__(self, args):
         self.args = args
         self.session, self.streams = self._load_stream_configuration()
-        if len(self.streams) > 1:
+        if self.args.streams_config:
             self.args.room = self.session["room"]
             self.args.video_bitrate_kbit = sum(stream["bitrate_kbit"] for stream in self.streams)
             self.args.min_bitrate_kbit = sum(stream["min_bitrate_kbit"] for stream in self.streams)
             self.args.max_bitrate_kbit = sum(stream["max_bitrate_kbit"] for stream in self.streams)
+            budget = self.session.get("bitrate_budget_kbit", 0)
+            if budget:
+                self.args.max_bitrate_kbit = min(budget, self.args.max_bitrate_kbit)
+                self.args.video_bitrate_kbit = min(self.args.video_bitrate_kbit, budget)
         if self.args.max_bitrate_kbit < self.args.min_bitrate_kbit:
             self.args.max_bitrate_kbit = self.args.min_bitrate_kbit
         self.profile = load_env_file(args.profile)
@@ -151,12 +161,31 @@ class H264RobotSender:
         self.pipeline_ready = False
         self.relay_mode = bool(args.signaling_url)
         self.peer_ready = not self.relay_mode
+        self.peer_session_id = ""
         self.command_gate = CommandGate(args.cmd_max_age_ms, args.cmd_max_future_ms)
         self.estop_latched = False
         self.recovering = False
         self.negotiation_in_progress = False
         self.offer_pending = False
         self.last_remote_answer_sdp = ""
+        self.stopped = False
+        self.generation = 0
+        self.negotiation_id = ""
+        self.negotiation_started = 0.0
+        self.stats_started = 0.0
+        self.bus = None
+        self.bus_handler = None
+        self.media_handlers = []
+        self.media_probes = []
+        self.request_pads = []
+        self.recovery_timer = None
+        self.recovery_backoff = RecoveryBackoff()
+        self.duration_timer = None
+        self.health_timer = None
+        self.rtp_frames = {}
+        self.rtp_last = {}
+        self.last_rtp_timestamp = {}
+        self.observation_start = time.monotonic()
         self.signaling = self._make_signaling()
         if self.args.enable_control:
             self._publish_zero_command("startup")
@@ -184,9 +213,14 @@ class H264RobotSender:
         os.environ["HORUS_STREAMS_CONFIG"] = self.args.streams_config
         root = Path(self.args.root).resolve()
         session = load_session(root, "robot")
+        streams = load_streams(root, "robot")
+        if getattr(self.args, "stream_id", ""):
+            streams = [stream for stream in streams if stream["id"] == self.args.stream_id]
+            if len(streams) != 1:
+                raise SystemExit(f"Unknown or disabled camera stream: {self.args.stream_id}")
+            return {**session, "mode": "isolated", "room": streams[0]["room"]}, streams
         if session["mode"] != "bundled":
             raise SystemExit("--streams-config requires session.mode=bundled (or HORUS_WEBRTC_SESSION_MODE=bundled)")
-        streams = load_streams(root, "robot")
         if len(streams) > 32:
             raise SystemExit("A bundled WebRTC session supports at most 32 H.264 tracks")
         return session, streams
@@ -226,11 +260,17 @@ class H264RobotSender:
         return self.profile.get("GST_H264_ENCODER_PREPROCESS", "") or "videoconvert"
 
     def _source_transform(self, stream: dict) -> str:
-        if stream["video_source"] != "ros2":
-            return ""
+        if stream["video_source"] == "ros2":
+            suffix = ros_safe_name(stream["id"])
+            return (
+                f"videoconvert ! videoscale add-borders=false ! capsfilter name=scale_caps_{suffix} ! "
+                f"videobox name=padding_{suffix} ! video/x-raw,width={stream['width']},height={stream['height']},"
+                f"pixel-aspect-ratio=1/1,framerate={stream['fps']}/1 ! ")
+        rate_filter = "" if stream["video_source"] == "ros2" else "videorate drop-only=true ! "
+        borders = "true" if stream.get("resize_mode", "letterbox") == "letterbox" else "false"
         return (
-            "videoconvert ! videoscale ! "
-            f"video/x-raw,width={stream['width']},height={stream['height']} ! "
+            f"videoconvert ! videoscale add-borders={borders} ! {rate_filter}"
+            f"video/x-raw,width={stream['width']},height={stream['height']},pixel-aspect-ratio=1/1,framerate={stream['fps']}/1 ! "
         )
 
     def _media_bin_description(self, stream: dict, index: int) -> str:
@@ -240,11 +280,10 @@ class H264RobotSender:
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
             f"{self._source_transform(stream)}"
             f"{self._encoder_preprocess()} ! "
-            f"{f'identity name=frameclock_{index} signal-handoffs=true silent=true ! ' if self.args.latency_probe else ''}"
             f"{self._encoder(encoder_name)} ! "
             "h264parse config-interval=1 ! "
             "video/x-h264,stream-format=byte-stream,alignment=au ! "
-            f"rtph264pay pt={96 + index} config-interval=1 mtu=1200 aggregate-mode=zero-latency"
+            f"rtph264pay name=payloader_{index} pt={96 + index} config-interval=1 mtu=1200 aggregate-mode=zero-latency"
         )
 
     def _build_pipeline(self):
@@ -255,6 +294,7 @@ class H264RobotSender:
         configure_webrtcbin(self.webrtc, self.args.ice_servers, self.args.ice_transport_policy)
         pipeline.add(self.webrtc)
         self.ros_image_sources = []
+        self.sources_by_id = {}
         self.encoders = []
         for index, stream in enumerate(self.streams):
             media = Gst.parse_bin_from_description(self._media_bin_description(stream, index), True)
@@ -270,14 +310,20 @@ class H264RobotSender:
                     node_name=f"horus_webrtc_source_{ros_safe_name(stream['id'])}",
                 )
                 self.ros_image_sources.append(source)
+                source.camera_info_topic = stream.get("input_camera_info_topic", "")
+                source.output_size = (stream["width"], stream["height"])
+                source.resize_mode = stream.get("resize_mode", "letterbox")
+                source.scale_caps = media.get_by_name(f"scale_caps_{ros_safe_name(stream['id'])}")
+                source.padding = media.get_by_name(f"padding_{ros_safe_name(stream['id'])}")
+                self.sources_by_id[stream["id"]] = source
             encoder = media.get_by_name(f"video_encoder_{index}")
             if encoder is not None:
                 self.encoders.append((stream, encoder))
-            if self.args.latency_probe:
-                frameclock = media.get_by_name(f"frameclock_{index}")
-                if frameclock is None:
-                    raise RuntimeError(f"failed to create latency probe for {stream['id']}")
-                frameclock.connect("handoff", self._on_frame_clock_handoff, stream["id"])
+            probe_pad = media.get_by_name(f"payloader_{index}").get_static_pad("src")
+            probe_id = probe_pad.add_probe(
+                Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST,
+                self._on_rtp_sent, (self.generation, stream["id"]))
+            self.media_probes.append((probe_pad, probe_id))
             pipeline.add(media)
             srcpad = media.get_static_pad("src")
             request_pad_simple = getattr(self.webrtc, "request_pad_simple", None)
@@ -286,20 +332,25 @@ class H264RobotSender:
                 sinkpad = self.webrtc.get_request_pad("sink_%u")
             if sinkpad is None:
                 raise RuntimeError("failed to request webrtcbin sink pad; install gstreamer1.0-nice and rerun bootstrap")
+            self.request_pads.append(sinkpad)
             if sinkpad.find_property("msid"):
-                sinkpad.set_property("msid", f"horus-{ros_safe_name(self.session['id'])} {stream['id']}")
+                sinkpad.set_property("msid", stream["id"])
+            elif len(self.streams) > 1:
+                raise RuntimeError("Bundled cameras require GStreamer 1.22+ with negotiated MSID identity")
             result = srcpad.link(sinkpad)
             if result != Gst.PadLinkReturn.OK:
                 raise RuntimeError(f"failed to link {stream['id']} to webrtcbin: {result}")
         self.encoder = self.encoders[0][1] if self.encoders else None
         self.ros_image_source = self.ros_image_sources[0] if self.ros_image_sources else None
         if self.encoders:
-            self._set_encoder_bitrate(self.current_bitrate_kbit, announce=False)
+            self._set_encoder_bitrate(self.current_bitrate_kbit or self.args.video_bitrate_kbit, announce=False)
         return pipeline
 
     def start(self):
         Gst.init(None)
         ensure_webrtc_runtime()
+        signal.signal(signal.SIGTERM, lambda *_: GLib.idle_add(self.stop))
+        signal.signal(signal.SIGINT, lambda *_: GLib.idle_add(self.stop))
         for index, stream in enumerate(self.streams):
             print(f"Robot media track {stream['id']}: {self._media_bin_description(stream, index)}", flush=True)
         if not self.relay_mode:
@@ -308,24 +359,37 @@ class H264RobotSender:
         if not self.relay_mode:
             self._ensure_adaptive_bitrate()
         self.signaling.start()
+        self.health_timer = GLib.timeout_add_seconds(1, self._media_health)
         if self.args.duration > 0:
-            GLib.timeout_add_seconds(int(self.args.duration), self.stop)
+            self.duration_timer = GLib.timeout_add(max(1, int(self.args.duration * 1000)), self.stop)
         try:
             self.loop.run()
         finally:
             self.stop()
 
     def _start_pipeline(self):
+        if self.stopped:
+            return
+        from media_health import recycle_media_process
+        if self.generation and recycle_media_process(self):
+            return
+        self.generation += 1
+        self.negotiation_id = uuid.uuid4().hex
+        self.signaling.reset_negotiation(self.negotiation_id)
         self.data_channels_supported = True
         self.pipeline_ready = False
         self.pipeline = self._build_pipeline()
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
-        self.webrtc.connect("on-negotiation-needed", self._on_negotiation_needed)
-        self.webrtc.connect("on-ice-candidate", self._on_ice_candidate)
+        self.bus_handler = bus.connect("message", self._on_bus_message)
+        self.bus = bus
+        # Keep one bus watch/handler per pipeline generation.
+        for name in ("ice-connection-state", "connection-state"):
+            self._connect_media(self.webrtc, f"notify::{name}", self._on_connection_state, name)
+        self._connect_media(self.webrtc, "on-negotiation-needed", self._on_negotiation_needed)
+        self._connect_media(self.webrtc, "on-ice-candidate", self._on_ice_candidate)
         try:
-            self.webrtc.connect("on-data-channel", self._on_data_channel)
+            self._connect_media(self.webrtc, "on-data-channel", self._on_data_channel)
         except TypeError:
             self.data_channels_supported = False
             print("WebRTC DataChannel unavailable in this GStreamer runtime; cmd_vel over WebRTC disabled", flush=True)
@@ -335,10 +399,10 @@ class H264RobotSender:
         self._create_local_data_channels()
 
     def _create_local_data_channels(self):
-        if self.args.latency_probe and self.data_channels_supported:
-            self.frame_clock_channel = self.webrtc.emit("create-data-channel", "frame-clock", None)
+        if (self.args.latency_probe or self.ros_image_sources) and self.data_channels_supported:
+            self.frame_clock_channel = self.webrtc.emit("create-data-channel", "frame-clock", data_channel_options(ordered=False, max_retransmits=0))
             if self.frame_clock_channel is not None:
-                self.frame_clock_channel.connect("on-open", self._on_frame_clock_open)
+                self._connect_media(self.frame_clock_channel, "on-open", self._on_frame_clock_open)
             else:
                 print("frame latency DataChannel unavailable; continuing without latency samples", flush=True)
         if self.args.enable_control and self.args.ros_cmd_topic and self.data_channels_supported:
@@ -358,34 +422,75 @@ class H264RobotSender:
         self.watchdog_source_id = GLib.timeout_add(100, self._watchdog_check)
 
     def stop(self):
+        if self.stopped:
+            return False
+        self.stopped = True
+        for name in ("watchdog_source_id", "adaptive_source_id", "recovery_timer", "duration_timer", "health_timer"):
+            source = getattr(self, name)
+            if source:
+                GLib.source_remove(source)
+                setattr(self, name, None)
+        self.signaling.close()
         if self.args.enable_control:
             self._publish_zero_command("shutdown")
         self._stop_media_pipeline()
+        write_status(os.environ.get("HORUS_MEDIA_STATUS_FILE"), {"role": "robot", "state": "stopped", "tracks": {}})
         self.control.close()
         if self.loop.is_running():
             self.loop.quit()
         return False
 
+    def _connect_media(self, element, name, callback, *args):
+        self.media_handlers.append((element, element.connect(name, callback, *args)))
+
     def _stop_media_pipeline(self):
+        if self.recovery_timer is not None:
+            source = GLib.MainContext.default().find_source_by_id(self.recovery_timer)
+            if source is not None:
+                source.destroy()
+            self.recovery_timer = None
+        self.generation += 1
+        for element, handler in self.media_handlers:
+            if element.handler_is_connected(handler):
+                element.disconnect(handler)
+        self.media_handlers.clear()
+        for pad, probe in self.media_probes:
+            pad.remove_probe(probe)
+        self.media_probes.clear()
+        if self.bus is not None:
+            if self.bus_handler is not None:
+                self.bus.disconnect(self.bus_handler)
+            self.bus.remove_signal_watch()
+            self.bus = self.bus_handler = None
         for source in self.ros_image_sources:
             source.close()
         self.ros_image_sources = []
         self.ros_image_source = None
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
+            for pad in self.request_pads:
+                if self.webrtc is not None:
+                    self.webrtc.release_request_pad(pad)
             self.pipeline = None
+        self.request_pads.clear()
+        self.sources_by_id.clear()
         self.pipeline_ready = False
         self.webrtc = None
         self.encoder = None
         self.encoders = []
         self.frame_clock_channel = None
         self.frame_clock_open = False
+        self.rtp_last.clear()
+        self.last_rtp_timestamp.clear()
         self.negotiation_in_progress = False
         self.offer_pending = False
         self.last_remote_answer_sdp = ""
         self.stats_request_in_flight = False
+        gc.collect()
 
     def _on_negotiation_needed(self, _element):
+        if self.stopped or _element is not self.webrtc:
+            return
         if self.webrtc is None:
             self.offer_pending = True
             return
@@ -396,14 +501,17 @@ class H264RobotSender:
             self.offer_pending = True
             return
         if self.negotiation_in_progress:
-            self.offer_pending = True
             return
         self.offer_pending = False
         self.negotiation_in_progress = True
-        promise = Gst.Promise.new_with_change_func(self._on_offer_created, None)
+        self.negotiation_started = time.monotonic()
+        promise = Gst.Promise.new_with_change_func(self._on_offer_created, (self.generation, self.webrtc))
         self.webrtc.emit("create-offer", None, promise)
 
     def _on_offer_created(self, promise, _user_data):
+        generation, element = _user_data
+        if self.stopped or generation != self.generation or element is not self.webrtc:
+            return
         promise.wait()
         reply = promise.get_reply()
         offer = reply.get_value("offer") if reply is not None else None
@@ -411,12 +519,14 @@ class H264RobotSender:
             self.negotiation_in_progress = False
             detail = reply.to_string() if reply is not None else "no promise reply"
             print(f"failed to create WebRTC offer: {detail}", flush=True)
-            self.stop()
+            GLib.idle_add(self._schedule_recovery)
             return
         self.webrtc.emit("set-local-description", offer, Gst.Promise.new())
         self.signaling.send({"type": "offer", "sdp": offer.sdp.as_text()})
 
     def _on_bus_message(self, _bus, message):
+        if self.stopped or _bus is not self.bus:
+            return
         if message.type == Gst.MessageType.STATE_CHANGED and message.src is self.pipeline:
             _old_state, new_state, _pending_state = message.parse_state_changed()
             if new_state == Gst.State.PLAYING:
@@ -430,11 +540,15 @@ class H264RobotSender:
             error, debug = message.parse_error()
             print(f"GStreamer error from {message.src.get_name()}: {error}; {debug}", flush=True)
             self._publish_zero_command("GStreamer error")
+            from media_runtime import invalidate_profile
+            if invalidate_profile(self.args.profile, message.src):
+                self.codec_exit_code = 75
+                self.stop()
+                return
             self._adaptive_downshift("GStreamer error")
-            if not self.recovering:
-                self.recovering = True
-                print("GStreamer recovery scheduled in 2 seconds", flush=True)
-                GLib.timeout_add_seconds(2, self._recover_pipeline)
+            self._schedule_recovery()
+        elif message.type == Gst.MessageType.EOS:
+            self._schedule_recovery()
         elif message.type == Gst.MessageType.WARNING:
             self.pipeline_warning_count += 1
             warning, debug = message.parse_warning()
@@ -467,11 +581,16 @@ class H264RobotSender:
             print(f"{reason}: zero /cmd_vel published", flush=True)
 
     def _recover_pipeline(self):
+        self.recovery_timer = None
+        if self.stopped:
+            return False
         print("Recovering robot GStreamer pipeline", flush=True)
         try:
             self._stop_media_pipeline()
             if not self.relay_mode or self.peer_ready:
                 self._start_pipeline()
+                if self.stopped:
+                    return False
                 self.offer_pending = True
             self.recovering = False
             print(
@@ -481,11 +600,13 @@ class H264RobotSender:
                 flush=True,
             )
         except Exception as exc:
-            print(f"Robot GStreamer recovery failed: {exc}; retrying in 5 seconds", flush=True)
-            GLib.timeout_add_seconds(5, self._recover_pipeline)
+            print(f"Robot GStreamer recovery failed: {exc}", flush=True)
+            self._schedule_recovery()
         return False
 
     def _on_ice_candidate(self, _element, mlineindex, candidate):
+        if self.stopped or _element is not self.webrtc:
+            return
         if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
             print(f"Local ICE candidate: {candidate}", flush=True)
         self.signaling.send({"type": "ice", "sdpMLineIndex": int(mlineindex), "candidate": candidate})
@@ -494,6 +615,8 @@ class H264RobotSender:
         GLib.idle_add(self._handle_signaling_message_in_loop, message)
 
     def _handle_signaling_message_in_loop(self, message: dict):
+        if self.stopped:
+            return False
         kind = message.get("type")
         if kind == "registered":
             ice_servers = ice_servers_from_registration(self.args.ice_servers, message)
@@ -504,21 +627,36 @@ class H264RobotSender:
                 print("Applied broker-issued TURN credentials to the robot session", flush=True)
             if self.relay_mode:
                 self.peer_ready = bool(message.get("peer_ready", False))
+                self.peer_session_id = str(message.get("peer_session_id") or "")
                 if self.peer_ready:
-                    self._start_relay_media_session()
+                    self._start_relay_media_session(force_rebuild=self.pipeline is not None)
             return False
         if kind == "peer-ready" and message.get("role") == "machine":
+            peer_session_id = str(message.get("peer_session_id") or "")
+            if peer_session_id and peer_session_id == self.peer_session_id and self.peer_ready and self.pipeline is not None:
+                return False
+            self.peer_session_id = peer_session_id
             self.peer_ready = True
             print("Machine peer is ready; starting a fresh WebRTC media session", flush=True)
             self._start_relay_media_session(force_rebuild=self.pipeline is not None)
             return False
         if kind == "peer-left" and message.get("role") == "machine":
             self.peer_ready = False
+            self.peer_session_id = ""
             self._publish_zero_command("machine peer disconnected")
             self._stop_media_pipeline()
             print("Machine peer left; robot media is idle", flush=True)
             return False
+        if kind == "restart":
+            self.peer_ready = True
+            self._stop_media_pipeline()
+            self._start_pipeline()
+            self.offer_pending = True
+            self._request_offer()
+            return False
         if kind == "answer":
+            if self.webrtc is None or message.get("negotiation_id", "") not in {"", self.negotiation_id}:
+                return False
             sdp = message.get("sdp", "")
             if not sdp or sdp == self.last_remote_answer_sdp:
                 return False
@@ -528,18 +666,21 @@ class H264RobotSender:
             self.negotiation_in_progress = False
             self.offer_pending = False
         elif kind == "ice":
+            if self.webrtc is None or message.get("negotiation_id", "") not in {"", self.negotiation_id}:
+                return False
             if os.environ.get("HORUS_WEBRTC_DEBUG_ICE") == "1":
                 print(f"Remote ICE candidate: {message.get('candidate', '')}", flush=True)
             self.webrtc.emit("add-ice-candidate", int(message["sdpMLineIndex"]), message["candidate"])
         return False
 
     def _on_signaling_connected(self):
-        if self.relay_mode:
-            GLib.idle_add(self._start_relay_media_session)
-        else:
+        # Relay registration/peer-ready messages own startup; do not negotiate twice.
+        if not self.relay_mode:
             GLib.idle_add(self._request_offer)
 
     def _request_offer(self):
+        if self.stopped:
+            return False
         if self.webrtc is None:
             self.offer_pending = True
             return False
@@ -547,12 +688,16 @@ class H264RobotSender:
         return False
 
     def _start_relay_media_session(self, force_rebuild=False):
+        if self.stopped:
+            return False
         if not self.relay_mode or not self.peer_ready or not self.signaling.connected.is_set():
             return False
         if force_rebuild and self.pipeline is not None:
             self._stop_media_pipeline()
         if self.pipeline is None:
             self._start_pipeline()
+            if self.stopped:
+                return False
             self._ensure_adaptive_bitrate()
             print("Robot WebRTC media pipeline started for the active machine peer", flush=True)
         self.offer_pending = True
@@ -560,6 +705,8 @@ class H264RobotSender:
         return False
 
     def _on_data_channel(self, _webrtc, channel):
+        if self.stopped or _webrtc is not self.webrtc:
+            return
         label = channel.props.label
         print(f"DataChannel received: {label}", flush=True)
         if label != "cmd-vel":
@@ -572,10 +719,13 @@ class H264RobotSender:
     def _attach_control_channel(self, channel):
         if channel is None:
             return
-        channel.connect("on-open", self._on_control_channel_open)
-        channel.connect("on-close", self._on_control_channel_close)
-        channel.connect("on-error", self._on_control_channel_error)
-        channel.connect("on-message-string", self._on_control_message)
+        generation = self.generation
+        for name, callback in (("on-open", self._on_control_channel_open),
+                               ("on-close", self._on_control_channel_close),
+                               ("on-error", self._on_control_channel_error),
+                               ("on-message-string", self._on_control_message)):
+            self._connect_media(channel, name, lambda *args, callback=callback: callback(*args)
+                                if not self.stopped and generation == self.generation else None)
 
     def _on_control_channel_open(self, _channel):
         print("cmd-vel DataChannel open", flush=True)
@@ -649,25 +799,87 @@ class H264RobotSender:
         channel.emit("send-string", json.dumps(ack, separators=(",", ":")))
 
     def _on_frame_clock_open(self, _channel):
+        if self.stopped or _channel is not self.frame_clock_channel:
+            return
         self.frame_clock_open = True
         print("frame latency DataChannel open", flush=True)
 
-    def _on_frame_clock_handoff(self, _identity, _buffer, stream_id="primary"):
-        if not self.frame_clock_open or self.frame_clock_channel is None:
-            return
+    def _on_rtp_sent(self, _pad, info, context):
+        generation, stream_id = context
+        if self.stopped or generation != self.generation:
+            return Gst.PadProbeReturn.OK
+        buffers = info.get_buffer_list() if info.type & Gst.PadProbeType.BUFFER_LIST else None
+        items = [buffers.get(index) for index in range(buffers.length())] if buffers is not None else [info.get_buffer()]
+        for buffer in items:
+            if buffer is None:
+                continue
+            ok, rtp = GstRtp.RTPBuffer.map(buffer, Gst.MapFlags.READ)
+            if not ok:
+                continue
+            try:
+                timestamp = int(rtp.get_timestamp())
+            finally:
+                rtp.unmap()
+            if self.last_rtp_timestamp.get(stream_id) == timestamp:
+                continue
+            self.last_rtp_timestamp[stream_id] = timestamp
+            self.rtp_frames[stream_id] = self.rtp_frames.get(stream_id, 0) + 1
+            self.rtp_last[stream_id] = time.monotonic()
+            if self.frame_clock_open and self.frame_clock_channel is not None:
+                payload = {"type": "frame_clock", "seq": self.rtp_frames[stream_id],
+                           "sent_ns": time.time_ns(), "stage": "rtp_frame_sent",
+                           "stream_id": stream_id, "rtp_timestamp": timestamp,
+                           "negotiation_id": self.negotiation_id}
+                source = self.sources_by_id.get(stream_id)
+                segment_event = _pad.get_sticky_event(Gst.EventType.SEGMENT, 0)
+                if source is not None and segment_event is not None:
+                    segment = segment_event.parse_segment()
+                    running_time = segment.to_running_time(Gst.Format.TIME, buffer.pts)
+                    metadata = source.metadata_for_running_time(int(running_time))
+                    if metadata is not None:
+                        payload["source"] = metadata
+                self.frame_clock_channel.emit("send-string", json.dumps(payload, separators=(",", ":")))
+        return Gst.PadProbeReturn.OK
+
+    def _media_health(self):
+        if self.stopped:
+            return False
         now = time.monotonic()
-        if self.args.latency_probe_rate > 0 and now - self.frame_clock_last_sec < 1.0 / self.args.latency_probe_rate:
-            return
-        self.frame_clock_last_sec = now
-        payload = {
-            "type": "frame_clock",
-            "seq": self.frame_clock_seq,
-            "sent_ns": time.time_ns(),
-            "stage": "rtp_payloader_handoff",
-            "stream_id": stream_id,
-        }
-        self.frame_clock_channel.emit("send-string", json.dumps(payload, separators=(",", ":")))
-        self.frame_clock_seq += 1
+        if self.webrtc is not None and not self.recovering and now - self.negotiation_started >= 30:
+            if getattr(self.webrtc.get_property("connection-state"), "value_nick", "") == "connected":
+                self.recovery_backoff.reset()
+        if self.negotiation_in_progress and now - self.negotiation_started > 15:
+            self._schedule_recovery()
+        tracks = {}
+        bitrates = {stream["id"]: value for (stream, _), value in zip(getattr(self, "encoders", []),
+                    getattr(self, "applied_track_bitrates", []))}
+        for stream in self.streams:
+            key = stream["id"]
+            last = self.rtp_last.get(key)
+            tracks[key] = {"rtp_frames": self.rtp_frames.get(key, 0),
+                           "applied_bitrate_kbit": bitrates.get(key),
+                           "frame_age_sec": None if last is None else now - last,
+                           "state": "waiting" if last is None else "flowing" if now - last < 3 else "stale"}
+            source = getattr(self, "sources_by_id", {}).get(key)
+            if source is not None:
+                tracks[key]["source_frame_age_sec"] = None if not math.isfinite(source.last_push_sec) else now - source.last_push_sec
+                tracks[key]["rate_dropped"] = source.rate_dropped
+                tracks[key]["source_received_frames"] = source.total_received
+                tracks[key]["source_pushed_frames"] = source.total_pushed
+                # Active ROS input with a stalled encoder is different from a stopped publisher.
+                waiting = now - self.negotiation_started > 15 if last is None else now - last > 5
+                connected = self.webrtc is not None and getattr(self.webrtc.get_property("connection-state"), "value_nick", "") == "connected"
+                if connected and waiting and now - source.last_push_sec < 2:
+                    self._schedule_recovery()
+        write_status(os.environ.get("HORUS_MEDIA_STATUS_FILE"),
+                     {"role": "robot", "signaling_connected": self.signaling.connected.is_set(),
+                      "state": "recovering" if self.recovery_timer is not None else "running",
+                      "generation": self.generation, "tracks": tracks,
+                      "recovery_attempts": self.recovery_backoff.attempts,
+                      "applied_bitrate_kbit": self.current_bitrate_kbit})
+        if self.signaling.connected.is_set() and self.negotiation_id:
+            self.signaling.send({"type": "media-status", "negotiation_id": self.negotiation_id, "tracks": tracks})
+        return True
 
     def _ensure_adaptive_bitrate(self):
         if not self.args.adaptive_bitrate or self.adaptive_source_id is not None:
@@ -688,19 +900,27 @@ class H264RobotSender:
         return int(kbit)
 
     def _set_encoder_bitrate(self, kbit: int, announce: bool = True) -> bool:
-        self.current_bitrate_kbit = max(self.args.min_bitrate_kbit, min(kbit, self.args.max_bitrate_kbit))
         if not self.encoders:
             return False
-        configured_total = max(1, sum(stream["bitrate_kbit"] for stream, _encoder in self.encoders))
+        allocation = allocate_bitrates([stream for stream, _encoder in self.encoders], kbit)
         updated = 0
+        applied = 0
+        original = []
         try:
-            for stream, encoder in self.encoders:
+            for _stream, encoder in self.encoders:
                 if encoder.find_property("bitrate") is None:
-                    continue
-                share = int(round(self.current_bitrate_kbit * stream["bitrate_kbit"] / configured_total))
-                share = max(stream["min_bitrate_kbit"], min(share, stream["max_bitrate_kbit"]))
+                    raise RuntimeError(f"{encoder.get_name()} has no runtime bitrate property")
+                original.append(encoder.get_property("bitrate"))
+            for (stream, encoder), share in zip(self.encoders, allocation):
+                if encoder.find_property("bitrate") is None:
+                    raise RuntimeError(f"{encoder.get_name()} has no runtime bitrate property")
                 encoder.set_property("bitrate", self._encoder_bitrate_value(share))
+                value = encoder.get_property("bitrate")
+                applied += int(value / 1000) if self._encoder_bitrate_value(1) == 1000 else int(value)
                 updated += 1
+            self.current_bitrate_kbit = applied
+            self.applied_track_bitrates = [int(encoder.get_property("bitrate") / 1000) if self._encoder_bitrate_value(1) == 1000
+                                          else int(encoder.get_property("bitrate")) for _stream, encoder in self.encoders]
             if announce:
                 print(
                     f"Adaptive WebRTC session bitrate set to {self.current_bitrate_kbit} kbit/s "
@@ -709,11 +929,25 @@ class H264RobotSender:
                 )
             return updated > 0
         except Exception as exc:
-            print(f"Adaptive WebRTC bitrate update skipped: {exc}", flush=True)
+            for (_stream, encoder), value in zip(self.encoders, original):
+                try:
+                    encoder.set_property("bitrate", value)
+                except Exception:
+                    logger.warning("Could not restore encoder bitrate", exc_info=True)
+            actual = []
+            for _stream, encoder in self.encoders:
+                try:
+                    value = encoder.get_property("bitrate")
+                    actual.append(int(value / 1000) if self._encoder_bitrate_value(1) == 1000 else int(value))
+                except Exception:
+                    actual.append(None)
+            self.applied_track_bitrates = actual
+            self.current_bitrate_kbit = sum(actual) if all(value is not None for value in actual) else None
+            print(f"Adaptive bitrate update failed; actual per-track kbit/s={actual}: {exc}", flush=True)
             return False
 
     def _adaptive_downshift(self, reason: str):
-        if not self.args.adaptive_bitrate:
+        if not self.args.adaptive_bitrate or self.current_bitrate_kbit is None:
             return
         next_bitrate = max(self.args.min_bitrate_kbit, self.current_bitrate_kbit - self.args.bitrate_step_kbit)
         if next_bitrate < self.current_bitrate_kbit:
@@ -721,6 +955,16 @@ class H264RobotSender:
             self._set_encoder_bitrate(next_bitrate)
 
     def _adaptive_bitrate_check(self) -> bool:
+        if self.current_bitrate_kbit is None:
+            self._set_encoder_bitrate(self.args.video_bitrate_kbit)
+            return True
+        if self.stopped:
+            return False
+        now = time.monotonic()
+        if self.negotiation_in_progress and now - self.negotiation_started > 15:
+            self._schedule_recovery()
+        if self.stats_request_in_flight and now - self.stats_started > 5:
+            self.stats_request_in_flight = False
         if self.encoder is None:
             return True
         warning_changed = self.pipeline_warning_count != self.last_adaptive_warning_count
@@ -733,11 +977,14 @@ class H264RobotSender:
         if not self.signaling.connected.is_set() or self.webrtc is None or self.stats_request_in_flight:
             return True
         self.stats_request_in_flight = True
-        promise = Gst.Promise.new_with_change_func(self._on_stats_ready, None)
+        self.stats_started = now
+        promise = Gst.Promise.new_with_change_func(self._on_stats_ready, (self.generation, self.stats_started))
         self.webrtc.emit("get-stats", None, promise)
         return True
 
     def _on_stats_ready(self, promise, _user_data):
+        if self.stopped or _user_data != (self.generation, self.stats_started):
+            return
         try:
             promise.wait()
             reply = promise.get_reply()
@@ -746,9 +993,11 @@ class H264RobotSender:
             logger.debug("WebRTC get-stats failed", exc_info=True)
             print(f"WebRTC stats unavailable: {exc}", flush=True)
             sample = None
-        GLib.idle_add(self._apply_network_sample, sample)
+        GLib.idle_add(self._apply_network_sample, sample, _user_data)
 
-    def _apply_network_sample(self, sample):
+    def _apply_network_sample(self, sample, generation=None):
+        if self.stopped or (generation is not None and generation != (self.generation, self.stats_started)):
+            return False
         self.stats_request_in_flight = False
         if sample is None:
             return False
@@ -765,11 +1014,23 @@ class H264RobotSender:
             )
         return False
 
+    def _schedule_recovery(self):
+        if not self.stopped and self.recovery_timer is None:
+            self.recovering = True
+            delay = self.recovery_backoff.next_delay()
+            print(f"Robot media recovery scheduled in {delay} seconds", flush=True)
+            self.recovery_timer = GLib.timeout_add_seconds(delay, self._recover_pipeline)
+
+    def _on_connection_state(self, element, _pspec, name):
+        if element is self.webrtc and getattr(element.get_property(name), "value_nick", "") == "failed":
+            GLib.idle_add(self._schedule_recovery)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--streams-config", default="")
+    parser.add_argument("--stream-id", default="")
     parser.add_argument("--signaling-url", default="")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
@@ -822,7 +1083,17 @@ def parse_args():
 
 
 def main():
-    H264RobotSender(parse_args()).start()
+    from media_runtime import invalidate_profile, recover_profile
+    args = parse_args()
+    recover_profile(args, "robot")
+    sender = H264RobotSender(args)
+    try:
+        sender.start()
+    except (RuntimeError, GLib.Error):
+        invalidate_profile(args.profile)
+        sender.stop()
+        raise
+    raise SystemExit(getattr(sender, "codec_exit_code", 0))
 
 
 if __name__ == "__main__":

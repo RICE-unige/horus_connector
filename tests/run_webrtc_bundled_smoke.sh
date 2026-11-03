@@ -3,6 +3,13 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime="${HORUS_WEBRTC_PYTHON:-${root}/.venv-webrtc/bin/python}"
+if [[ ! -x "${runtime}" && -z "${HORUS_WEBRTC_PYTHON:-}" ]]; then
+  runtime="$(command -v python3)"
+fi
+if [[ ! -x "${runtime}" ]]; then
+  printf 'WebRTC Python runtime is unavailable: %s\n' "${runtime}" >&2
+  exit 1
+fi
 port="${HORUS_WEBRTC_TEST_PORT:-19876}"
 duration="${HORUS_WEBRTC_TEST_DURATION:-8}"
 start_order="${HORUS_WEBRTC_TEST_ORDER:-robot-first}"
@@ -54,6 +61,9 @@ start_machine() {
     --signaling-url "ws://127.0.0.1:${port}" \
     --video-output display \
     --video-sink fakesink \
+    --profile tests/fixtures/webrtc_cpu_test.env \
+    --clock-offset-ms 0 \
+    --latency-json "${tmp_dir}/machine.json" \
     --duration "${duration}" \
     >"${tmp_dir}/machine.log" 2>&1 &
   machine_pid=$!
@@ -65,6 +75,8 @@ start_robot() {
   "${runtime}" scripts/gst_webrtc_h264_robot.py \
     --streams-config tests/fixtures/webrtc_bundled_testsrc.json \
     --signaling-url "ws://127.0.0.1:${port}" \
+    --latency-probe \
+    --profile tests/fixtures/webrtc_cpu_test.env \
     --duration "${robot_duration}" \
     >"${tmp_dir}/robot.log" 2>&1 &
   robot_pid=$!
@@ -92,6 +104,7 @@ if [[ "${reconnect}" == "1" ]]; then
   fi
   wait "${machine_pid}" || fail_with_logs "First machine WebRTC endpoint failed"
   machine_pid=""
+  "${runtime}" tests/check_media_results.py "${tmp_dir}/machine.json" || fail_with_logs "First session did not deliver decoded frames and matching timing"
   mv "${tmp_dir}/machine.log" "${tmp_dir}/machine-first.log"
   sleep 0.5
   start_machine
@@ -118,6 +131,7 @@ grep -q "Incoming RTP video track=front" "${tmp_dir}/machine.log" \
   || fail_with_logs "Front video track was not decoded"
 grep -q "Incoming RTP video track=rear" "${tmp_dir}/machine.log" \
   || fail_with_logs "Rear video track was not decoded"
+"${runtime}" tests/check_media_results.py "${tmp_dir}/machine.json" || fail_with_logs "Insufficient decoded continuity or frame matching"
 
 if grep -Eq "Traceback|GStreamer error|invalid signaling token" \
   "${tmp_dir}/relay.log" "${tmp_dir}/machine.log" "${tmp_dir}/robot.log"; then

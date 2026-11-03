@@ -152,6 +152,20 @@ def shlex_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def ros_data_probe(root: Path, role: str, topic: str, timeout_sec=3.0):
+    if role == "cloud" or not topic:
+        return {"skipped": True, "received": False, "reason": "no data probe requested"}
+    command = [sys.executable, str(root / "scripts/dds_data_probe.py"), "--topic", topic, "--timeout", str(timeout_sec)]
+    setup = find_ros_setup(root, os.environ)
+    if setup:
+        command = ["bash", "-c", f"source {shlex_quote(setup)} && " + " ".join(shlex_quote(part) for part in command)]
+    code, out, err = run_command(command, timeout=timeout_sec + 5)
+    try:
+        return {"skipped": False, **json.loads(out.splitlines()[-1])}
+    except (ValueError, IndexError):
+        return {"skipped": False, "topic": topic, "received": False, "error": err.strip() or f"probe exited {code}"}
+
+
 def strip_json5_line_comments(text: str) -> str:
     output: list[str] = []
     in_string = False
@@ -251,9 +265,24 @@ def extract_string_array(text: str, key: str) -> list[str] | None:
     return None
 
 
+def parsed_zenoh_config(config_path: Path):
+    text = config_path.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except ValueError:
+        try:
+            import json5
+        except ImportError:
+            return None
+        return json5.loads(text)
+
+
 def load_allow_patterns(config_path: Path) -> dict[str, list[str] | None]:
     if not config_path.exists():
         return {}
+    parsed = parsed_zenoh_config(config_path)
+    if parsed is not None:
+        return parsed.get("plugins", {}).get("ros2dds", {}).get("allow", {})
     text = strip_json5_line_comments(config_path.read_text(encoding="utf-8"))
     allow_body = extract_balanced_object(text, "allow")
     if not allow_body:
@@ -341,6 +370,7 @@ def classify_topics(
     topics: list[str],
     allow_patterns: dict[str, list[str] | None],
     zenoh_config: str,
+    webrtc_only_topics: list[str] | None = None,
 ) -> list[Finding]:
     findings: list[Finding] = []
     if role == "cloud":
@@ -374,6 +404,12 @@ def classify_topics(
     if patterns is None:
         return findings
     filtered = [topic for topic in substantive if not topic_allowed(topic, patterns)]
+    media = sorted(set(filtered).intersection(webrtc_only_topics or []))
+    if media:
+        findings.append(Finding("info", "EXPLICIT_WEBRTC_TOPICS",
+            f"{len(media)} camera topic(s) intentionally use WebRTC instead of ROS WAN forwarding.",
+            "Media delivery must be checked separately: " + ", ".join(media[:8])))
+        filtered = [topic for topic in filtered if topic not in media]
     if not filtered:
         return findings
     severity = "error" if len(filtered) == len(substantive) and substantive else "warning"
@@ -383,6 +419,8 @@ def classify_topics(
     pattern_sample = ", ".join(patterns[:6]) if patterns else "<none>"
     if patterns and len(patterns) > 6:
         pattern_sample += f", ... ({len(patterns)} total)"
+    if len(pattern_sample) > 240:
+        pattern_sample = pattern_sample[:237] + "..."
     findings.append(
         Finding(
             severity,
@@ -464,6 +502,10 @@ def zenoh_config_requests_localhost(config_path: Path | None) -> bool:
     if not config_path or not config_path.exists():
         return False
     try:
+        parsed = parsed_zenoh_config(config_path)
+        if parsed is not None:
+            plugin = parsed.get("plugins", {}).get("ros2dds", {})
+            return plugin.get("ros_localhost_only") is True or plugin.get("ros_automatic_discovery_range") == "LOCALHOST"
         text = strip_json5_line_comments(config_path.read_text(encoding="utf-8", errors="ignore"))
     except OSError:
         return False
@@ -480,10 +522,10 @@ def infer_interface(snapshot: dict[str, str], network: dict[str, Any], zenoh_con
     localhost_only = snapshot.get("ROS_LOCALHOST_ONLY", "")
     discovery_range = snapshot.get("ROS_AUTOMATIC_DISCOVERY_RANGE", "")
     if truthy(localhost_only) or discovery_range.upper() == "LOCALHOST" or zenoh_config_requests_localhost(zenoh_config):
-        # ROS and zenoh-bridge-ros2dds already select loopback in localhost-only
-        # mode. Adding an explicit "lo" here can make CycloneDDS reject the
-        # participant with "the same interface may not be selected twice".
-        return "", False
+        distro = snapshot.get("ROS_DISTRO") or os.environ.get("ROS_DISTRO", "jazzy")
+        # Before Iron the bridge injects its own loopback interface. Newer
+        # releases configure static peers instead and still need NIC selection.
+        return ("", False) if distro in {"foxy", "galactic", "humble"} else ("lo", True)
     route = network.get("route", {}) if isinstance(network.get("route"), dict) else {}
     interface = str(route.get("interface") or "")
     return interface, bool(interface)
@@ -503,7 +545,7 @@ def render_cyclonedds_template(
     if has_interface:
         interfaces = (
             "<Interfaces>\n"
-            f'        <NetworkInterface name="{xml_escape(interface)}" priority="default" multicast="default" />\n'
+            f'        <NetworkInterface name="{xml_escape(interface)}" priority="default" multicast="{"true" if interface == "lo" else "default"}" />\n'
             "      </Interfaces>"
         )
     else:
@@ -530,19 +572,41 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     snapshot = env_snapshot()
     network = load_network_snapshot(args.target)
-    zenoh_config = Path(args.zenoh_config).expanduser().resolve() if args.zenoh_config else Path()
+    zenoh_config = Path(args.zenoh_config).expanduser().resolve() if args.zenoh_config else None
     cyclonedds = render_cyclonedds_template(root, run_dir, snapshot, network, zenoh_config)
     allow_patterns = load_allow_patterns(zenoh_config) if zenoh_config else {}
 
     findings = []
+    data_probe = {"skipped": True, "received": False}
     if args.mode == "render":
         topic_probe = {"available": False, "skipped": True, "topics": [], "reason": "render mode"}
         bridge_log = parse_bridge_log(run_dir)
     else:
         topic_probe = ros_topic_list(root, args.role, args.topic_timeout)
+        requested = os.environ.get("HORUS_DDS_PROBE_TOPIC", "")
+        if requested or args.mode == "doctor":
+            selected = requested or next((topic for topic in topic_probe.get("topics", [])
+                                         if topic == "/tf" or topic.endswith("/odom")), "")
+            data_probe = ros_data_probe(root, args.role, selected)
+            if selected and not data_probe.get("received"):
+                findings.append(Finding("warning", "DDS_SAMPLE_NOT_RECEIVED",
+                    f"No sample received from {selected} within the bounded local DDS probe.",
+                    "Topic discovery is not data delivery; check publisher activity, QoS, domain and interface."))
         bridge_log = parse_bridge_log(run_dir)
         findings.extend(classify_environment(snapshot, args.role, args.runtime, args.docker_network))
-        findings.extend(classify_topics(args.role, topic_probe.get("topics", []), allow_patterns, str(zenoh_config)))
+        media_topics = []
+        routes_path = os.environ.get("HORUS_ROUTES_CONFIG", "")
+        if routes_path:
+            try:
+                media_topics = json.loads(Path(routes_path).read_text()).get("webrtc_only_topics", [])
+                if not isinstance(media_topics, list) or any(not isinstance(item, str) for item in media_topics):
+                    raise ValueError("webrtc_only_topics must be a list of topic names")
+            except (OSError, ValueError, AttributeError) as exc:
+                media_topics = []
+                findings.append(Finding("warning", "ROUTES_CONFIG_UNREADABLE",
+                    "Could not classify explicit WebRTC-only routes.", str(exc)))
+        findings.extend(classify_topics(args.role, topic_probe.get("topics", []), allow_patterns,
+                                       str(zenoh_config), media_topics))
         if args.mode == "doctor":
             findings.extend(classify_bridge_log(args.role, topic_probe.get("topics", []), bridge_log))
         if not topic_probe.get("available", False) and args.role != "cloud":
@@ -568,6 +632,7 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
         "environment": snapshot,
         "network": network,
         "topic_probe": topic_probe,
+        "data_probe": data_probe,
         "bridge_log": bridge_log,
         "allow_patterns": allow_patterns,
         "findings": [finding.as_dict() for finding in findings],
@@ -589,6 +654,9 @@ def print_pretty(verdict: dict[str, Any]) -> None:
         print(f"  ros graph   {len(topics)} topic(s) visible")
     else:
         print("  ros graph   unavailable")
+    sample = verdict.get("data_probe", {})
+    if not sample.get("skipped", True):
+        print(f"  DDS sample  {sample.get('topic')}: {'received' if sample.get('received') else 'not received'} (local only)")
     if not findings:
         print("  verdict    ok")
         return

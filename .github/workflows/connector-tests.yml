@@ -1,0 +1,65 @@
+name: Connector Regression Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            ros: jazzy
+          - runner: ubuntu-24.04-arm
+            ros: jazzy
+          - runner: ubuntu-22.04
+            ros: humble
+    runs-on: ${{ matrix.runner }}
+    container: ros:${{ matrix.ros }}-ros-base
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl unzip iproute2 procps python3-venv python3-pytest python3-gi gir1.2-gst-plugins-bad-1.0 gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice ros-${{ matrix.ros }}-rmw-cyclonedds-cpp ros-${{ matrix.ros }}-tf2-msgs
+          python3 -m venv --system-site-packages .venv-webrtc
+          .venv-webrtc/bin/python -m pip install -r requirements-media.txt
+      - name: Unit and native ROS checks
+        shell: bash
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          HORUS_FIELD_ROS_TEST: "1"
+          ROS_DOMAIN_ID: "196"
+          ROS_LOCALHOST_ONLY: "1"
+          RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+          CYCLONEDDS_URI: '<CycloneDDS><Domain><General><Interfaces><NetworkInterface address="127.0.0.1" multicast="true"/></Interfaces></General></Domain></CycloneDDS>'
+        run: |
+          source /opt/ros/${{ matrix.ros }}/setup.bash
+          bash -n horus scripts/bootstrap.sh scripts/setup_webrtc.sh
+          .venv-webrtc/bin/python -m pytest tests -q --junitxml=test-results.xml
+          ./horus update-zenoh
+          .venv-webrtc/bin/python tests/check_zenoh_routes.py --bulk --output /tmp/horus-check-direct
+          .venv-webrtc/bin/python tests/check_zenoh_routes.py --bulk --hub --output /tmp/horus-check-hub
+          .venv-webrtc/bin/python tests/check_ros_webrtc.py --output /tmp/horus-check-camera
+          if [[ '${{ matrix.ros }}' == jazzy ]]; then
+            .venv-webrtc/bin/python tests/check_ros_webrtc.py --letterbox --latched-info --output /tmp/horus-check-calibration
+            .venv-webrtc/bin/python tests/check_media_recovery.py --track-only --output /tmp/horus-check-track
+            .venv-webrtc/bin/python tests/check_supervised_media_recovery.py --output /tmp/horus-check-recovery
+            .venv-webrtc/bin/python tests/check_multi_operator_media.py --output /tmp/horus-check-operators
+          fi
+      - name: Retain results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connector-${{ matrix.runner }}-${{ matrix.ros }}
+          path: |
+            test-results.xml
+            /tmp/horus-check-*

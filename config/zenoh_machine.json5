@@ -8,30 +8,58 @@
 
       allow: {
         publishers: [
-          // Keep machine-side export narrow. Robot state flows toward the
-          // machine, but velocity commands flow back toward the robot.
+          // Full HORUS runtime reply/request contract, including namespaced SDKs.
+          "^/(.*/)?horus/.*$",
+          // Robot state flows toward the machine; operator commands and
+          // task goals flow back toward the selected robot.
           "^/cmd_vel$",
           "^/.*/cmd_vel$",
+          "^/cmd/velocity$",
+          "^/.*/cmd/velocity$",
+          "^/goal$",
+          "^/.*/goal$",
+          "^/goal_pose$",
+          "^/.*/goal_pose$",
+          "^/move_base_simple/goal$",
+          "^/.*/move_base_simple/goal$",
+          "^/.*/command$",
         ],
         subscribers: [
           // Import any remote topic that this machine explicitly subscribes to.
           "^/.*$",
         ],
         service_servers: [],
-        service_clients: [],
+        service_clients: ["^/.*$"],
         action_servers: [],
-        action_clients: [],
+        action_clients: ["^/.*$"],
       },
 
       pub_priorities: [
+        ".*/tf(_static)?$=1:express",
+        ".*/clock$=1:express",
+        ".*/(client_signal|server_signal|indexed_request|request_keyframe)$=1:express",
+        ".*/(indexed_manifest|manifest)$=2:express",
+        ".*/(image_raw|image|compressed)(/compressed)?$=2:express",
+        ".*/horus/robot_description/chunk_.*$=6",
+        ".*/horus/gaussian_splat/chunk_.*$=6",
+        ".*/(mesh|mesh_map|gaussian_splat)(/.*)?$=6",
+        ".*/(cloud_map|octomap_.*|mesh.*|map|points)(/.*)?$=6",
+        ".*/horus/(registration(_ack)?|heartbeat|teleop|leases?|multi_operator)(/.*)?$=1:express",
+        ".*/cmd/velocity$=1:express",
         ".*/cmd_vel$=1:express",
+        ".*/goal$=2:express",
+        ".*/goal_pose$=2:express",
+        ".*/command$=2:express",
+        ".*/(shared_map|global_map|local_map|grid_prob_map|occupancy_grid)$=6",
+        ".*/odom$=3:express",
+        ".*/horus/.*$=4",
       ],
 
-      reliable_routes_blocking: false,
-      transient_local_cache_multiplier: 1,
+      reliable_routes_blocking: true,
+      transient_local_cache_multiplier: 10,
       queries_timeout: {
-        default: 1.0,
-        transient_local_subscribers: 0.5,
+        default: 5.0,
+        transient_local_subscribers: 5.0,
         services: 1.0,
         actions: {
           send_goal: 1.0,
@@ -41,6 +69,9 @@
       },
     },
   },
+
+  connect: { timeout_ms: -1, exit_on_failure: false,
+    retry: { period_init_ms: 1000, period_max_ms: 10000, period_increase_factor: 2 } },
 
   scouting: {
     multicast: { enabled: false },
@@ -52,8 +83,10 @@
     link: {
       tx: {
         queue: {
-          batching: { enabled: false },
-          congestion_control: { drop: { wait_before_drop: 0 } },
+          // Bound declaration/data bursts; express control and TF bypass batching.
+          batching: { enabled: true, time_limit: 1 },
+          // Allow a bounded 1 ms enqueue window; zero drops even small bursts.
+          congestion_control: { drop: { wait_before_drop: 1000 } },
         },
       },
     },

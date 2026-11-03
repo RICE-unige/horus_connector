@@ -1,0 +1,887 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c44c8da..46ad63f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -693,8 +693,6 @@ dependencies = [
+ [[package]]
+ name = "cyclors"
+ version = "0.4.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6beb8dc0574f6e2184a2a67c6833ff7ab5b64a95d2459db9b009797b0bb7374e"
+ dependencies = [
+  "bincode",
+  "bindgen",
+diff --git a/zenoh-plugin-ros2dds/src/bulk_budget.rs b/zenoh-plugin-ros2dds/src/bulk_budget.rs
+new file mode 100644
+index 0000000..6686d62
+--- /dev/null
++++ b/zenoh-plugin-ros2dds/src/bulk_budget.rs
+@@ -0,0 +1,60 @@
++// Copyright 2026 RICE Lab, University of Genoa
++// SPDX-License-Identifier: Apache-2.0
++
++use std::{path::Path, sync::{LazyLock, Mutex}, time::{Duration, Instant}};
++
++fn read_budget(path: &Path, fallback: u64, previous: Option<u64>) -> u64 {
++    let fresh = std::fs::metadata(path).ok().filter(|metadata| metadata.len() <= 32)
++        .and_then(|metadata| metadata.modified().ok())
++        .and_then(|modified| modified.elapsed().ok())
++        .is_some_and(|age| age <= Duration::from_secs(3));
++    if fresh {
++        if let Some(value) = std::fs::read_to_string(path).ok()
++            .and_then(|text| text.trim().parse::<u64>().ok())
++            .filter(|value| (1024..=1073741824).contains(value))
++        {
++            return value;
++        }
++    }
++    // A dead governor must not turn zero (unlimited) into a bulk flood.
++    let bounded = if fallback == 0 { 128000 } else { fallback.min(128000) };
++    previous.map_or(bounded, |rate| bounded.min(rate))
++}
++
++pub(crate) fn effective_rate(fallback: u64) -> u64 {
++    static PATH: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(||
++        std::env::var_os("HORUS_ZENOH_BULK_BUDGET_FILE")
++            .filter(|path| !path.is_empty()).map(std::path::PathBuf::from));
++    static CACHE: LazyLock<Mutex<Option<(Instant, u64)>>> = LazyLock::new(|| Mutex::new(None));
++    let Some(path) = PATH.as_ref() else { return fallback; };
++    let mut cached = CACHE.lock().unwrap_or_else(|error| error.into_inner());
++    if let Some((at, rate)) = *cached {
++        if at.elapsed() < Duration::from_millis(100) { return rate; }
++    }
++    let rate = read_budget(path, fallback, cached.map(|(_, rate)| rate));
++    *cached = Some((Instant::now(), rate));
++    rate
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn missing_and_invalid_governors_never_enable_unlimited_bulk() {
++        let path = std::env::temp_dir().join(format!("horus-budget-{}", std::process::id()));
++        assert_eq!(read_budget(&path, 0, None), 128000);
++        std::fs::write(&path, "400000\n").unwrap();
++        assert_eq!(read_budget(&path, 0, None), 400000);
++        std::fs::write(&path, "0\n").unwrap();
++        assert_eq!(read_budget(&path, 1500000, None), 128000);
++        std::fs::write(&path, "invalid\n").unwrap();
++        assert_eq!(read_budget(&path, 64000, None), 64000);
++        assert_eq!(read_budget(&path, 1500000, Some(32000)), 32000);
++        std::fs::write(&path, "400000\n").unwrap();
++        let stale = std::time::SystemTime::now() - Duration::from_secs(4);
++        std::fs::File::open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(stale)).unwrap();
++        assert_eq!(read_budget(&path, 0, Some(32000)), 32000);
++        std::fs::remove_file(path).unwrap();
++    }
++}
+diff --git a/zenoh-plugin-ros2dds/src/config.rs b/zenoh-plugin-ros2dds/src/config.rs
+index 30bf504..669b15a 100644
+--- a/zenoh-plugin-ros2dds/src/config.rs
++++ b/zenoh-plugin-ros2dds/src/config.rs
+@@ -32,9 +32,19 @@ pub const DEFAULT_ACTION_GET_RESULT_TIMEOUT: f32 = 300.0;
+ pub const DEFAULT_WORK_THREAD_NUM: usize = 2;
+ pub const DEFAULT_MAX_BLOCK_THREAD_NUM: usize = 50;
+ 
++#[derive(Deserialize, Debug, Serialize, Clone, Copy)]
++#[serde(rename_all = "snake_case")]
++pub enum TrafficClass {
++    Realtime,
++    Sensing,
++    Bulk,
++}
++
+ #[derive(Deserialize, Debug, Serialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct Config {
++    #[serde(default)]
++    pub traffic_class: Option<TrafficClass>,
+     #[serde(default = "default_namespace")]
+     pub namespace: String,
+     #[serde(default = "default_nodename")]
+@@ -83,6 +93,20 @@ pub struct Config {
+ }
+ 
+ impl Config {
++    pub fn allows_traffic_class(&self, topic: Option<&str>) -> bool {
++        let Some(class) = self.traffic_class else { return true; };
++        // Services/actions are always on the real-time session. Topic priorities
++        // are the same capability-derived policy used by the legacy single bridge.
++        let priority = topic.map(|name| self.get_pub_priority_and_express(name)
++            .map(|(priority, _)| priority).unwrap_or(Priority::Data) as u8);
++        match (class, priority) {
++            (TrafficClass::Realtime, None | Some(0..=1)) => true,
++            (TrafficClass::Sensing, Some(2..=5)) => true,
++            (TrafficClass::Bulk, Some(6..=7)) => true,
++            _ => false,
++        }
++    }
++
+     pub fn get_pub_max_frequencies(&self, ros2_name: &str) -> Option<f32> {
+         for (re, freq) in &self.pub_max_frequencies {
+             if re.is_match(ros2_name) {
+diff --git a/zenoh-plugin-ros2dds/src/dds_types.rs b/zenoh-plugin-ros2dds/src/dds_types.rs
+index bf88b1a..20f1909 100644
+--- a/zenoh-plugin-ros2dds/src/dds_types.rs
++++ b/zenoh-plugin-ros2dds/src/dds_types.rs
+@@ -63,7 +63,7 @@ impl DDSRawSample {
+         DDSRawSample { sdref, data }
+     }
+ 
+-    fn data_as_slice(&self) -> &[u8] {
++    pub(crate) fn data_as_slice(&self) -> &[u8] {
+         unsafe {
+             slice::from_raw_parts(
+                 self.data.iov_base as *const u8,
+diff --git a/zenoh-plugin-ros2dds/src/dds_utils.rs b/zenoh-plugin-ros2dds/src/dds_utils.rs
+index 10d3f7e..1f73a08 100644
+--- a/zenoh-plugin-ros2dds/src/dds_utils.rs
++++ b/zenoh-plugin-ros2dds/src/dds_utils.rs
+@@ -268,6 +268,33 @@ where
+ 
+ #[allow(clippy::too_many_arguments)]
+ pub fn create_dds_reader<F>(
++    dp: dds_entity_t,
++    topic_name: String,
++    type_name: String,
++    type_info: &Option<Arc<TypeInfo>>,
++    keyless: bool,
++    qos: Qos,
++    read_period: Option<Duration>,
++    callback: F,
++) -> Result<dds_entity_t, String>
++where
++    F: Fn(&DDSRawSample) + std::marker::Send + 'static,
++{
++    create_dds_reader_with_worker(
++        dp,
++        topic_name,
++        type_name,
++        type_info,
++        keyless,
++        qos,
++        read_period,
++        false,
++        callback,
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++pub fn create_dds_reader_with_worker<F>(
+     dp: dds_entity_t,
+     topic_name: String,
+     type_name: String,
+@@ -275,6 +302,7 @@ pub fn create_dds_reader<F>(
+     keyless: bool,
+     mut qos: Qos,
+     read_period: Option<Duration>,
++    independent_worker: bool,
+     callback: F,
+ ) -> Result<dds_entity_t, String>
+ where
+@@ -283,6 +311,65 @@ where
+     unsafe {
+         let t = create_topic(dp, &topic_name, &type_name, type_info, keyless);
+         match read_period {
++            None if independent_worker => {
++                // Reliable bulk puts may block. Keep them off Cyclone's shared receive
++                // callback without changing the reader history or sampling map deltas.
++                let qos_native = qos.to_qos_native();
++                let reader = dds_create_reader(dp, t, qos_native, std::ptr::null());
++                Qos::delete_qos_native(qos_native);
++                if reader < 0 {
++                    return Err(format!("Error creating independent DDS Reader: {reader}"));
++                }
++                let mut original_handle: dds_instance_handle_t = 0;
++                if dds_get_instance_handle(reader, &mut original_handle) != DDS_RETCODE_OK as i32 {
++                    dds_delete(reader);
++                    return Err("Error reading independent DDS Reader instance handle".into());
++                }
++                let worker = std::thread::Builder::new()
++                    .name("dds-bulk-reader".into())
++                    .stack_size(512 * 1024)
++                    .spawn(move || loop {
++                        let mut handle: dds_instance_handle_t = 0;
++                        if dds_get_instance_handle(reader, &mut handle) != DDS_RETCODE_OK as i32
++                            || handle != original_handle
++                        {
++                            break;
++                        }
++                        let mut zp: *mut ddsi_serdata = std::ptr::null_mut();
++                        let mut si = MaybeUninit::<[dds_sample_info_t; 1]>::uninit();
++                        let count = dds_takecdr(
++                            reader,
++                            &mut zp,
++                            1,
++                            si.as_mut_ptr() as *mut dds_sample_info_t,
++                            DDS_ANY_STATE,
++                        );
++                        if count < 0 {
++                            break;
++                        }
++                        if count == 0 {
++                            std::thread::sleep(Duration::from_millis(2));
++                            continue;
++                        }
++                        let si = si.assume_init();
++                        if si[0].valid_data {
++                            let raw_sample = DDSRawSample::create(zp);
++                            if dds_get_instance_handle(reader, &mut handle) != DDS_RETCODE_OK as i32
++                                || handle != original_handle
++                            {
++                                ddsi_serdata_unref(zp);
++                                break;
++                            }
++                            callback(&raw_sample);
++                        }
++                        ddsi_serdata_unref(zp);
++                    });
++                if let Err(error) = worker {
++                    dds_delete(reader);
++                    return Err(format!("Error starting independent DDS Reader: {error}"));
++                }
++                Ok(reader)
++            }
+             None => {
+                 // Use a Listener to route data as soon as it arrives
+                 let arg = Box::new(callback);
+@@ -358,3 +445,60 @@ where
+         }
+     }
+ }
++
++fn reserve_bulk_slot(
++    next: &mut std::time::Instant,
++    now: std::time::Instant,
++    bytes: usize,
++    rate: u64,
++) -> Duration {
++    if rate == 0 {
++        return Duration::ZERO;
++    }
++    let start = (*next).max(now);
++    *next = start + Duration::from_secs_f64(bytes as f64 / rate as f64);
++    start.saturating_duration_since(now)
++}
++
++pub(crate) fn pace_bulk_sample(bytes: usize, rate: u64) {
++    let rate = crate::bulk_budget::effective_rate(rate);
++    if rate == 0 {
++        return;
++    }
++    // One shared schedule across bulk topics, with at most one held sample per
++    // reader. Sleeping never holds a DDS receive callback or this scheduling lock.
++    static NEXT: std::sync::LazyLock<std::sync::Mutex<std::time::Instant>> =
++        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::time::Instant::now()));
++    let delay = {
++        let mut next = NEXT.lock().unwrap_or_else(|error| error.into_inner());
++        reserve_bulk_slot(&mut next, std::time::Instant::now(), bytes, rate)
++    };
++    if !delay.is_zero() {
++        std::thread::sleep(delay);
++    }
++}
++
++#[cfg(test)]
++mod bulk_pacing_tests {
++    use super::*;
++
++    #[test]
++    fn shared_budget_preserves_every_sample_without_idle_bursts() {
++        let now = std::time::Instant::now();
++        let mut next = now;
++        assert_eq!(reserve_bulk_slot(&mut next, now, 100, 1000), Duration::ZERO);
++        assert_eq!(
++            reserve_bulk_slot(&mut next, now, 200, 1000),
++            Duration::from_millis(100)
++        );
++        assert_eq!(
++            reserve_bulk_slot(&mut next, now, 50, 1000),
++            Duration::from_millis(300)
++        );
++        assert_eq!(
++            reserve_bulk_slot(&mut next, now + Duration::from_secs(10), 100, 1000),
++            Duration::ZERO
++        );
++        assert_eq!(reserve_bulk_slot(&mut next, now, 100, 0), Duration::ZERO);
++    }
++}
+diff --git a/zenoh-plugin-ros2dds/src/hmsh_queue.rs b/zenoh-plugin-ros2dds/src/hmsh_queue.rs
+new file mode 100644
+index 0000000..f164a93
+--- /dev/null
++++ b/zenoh-plugin-ros2dds/src/hmsh_queue.rs
+@@ -0,0 +1,307 @@
++// Copyright 2026 RICE Lab, University of Genoa
++// SPDX-License-Identifier: Apache-2.0
++
++use std::collections::{HashMap, VecDeque};
++use std::sync::{Arc, Condvar, Mutex};
++use std::time::Duration;
++
++#[derive(Clone, Copy, Debug)]
++struct Header {
++    chunk: u32,
++    epoch: u64,
++    revision: u64,
++    operation: u8,
++}
++
++// Only the full-replacement HMSH v2 contract is eligible. Unknown layouts,
++// ordinary ROS messages and malformed frames retain FIFO/backpressure behavior.
++fn header(cdr: &[u8]) -> Option<Header> {
++    if cdr.get(..4)? != [0, 1, 0, 0] || cdr.get(4..12)? != [0; 8] {
++        return None;
++    }
++    let length = u32::from_le_bytes(cdr.get(12..16)?.try_into().ok()?) as usize;
++    let payload = cdr.get(16..)?;
++    if payload.len() != length || payload.len() < 52 || &payload[..4] != b"HSMH" {
++        return None;
++    }
++    let u32_at = |offset| {
++        Some(u32::from_le_bytes(
++            payload.get(offset..offset + 4)?.try_into().ok()?,
++        ))
++    };
++    if u32_at(4)? != 2 || payload[40] > 2 || payload[41] > 1 {
++        return None;
++    }
++    let vertices = u32_at(44)? as usize;
++    let indices = u32_at(48)? as usize;
++    let expected = 52usize
++        .checked_add(vertices.checked_mul(if payload[41] == 1 { 16 } else { 12 })?)?
++        .checked_add(indices.checked_mul(4)?)?;
++    if expected != length
++        || indices % 3 != 0
++        || (payload[40] != 0 && (vertices != 0 || indices != 0))
++    {
++        return None;
++    }
++    Some(Header {
++        chunk: u32_at(8)?,
++        epoch: u64::from_le_bytes(payload[24..32].try_into().ok()?),
++        revision: u64::from_le_bytes(payload[32..40].try_into().ok()?),
++        operation: payload[40],
++    })
++}
++
++#[derive(Clone, Copy, Eq, Hash, PartialEq)]
++enum Key {
++    Page(u32),
++    Clear,
++    Ordered(u64),
++}
++
++struct Packet {
++    bytes: Vec<u8>,
++    header: Option<Header>,
++}
++
++struct State {
++    packets: HashMap<Key, Packet>,
++    order: VecDeque<Key>,
++    bytes: usize,
++    epoch: Option<u64>,
++    serial: u64,
++    closed: bool,
++}
++
++struct Inner {
++    state: Mutex<State>,
++    changed: Condvar,
++    max_bytes: usize,
++    max_items: usize,
++}
++
++pub struct MeshSender(Arc<Inner>);
++pub struct MeshReceiver(Arc<Inner>);
++
++pub fn channel(max_bytes: usize, max_items: usize) -> (MeshSender, MeshReceiver) {
++    let inner = Arc::new(Inner {
++        state: Mutex::new(State {
++            packets: HashMap::new(),
++            order: VecDeque::new(),
++            bytes: 0,
++            epoch: None,
++            serial: 0,
++            closed: false,
++        }),
++        changed: Condvar::new(),
++        max_bytes,
++        max_items,
++    });
++    (MeshSender(inner.clone()), MeshReceiver(inner))
++}
++
++impl MeshSender {
++    pub fn push(&self, bytes: Vec<u8>) -> Result<bool, &'static str> {
++        if bytes.len() > self.0.max_bytes {
++            return Err("HMSH sample exceeds the configured queue byte budget");
++        }
++        let parsed = header(&bytes);
++        let mut state = self
++            .0
++            .state
++            .lock()
++            .unwrap_or_else(|error| error.into_inner());
++        loop {
++            if state.closed {
++                return Err("HMSH sender is closed");
++            }
++            if let Some(h) = parsed {
++                if let Some(epoch) = state.epoch {
++                    if h.epoch < epoch || (h.epoch == epoch && h.operation == 2) {
++                        return Ok(false);
++                    }
++                }
++                if state.epoch != Some(h.epoch) {
++                    // A new map epoch supersedes its old full-replacement pages,
++                    // but cannot remove unknown/FIFO messages on this topic.
++                    state.packets.retain(|_, packet| packet.header.is_none());
++                    state.order.retain(|key| matches!(key, Key::Ordered(_)));
++                    state.bytes = state
++                        .packets
++                        .values()
++                        .map(|packet| packet.bytes.len())
++                        .sum();
++                    state.epoch = Some(h.epoch);
++                }
++            }
++            let key = match parsed {
++                Some(h) if h.operation == 2 => Key::Clear,
++                Some(h) => Key::Page(h.chunk),
++                None => Key::Ordered(state.serial),
++            };
++            let previous = state.packets.get(&key);
++            if let (Some(old), Some(new)) = (previous.and_then(|packet| packet.header), parsed) {
++                if new.revision <= old.revision {
++                    return Ok(false);
++                }
++            }
++            let old_bytes = previous.map_or(0, |packet| packet.bytes.len());
++            let replacement = previous.is_some();
++            if state.bytes - old_bytes + bytes.len() <= self.0.max_bytes
++                && (replacement || state.packets.len() < self.0.max_items)
++            {
++                state.bytes = state.bytes - old_bytes + bytes.len();
++                if !replacement {
++                    state.order.push_back(key);
++                }
++                if parsed.is_none() {
++                    state.serial = state.serial.wrapping_add(1);
++                }
++                state.packets.insert(
++                    key,
++                    Packet {
++                        bytes,
++                        header: parsed,
++                    },
++                );
++                self.0.changed.notify_all();
++                return Ok(true);
++            }
++            state = self
++                .0
++                .changed
++                .wait(state)
++                .unwrap_or_else(|error| error.into_inner());
++        }
++    }
++}
++
++impl MeshReceiver {
++    pub fn next(&self, timeout: Duration) -> Option<Vec<u8>> {
++        let mut state = self
++            .0
++            .state
++            .lock()
++            .unwrap_or_else(|error| error.into_inner());
++        if state.order.is_empty() && !state.closed {
++            state = self
++                .0
++                .changed
++                .wait_timeout(state, timeout)
++                .unwrap_or_else(|error| error.into_inner())
++                .0;
++        }
++        if state.closed {
++            return None;
++        }
++        let key = state.order.pop_front()?;
++        let packet = state.packets.remove(&key)?;
++        state.bytes -= packet.bytes.len();
++        self.0.changed.notify_all();
++        Some(packet.bytes)
++    }
++
++    pub fn closed(&self) -> bool {
++        self.0
++            .state
++            .lock()
++            .unwrap_or_else(|error| error.into_inner())
++            .closed
++    }
++}
++
++fn close(inner: &Inner) {
++    let mut state = inner
++        .state
++        .lock()
++        .unwrap_or_else(|error| error.into_inner());
++    state.closed = true;
++    inner.changed.notify_all();
++}
++
++impl Drop for MeshSender {
++    fn drop(&mut self) {
++        close(&self.0);
++    }
++}
++impl Drop for MeshReceiver {
++    fn drop(&mut self) {
++        close(&self.0);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn page(chunk: u32, epoch: u64, revision: u64, operation: u8) -> Vec<u8> {
++        let mut cdr = vec![0u8; 68];
++        cdr[1] = 1;
++        cdr[12..16].copy_from_slice(&52u32.to_le_bytes());
++        cdr[16..20].copy_from_slice(b"HSMH");
++        cdr[20..24].copy_from_slice(&2u32.to_le_bytes());
++        cdr[24..28].copy_from_slice(&chunk.to_le_bytes());
++        cdr[40..48].copy_from_slice(&epoch.to_le_bytes());
++        cdr[48..56].copy_from_slice(&revision.to_le_bytes());
++        cdr[56] = operation;
++        cdr
++    }
++
++    #[test]
++    fn latest_full_page_keeps_fifo_place_and_exact_bytes() {
++        let (send, receive) = channel(1024, 10);
++        send.push(page(1, 7, 1, 0)).unwrap();
++        send.push(page(2, 7, 1, 0)).unwrap();
++        let latest = page(1, 7, 5, 0);
++        send.push(latest.clone()).unwrap();
++        assert!(!send.push(page(1, 7, 4, 0)).unwrap());
++        assert_eq!(receive.next(Duration::ZERO), Some(latest));
++        assert_eq!(receive.next(Duration::ZERO), Some(page(2, 7, 1, 0)));
++    }
++
++    #[test]
++    fn epoch_clear_and_deletes_cannot_resurrect_old_geometry() {
++        let (send, receive) = channel(1024, 10);
++        send.push(page(1, 4, 1, 0)).unwrap();
++        send.push(page(0, 5, 0, 2)).unwrap();
++        send.push(page(1, 5, 1, 0)).unwrap();
++        assert!(!send.push(page(0, 5, 0, 2)).unwrap());
++        send.push(page(1, 5, 2, 1)).unwrap();
++        assert!(!send.push(page(1, 4, 3, 0)).unwrap());
++        assert_eq!(receive.next(Duration::ZERO), Some(page(0, 5, 0, 2)));
++        assert_eq!(receive.next(Duration::ZERO), Some(page(1, 5, 2, 1)));
++    }
++
++    #[test]
++    fn unknown_payloads_remain_ordered_and_bounded() {
++        let (send, receive) = channel(80, 1);
++        send.push(vec![7; 70]).unwrap();
++        let task = std::thread::spawn(move || {
++            send.push(vec![8; 70]).unwrap();
++            std::thread::sleep(Duration::from_millis(100));
++        });
++        std::thread::sleep(Duration::from_millis(10));
++        assert_eq!(receive.next(Duration::ZERO), Some(vec![7; 70]));
++        assert_eq!(receive.next(Duration::from_secs(1)), Some(vec![8; 70]));
++        task.join().unwrap();
++    }
++
++    #[test]
++    fn closing_unblocks_producer_and_consumer() {
++        let (send, receive) = channel(80, 1);
++        send.push(vec![1; 70]).unwrap();
++        let task = std::thread::spawn(move || send.push(vec![2; 70]));
++        drop(receive);
++        assert!(task.join().unwrap().is_err());
++    }
++
++    #[test]
++    fn invalid_or_nonempty_layouts_never_qualify_for_coalescing() {
++        let valid = page(9, 1, 1, 0);
++        assert!(header(&valid).is_some());
++        for offset in [0, 4, 8, 12, 16, 20, 56, 57, 60, 64] {
++            let mut invalid = valid.clone();
++            invalid[offset] = 99;
++            assert!(header(&invalid).is_none(), "offset={offset}");
++        }
++    }
++}
+diff --git a/zenoh-plugin-ros2dds/src/lib.rs b/zenoh-plugin-ros2dds/src/lib.rs
+index 8dd30b0..1d6d638 100644
+--- a/zenoh-plugin-ros2dds/src/lib.rs
++++ b/zenoh-plugin-ros2dds/src/lib.rs
+@@ -58,6 +58,8 @@ mod discovered_entities;
+ mod discovery_mgr;
+ mod events;
+ mod gid;
++mod hmsh_queue;
++mod bulk_budget;
+ mod liveliness_mgt;
+ mod node_info;
+ mod qos_helpers;
+@@ -663,6 +665,15 @@ impl ROS2PluginRuntime {
+     }
+ 
+     fn is_allowed(&self, evt: &ROS2DiscoveryEvent) -> bool {
++        use ROS2DiscoveryEvent::*;
++        let topic = match evt {
++            DiscoveredMsgPub(_, iface) | UndiscoveredMsgPub(_, iface) => Some(iface.name.as_str()),
++            DiscoveredMsgSub(_, iface) | UndiscoveredMsgSub(_, iface) => Some(iface.name.as_str()),
++            _ => None,
++        };
++        if !self.config.allows_traffic_class(topic) {
++            return false;
++        }
+         if let Some(allowance) = &self.config.allowance {
+             use ROS2DiscoveryEvent::*;
+             match evt {
+@@ -694,6 +705,16 @@ impl ROS2PluginRuntime {
+     // Check if a remote announcement by another bridge is allowed, depending on the matching entity allowance in config.
+     // E.g. a remote announcement of a Publisher on /abc is allowed only if a Subscriber on /abc is allowed in the local config.
+     fn is_announcement_allowed(&self, evt: &ROS2AnnouncementEvent) -> bool {
++        use ROS2AnnouncementEvent::*;
++        let topic = match evt {
++            AnnouncedMsgPub { zenoh_key_expr, .. } | RetiredMsgPub { zenoh_key_expr, .. }
++            | AnnouncedMsgSub { zenoh_key_expr, .. } | RetiredMsgSub { zenoh_key_expr, .. }
++                => Some(key_expr_to_ros2_name(zenoh_key_expr, &self.config)),
++            _ => None,
++        };
++        if !self.config.allows_traffic_class(topic.as_deref()) {
++            return false;
++        }
+         if let Some(allowance) = &self.config.allowance {
+             use ROS2AnnouncementEvent::*;
+             match evt {
+diff --git a/zenoh-plugin-ros2dds/src/route_publisher.rs b/zenoh-plugin-ros2dds/src/route_publisher.rs
+index 90b7d47..1ad5d48 100644
+--- a/zenoh-plugin-ros2dds/src/route_publisher.rs
++++ b/zenoh-plugin-ros2dds/src/route_publisher.rs
+@@ -16,7 +16,7 @@ use std::{
+     collections::HashSet,
+     fmt,
+     ops::Deref,
+-    sync::{atomic::Ordering, Arc},
++    sync::{atomic::Ordering, Arc, Mutex},
+     time::Duration,
+ };
+ 
+@@ -28,6 +28,7 @@ use serde::{Serialize, Serializer};
+ use zenoh::{
+     key_expr::{keyexpr, OwnedKeyExpr},
+     liveliness::LivelinessToken,
++    matching::MatchingListener,
+     qos::{CongestionControl, Priority, Reliability},
+     sample::Locality,
+     Wait,
+@@ -37,8 +38,8 @@ use zenoh_ext::{AdvancedPublisher, AdvancedPublisherBuilderExt, CacheConfig};
+ use crate::{
+     dds_types::{DDSRawSample, TypeInfo},
+     dds_utils::{
+-        create_dds_reader, delete_dds_entity, get_guid, serialize_atomic_entity_guid,
+-        AtomicDDSEntity, DDS_ENTITY_NULL,
++        create_dds_reader_with_worker, delete_dds_entity, get_guid, pace_bulk_sample,
++        serialize_atomic_entity_guid, AtomicDDSEntity, DDS_ENTITY_NULL,
+     },
+     liveliness_mgt::new_ke_liveliness_pub,
+     qos_helpers::*,
+@@ -105,10 +106,17 @@ pub struct RoutePublisher {
+     remote_routes: HashSet<String>,
+     // the list of nodes served by this route
+     local_nodes: HashSet<String>,
++    #[serde(skip)]
++    matching_listener: Option<MatchingListener<()>>,
++    #[serde(skip)]
++    reader_lifecycle: Arc<Mutex<bool>>,
+ }
+ 
+ impl Drop for RoutePublisher {
+     fn drop(&mut self) {
++        // An in-flight matching callback must not resurrect a retired route.
++        *self.reader_lifecycle.lock().unwrap() = false;
++        self.matching_listener.take();
+         self.deactivate_dds_reader();
+     }
+ }
+@@ -220,8 +228,9 @@ impl RoutePublisher {
+         // activate/deactivate DDS Reader on detection/undetection of matching Subscribers
+         // (copy/move all required args for the callback)
+         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
++        let reader_lifecycle = Arc::new(Mutex::new(true));
+ 
+-        publisher
++        let matching_listener = publisher
+             .matching_listener()
+             .callback({
+                 let dds_reader = dds_reader.clone();
+@@ -234,8 +243,13 @@ impl RoutePublisher {
+                 let reader_qos = reader_qos.clone();
+                 let type_info = type_info.clone();
+                 let publisher = publisher.clone();
++                let reader_lifecycle = reader_lifecycle.clone();
+ 
+                 move |status| {
++                    let alive = reader_lifecycle.lock().unwrap();
++                    if !*alive {
++                        return;
++                    }
+                     tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                     if status.matching() {
+                         if let Err(e) = activate_dds_reader(
+@@ -256,7 +270,6 @@ impl RoutePublisher {
+                     }
+                 }
+             })
+-            .background()
+             .await
+             .map_err(|e| format!("Failed to listen of matching status changes: {e}",))?;
+ 
+@@ -277,6 +290,8 @@ impl RoutePublisher {
+             liveliness_token: None,
+             remote_routes: HashSet::new(),
+             local_nodes: HashSet::new(),
++            matching_listener: Some(matching_listener),
++            reader_lifecycle,
+         })
+     }
+ 
+@@ -421,7 +436,36 @@ fn activate_dds_reader(
+     let read_period = get_read_period(&context.config, ros2_name);
+ 
+     // create matching DDS Reader that forwards message coming from DDS to Zenoh
+-    let reader = create_dds_reader(
++    let independent_worker = matches!(
++        context.config.get_pub_priority_and_express(ros2_name),
++        Some((Priority::DataLow | Priority::Background, _))
++    );
++    let bulk_rate = if independent_worker {
++        std::env::var("HORUS_ZENOH_BULK_BYTES_PER_SECOND")
++            .unwrap_or_else(|_| "0".into())
++            .parse::<u64>()
++            .map_err(|_| "HORUS_ZENOH_BULK_BYTES_PER_SECOND must be a nonnegative integer")?
++    } else {
++        0
++    };
++    let callback: Box<dyn Fn(&DDSRawSample) + Send> = if independent_worker
++        && ros2_type == "std_msgs/msg/UInt8MultiArray"
++        && ros2_name.ends_with("/indexed")
++    {
++        hmsh_forwarder(publisher.clone(), route_id.to_owned(), bulk_rate)?
++    } else {
++        let route_id = route_id.to_owned();
++        let publisher = publisher.clone();
++        Box::new(move |sample| {
++            // Urgent/sensing readers run in DDS callbacks and must never join
++            // the bulk governor, even when their static rate is zero.
++            if independent_worker {
++                pace_bulk_sample(sample.len(), bulk_rate);
++            }
++            route_dds_message_to_zenoh(sample, &publisher, &route_id);
++        })
++    };
++    let reader = create_dds_reader_with_worker(
+         context.participant,
+         topic_name.clone(),
+         type_name,
+@@ -429,13 +473,8 @@ fn activate_dds_reader(
+         keyless,
+         reader_qos.clone(),
+         read_period,
+-        {
+-            let route_id = route_id.to_string();
+-            let publisher = publisher.clone();
+-            move |sample: &DDSRawSample| {
+-                route_dds_message_to_zenoh(sample, &publisher, &route_id);
+-            }
+-        },
++        independent_worker,
++        callback,
+     )?;
+     let old = dds_reader.deref().swap(reader, Ordering::Relaxed);
+     // add reader's GID in ros_discovery_info message
+@@ -451,6 +490,45 @@ fn activate_dds_reader(
+     Ok(())
+ }
+ 
++fn hmsh_forwarder(
++    publisher: Arc<AdvancedPublisher<'static>>,
++    route_id: String,
++    rate: u64,
++) -> Result<Box<dyn Fn(&DDSRawSample) + Send>, String> {
++    let capacity = std::env::var("HORUS_ZENOH_MESH_QUEUE_BYTES")
++        .unwrap_or_else(|_| "134217728".into())
++        .parse::<usize>()
++        .map_err(|_| "HORUS_ZENOH_MESH_QUEUE_BYTES must be a positive integer")?;
++    if !(1024..=1073741824).contains(&capacity) {
++        return Err("HORUS_ZENOH_MESH_QUEUE_BYTES must be 1024..1073741824".into());
++    }
++    let (sender, receiver) = crate::hmsh_queue::channel(capacity, 65536);
++    let name = route_id.clone();
++    std::thread::Builder::new()
++        .name("hmsh-publisher".into())
++        .stack_size(512 * 1024)
++        .spawn(move || {
++            while !receiver.closed() {
++                if let Some(bytes) = receiver.next(Duration::from_millis(100)) {
++                    pace_bulk_sample(bytes.len(), rate);
++                    if receiver.closed() {
++                        break;
++                    }
++                    if let Err(error) = publisher.put(bytes).wait() {
++                        tracing::error!("{name}: failed to forward HMSH page: {error}");
++                    }
++                }
++            }
++        })
++        .map_err(|error| format!("Error starting HMSH publisher: {error}"))?;
++    tracing::info!("{route_id}: full-replacement HMSH queue enabled (budget={capacity}, bulk_bytes_per_second={rate})");
++    Ok(Box::new(move |sample| {
++        if let Err(error) = sender.push(sample.data_as_slice().to_vec()) {
++            tracing::warn!("{route_id}: {error}");
++        }
++    }))
++}
++
+ fn deactivate_dds_reader(
+     dds_reader: &Arc<AtomicDDSEntity>,
+     route_id: &str,
+diff --git a/zenoh-plugin-ros2dds/src/route_subscriber.rs b/zenoh-plugin-ros2dds/src/route_subscriber.rs
+index d5e824b..7342b2a 100644
+--- a/zenoh-plugin-ros2dds/src/route_subscriber.rs
++++ b/zenoh-plugin-ros2dds/src/route_subscriber.rs
+@@ -12,7 +12,7 @@
+ //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
+ //
+ 
+-use std::{collections::HashSet, ffi::CStr, fmt, time::Duration};
++use std::{collections::HashSet, ffi::CStr, fmt, time::{Duration, Instant}};
+ 
+ use cyclors::{
+     dds_entity_t, dds_get_entity_sertype, dds_strretcode, dds_writecdr, ddsi_serdata_from_ser_iov,
+@@ -379,7 +379,12 @@ fn route_zenoh_message_to_dds(s: Sample, ros2_name: &str, data_writer: dds_entit
+             size as usize,
+         );
+ 
++        let started = Instant::now();
+         let ret = dds_writecdr(data_writer, fwdp);
++        if started.elapsed() > Duration::from_millis(100) {
++            tracing::warn!("Slow Zenoh-to-DDS write: topic={} bytes={} elapsed_ms={}",
++                ros2_name, len, started.elapsed().as_millis());
++        }
+         if ret < 0 {
+             tracing::warn!(
+                 "Route Subscriber (Zenoh:{} -> ROS:{}): DDS write({data_writer}) failed: {}",
