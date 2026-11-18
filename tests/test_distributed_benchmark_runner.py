@@ -7,14 +7,12 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 
-def test_lan_defaults_to_tuned_poke_lan_path():
+def test_lan_requires_explicit_site_addresses():
     import run_distributed_benchmark as runner
 
     assert runner.PATHS["lan"]["sender"] == "arancina"
     assert runner.PATHS["lan"]["receiver"] == "poke"
-    assert runner.NODES["poke"]["ip"] == "10.186.13.16"
-    assert runner.PATHS["lan"]["target"] == "10.186.13.16"
-    assert not runner.PATHS["lan"]["target"].startswith("100.")
+    assert runner.PATHS["lan"]["target"] == runner.NODES["poke"]["ip"]
 
 
 def test_zenoh_benchmark_configs_include_camera_and_control_priorities():

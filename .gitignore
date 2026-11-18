@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 .env.backup-*
 .env.before_*
 .run/
@@ -6,6 +8,7 @@
 .runtime/
 .venv-webrtc
 .webrtc_profile.env
+.webrtc_profile.env.fingerprint
 .zenoh_profile.env
 .zenoh_tls_profile.env
 config/webrtc_streams.json

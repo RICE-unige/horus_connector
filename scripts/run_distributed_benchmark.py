@@ -12,9 +12,7 @@ import time
 import uuid
 
 
-ROOT_WIN = r"\\wsl.localhost\Ubuntu\home\omotoye\horus_connector"
-ROOT_POSIX = "~/horus_connector"
-LOCAL_ROOT = Path(ROOT_WIN) if os.name == "nt" else Path(__file__).resolve().parents[1]
+LOCAL_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_RUN_WIN = LOCAL_ROOT / ".run"
 RUN_ID = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
 BENCH_WIN = Path(os.environ.get("HORUS_BENCH_OUTPUT_DIR", str(LOCAL_RUN_WIN / "distributed_benchmark" / RUN_ID)))
@@ -53,11 +51,12 @@ NETWORK_PROFILES = {
 
 
 NODES = {
-    "wsl": {"kind": "wsl", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "host": "local", "ip": "100.70.153.10"},
-    "arancino": {"kind": "ssh", "alias": "arancino", "distro": "jazzy", "root": "/home/omotoye/horus_connector", "ip": "10.186.13.53"},
-    "arancina": {"kind": "ssh", "alias": "arancina", "distro": "jazzy", "root": "/home/rice/horus_connector", "ip": "10.186.13.39"},
-    "poke": {"kind": "ssh", "alias": "poke", "distro": "humble", "root": "/home/rice/horus_connector", "ip": "10.186.13.16"},
-    "cloud": {"kind": "ssh", "alias": "googlecloud", "distro": "", "root": "/home/adeko/horus_connector", "ip": "34.7.220.13"},
+    "wsl": {"kind": "wsl", "distro": "jazzy", "root": str(LOCAL_ROOT) if os.name != "nt" else "",
+            "host": "local", "ip": ""},
+    "arancino": {"kind": "ssh", "alias": "", "distro": "jazzy", "root": "", "ip": ""},
+    "arancina": {"kind": "ssh", "alias": "", "distro": "jazzy", "root": "", "ip": ""},
+    "poke": {"kind": "ssh", "alias": "", "distro": "humble", "root": "", "ip": ""},
+    "cloud": {"kind": "ssh", "alias": "", "distro": "", "root": "", "ip": ""},
 }
 
 for node_name, info in NODES.items():
@@ -1185,6 +1184,13 @@ def main() -> None:
         active_nodes.add(info["receiver"])
         if info.get("hub"):
             active_nodes.add(info["hub"])
+        if not info["target"]:
+            raise ValueError(f"{path} path has no configured target IP; set the matching HORUS_BENCH_*_IP")
+    for node in sorted(active_nodes):
+        if not NODES[node]["root"].startswith("/"):
+            raise ValueError(f"Set HORUS_BENCH_{node.upper()}_ROOT to an absolute path at the selected site")
+        if NODES[node]["kind"] == "ssh" and not NODES[node]["alias"]:
+            raise ValueError(f"Set HORUS_BENCH_{node.upper()}_ALIAS for the selected site")
 
     stop_all(active_nodes)
     for node in sorted(active_nodes):
