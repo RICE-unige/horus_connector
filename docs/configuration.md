@@ -10,6 +10,13 @@ not executed. Quote values containing spaces, quotes or JSON. Generated fleet
 files use this same grammar. See [reliability and performance](performance.md)
 for routing, camera delivery, recovery budgets and qualification instructions.
 
+## Installation
+
+- Bootstrap reuses the ROS setup or overlay selected in the profile. On Ubuntu 24.04/Jazzy or 22.04/Humble with the official ROS 2 apt repository configured, `HORUS_INSTALL_ROS=1 ./horus bootstrap` also installs ROS Base and Cyclone DDS when no default ROS setup is present. For a custom install, set `ROS_SETUP_PATH` instead.
+- The `cloud` role does not require ROS for routing and signaling alone. Native cloud media fan-out needs ROS and a matching [runtime bundle](#pinned-experiment-runtime).
+- Bootstrap detects Intel render devices for VA-API. On Jetson use the JetPack-provided drivers and codecs. A matching CPU architecture alone does not qualify a host's video stack or guarantee a native bundle is available.
+- `RUN_APT=no` skips apt for hosts with dependencies already installed. It does not skip runtime validation.
+
 ## Core Environment
 
 | Variable | Used by | Purpose |
@@ -30,6 +37,7 @@ for routing, camera delivery, recovery budgets and qualification instructions.
 | `ROS_DISTRO` | ROS 2 distro to source, for example `humble` or `jazzy`. |
 | `ROS_DOMAIN_ID` | DDS domain used by local ROS 2 nodes and the bridge. |
 | `ROS_SETUP_PATH` | Optional custom `setup.bash` or `local_setup.bash` path for source-built ROS installs. |
+| `HORUS_INSTALL_ROS` | Set `1` to opt in to apt installation of ROS Base and Cyclone DDS if ROS is missing. A value supplied in the bootstrap command environment overrides the profile for that invocation. |
 | `ROS_LOCALHOST_ONLY` | Keeps DDS traffic local to the host. Default: `1`. |
 | `ROS_AUTOMATIC_DISCOVERY_RANGE` | ROS discovery range. Default: `LOCALHOST`. |
 | `ROS_CMD_TOPIC` | Robot velocity command topic. Default: `/cmd_vel`. |
@@ -52,7 +60,51 @@ Artifacts:
 .run/zenoh.log
 ```
 
-The launch terminal DDS values are captured before `.env` is loaded, so stale `.env` settings can be detected. The snapshot includes `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`, `ROS_LOCALHOST_ONLY`, `ROS_AUTOMATIC_DISCOVERY_RANGE`, `ROS_STATIC_PEERS`, `ROS_DISCOVERY_SERVER`, `CYCLONEDDS_URI`, `FASTRTPS_DEFAULT_PROFILES_FILE`, network interfaces, and the selected route interface.
+The launch terminal DDS values are captured before `.env` is loaded. Launch
+loads the configured ROS overlay once, applies one local domain to the DDS
+probe, each Zenoh lane and the local native/Python ROS components, and
+rejects conflicting terminal or explicit Zenoh plugin domain values. Sites
+on opposite sides of Zenoh may use different DDS domains. A separate source
+camera domain is an explicit exception, local to the camera input node.
+
+The topic check bypasses the ROS CLI daemon. A topic listing is discovery,
+not proof of publication. Set `HORUS_DDS_PROBE_TOPIC` to a known active
+local topic; a configured but unreadable robot sample blocks launch.
+For an operator, run `HORUS_DDS_REQUIRE_SAMPLE=1 ./horus doctor machine`
+after launch to require an active TF/odometry sample, or the configured
+probe topic. This does not prove that all cameras arrived on Quest.
+Use `HORUS_DDS_INTERFACE` or a `CYCLONEDDS_URI` appropriate to the local
+ROS graph for a multihomed host.
+
+### Pinned experiment runtime
+
+Set `HORUS_RUNTIME_BUNDLE` to the platform-matched archive and
+`HORUS_RUNTIME_SHA256` to its published checksum. Set
+`HORUS_RUNTIME_BRIDGE_REVISION` to the ROS 2 revision in the compatibility
+manifest; bootstrap and launch reject a mismatch when set. Bootstrap validates the
+archive and the Zenoh build receipt before installing to
+`.runtime/releases/<sha256>`. Repeating the exact install reuses that
+directory. Bootstrap and launch select the same binary set; a missing
+verified runtime is an error, not a fallback to stock Zenoh. The bundle is
+specific to Ubuntu, architecture, and the ROS distribution.
+
+For Internet deployments, configure three mTLS Zenoh lanes and give
+each site its own identity. All three TCP lanes and UDP TURN must be
+reachable from the actual operator network. With native cloud media
+fan-out, the cloud profile also sets `HORUS_CLOUD_MEDIA_CONFIG` (relay
+streams), `HORUS_CLOUD_MEDIA_PARAMS` (private ROS ICE settings),
+`HORUS_CLOUD_MEDIA_ZENOH_CONFIG` (mTLS client configuration) and
+`HORUS_CLOUD_MEDIA_DOMAIN_ID` (dedicated local DDS domain, default 209).
+The signaling client forwards only the fleet
+`/horus/remote/webrtc/{client_signal,server_signal}` and operator
+`/horus/cloud/webrtc/{client_signal,server_signal}` topic pairs. The relay
+receives one H.264 track per camera and fans out to each operator. It
+does not receive control, DDS camera images or map geometry.
+
+The UAV simulation helper uses the same launch pipeline; it reads a
+locally owned `~/.config/horus/uav-sim-machine.env` or an explicit
+`HORUS_ENV`. Copy the public template and configure the local graph rather
+than relying on a lab-specific checked-in profile.
 
 Use:
 

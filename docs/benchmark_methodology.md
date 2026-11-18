@@ -104,7 +104,11 @@ global network buffers or shape the active LAN/Wi-Fi/VPN interface implicitly.
 Impairment trials require an explicitly configured disposable veth; the runner
 rejects ordinary interfaces and cleans up only its own qdisc handle.
 
-Run the distributed benchmark through the tracked runner:
+Run the distributed benchmark through the tracked runner. Configure the
+selected sites with `HORUS_BENCH_<SITE>_ALIAS`, `HORUS_BENCH_<SITE>_IP` and
+`HORUS_BENCH_<SITE>_ROOT` in a private environment. Roots must be absolute
+paths on the respective hosts. The runner does not contain lab endpoints
+or credentials.
 
 ```bash
 HORUS_BENCH_DURATION=300 \

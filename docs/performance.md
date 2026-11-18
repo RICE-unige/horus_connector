@@ -1,5 +1,8 @@
 # Reliability and Performance
 
+See [experiment runtime configuration](configuration.md#pinned-experiment-runtime)
+for the authenticated hub, native runtime and cloud media setup.
+
 The connector keeps ROS state/maps on Zenoh and camera media on WebRTC.
 The native remote-control profile uses a separate WebRTC control peer with
 fleet-side leases; the compatibility profile retains ROS/Zenoh control.
@@ -82,6 +85,22 @@ The ordinary single-session priority-link profile above retains peer mode for
 its existing multi-link reconnection behavior. Session isolation is not a
 guarantee against a congested physical uplink; qualify it with TF age and
 worst delivery gaps as well as average camera FPS.
+Use `./horus doctor robot` or `./horus doctor machine` to check each of
+the three destination ports. An open port is transport reachability, not
+proof that subscriptions are matched or data is flowing.
+
+For an Internet hub without a VPN, set `HORUS_ZENOH_SESSION_MTLS=1`
+with `HORUS_ZENOH_SESSION_ISOLATION=1` and `ZENOH_TRANSPORT=tcp`
+across the hub and its clients. Each role's `ZENOH_CONFIG` must set
+`transport.link.tls.enable_mtls=true` and an absolute
+`root_ca_certificate`. Supply `listen_certificate` and
+`listen_private_key` at the hub; supply `connect_certificate` and
+`connect_private_key` on each client. Use separate site identities,
+with the hub's public address in its certificate SAN. Name verification
+cannot be disabled in this profile; there is no plaintext fallback.
+Use a new run directory/port set for an evaluation or stop the old
+session group before replacing its settings. A trusted client certificate
+joins the transport, not a lease or topic permission.
 
 Optional per-socket network markings can be set with
 `HORUS_ZENOH_SESSION_DSCP=46,18,8` on both endpoints and the hub. These are
@@ -119,6 +138,15 @@ preserves epoch resets/deletions and all transmitted geometry/colour; it never
 coalesces arbitrary ROS deltas. `HORUS_ZENOH_MESH_QUEUE_BYTES` defaults to 128 MiB.
 Other messages retain FIFO/backpressure. Finite DDS history can still overflow;
 incremental producers need checkpoint/retry semantics and coverage checks.
+
+If a site uses a modest-rate live depth stream and large map snapshots, test
+assigning that specific depth topic priority `5` and the map topic `6` or
+`7` on both endpoints. This keeps depth out of the bulk queue in
+three-session mode without changing cloud/mesh geometry. It is an explicit
+route policy, not a global default; verify sensing capacity before moving
+high-rate depth there. A bulk cap is not a promise that every full snapshot
+can arrive at its source rate. Verify checksum-matched progress and final
+map coverage, and bound the source snapshot rate to the measured capacity.
 
 ### Compatibility ROS Video Adapter
 
@@ -214,6 +242,24 @@ track IDs, fresh status and the correct child process must all agree. On ROS
 output, useful delivery means ROS-published frames, not just decoder callbacks.
 The connector cannot prove that a Quest has displayed those frames.
 
+For the native operator RTP relay, `jitter_buffer_ms` can be set once in
+the relay JSON or overridden per stream. It defaults to 30 ms. Compare the
+worst decode silence and the source-to-decoder age before increasing it.
+The relay's `ice_servers` configure its local ICE agent. Set
+`source_ice_servers` explicitly when the source needs different servers,
+for example an operator-side TURN allocation with a public STUN server
+on the source. An empty list means no ICE servers on the source. Omitting
+the field preserves the existing behavior of forwarding `ice_servers`
+in the camera offer. To test Oracle/TURN rather than just Zenoh signaling
+through the hub, verify that the selected media pair includes a candidate
+from the expected TURN server, or use relay-only ICE and verify reception.
+
+TCP startup checks use the configured Zenoh or metrics bind address. A
+wildcard listener is probed on loopback for its address family. The Python
+WebRTC signaling client requires a registration acknowledgement on each new
+socket; if it does not arrive within five seconds, the client reconnects
+without releasing the queued offer to an unregistered connection.
+
 | Setting | Default | Purpose |
 |---|---|---|
 | `WEBRTC_DURATION` | `0` | Run until stopped. A positive value is an intentional finite session. |
@@ -246,10 +292,8 @@ provided codec profiles are never overwritten by that mechanism.
 Qualify topics, services and actions separately with the robot's actual RMW.
 The pinned ROS2DDS implementation uses Cyclone-specific service request headers;
 successful topic forwarding from a Fast DDS source does not prove generic
-cross-vendor service/action interoperability. The Arancino hospital test uses
-topic-based task adapters which call Nav2 locally. An empty-path round trip
-checks only command/feedback transport, not successful navigation or generic
-RPC support. Do not advertise that configuration as a generic service test.
+cross-vendor service/action interoperability. A topic-based task adapter that
+calls Nav2 locally does not exercise cross-vendor service/action transport.
 
 In the compatibility Python media path each operator room has independent encoders. Bundling shares the
 peer connection, not encoded video between operators. Inspect
@@ -278,11 +322,14 @@ Use the managed Python runtime created by bootstrap:
 ```bash
 source /opt/ros/jazzy/setup.bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 HORUS_FIELD_ROS_TEST=1 .venv-webrtc/bin/python -m pytest tests -q
+.venv-webrtc/bin/python tests/check_release_dds_launch.py --output .run/checks/dds-launch
 .venv-webrtc/bin/python tests/check_zenoh_routes.py --bulk --custom-routes --output .run/checks/routes
 .venv-webrtc/bin/python tests/check_zenoh_routes.py --bridge-binary /path/to/zenoh-priority/zenoh-bridge-ros2dds --priority-links --bulk --custom-routes --constrained-mbps 5 --output .run/checks/weak-link
 .venv-webrtc/bin/python tests/check_zenoh_routes.py --bridge-binary /path/to/zenoh-priority/zenoh-bridge-ros2dds --priority-links --bulk --custom-routes --constrained-mbps 5 --bulk-budget-bps 500000 --output .run/checks/shared-governor
 .venv-webrtc/bin/python tests/check_priority_reconnect.py --bridge-binary /path/to/zenoh-priority/zenoh-bridge-ros2dds --output .run/checks/priority-reconnect
 .venv-webrtc/bin/python tests/check_zenoh_routes.py --bulk --hub --output .run/checks/hub
+.venv-webrtc/bin/python tests/check_zenoh_routes.py --bridge-binary /path/to/zenoh-priority/zenoh-bridge-ros2dds --hub --session-lanes --bulk --custom-routes --output .run/checks/hub-three-sessions
+.venv-webrtc/bin/python tests/check_zenoh_routes.py --bridge-binary /path/to/zenoh-priority/zenoh-bridge-ros2dds --hub --session-lanes --bulk --custom-routes --restart-bulk --output .run/checks/hub-bulk-restart
 .venv-webrtc/bin/python tests/check_ros_webrtc.py --letterbox --latched-info --output .run/checks/camera
 .venv-webrtc/bin/python tests/check_connector_launch.py --output .run/checks/launcher
 .venv-webrtc/bin/python tests/check_media_recovery.py --track-only --output .run/checks/track
@@ -304,6 +351,28 @@ definition is not an executed compatibility result. H.264 requires GStreamer
 compatibility option, not a claim of identical multicamera recovery/features.
 Run long mixed-load, real WAN/TURN and physical hardware tests before claiming
 a supported production capacity or a release-wide zero-bug guarantee.
+
+### Remote Trial Preflight
+
+1. Run `./horus doctor robot` and `./horus doctor machine` on their respective
+   hosts (and `./horus doctor cloud` on the hub when used). Save
+   `./horus status --json` once the services are up. Confirm that the source
+   and operator binaries include WebRTC when using the native media path.
+   For a native-only run, set `HORUS_STREAMS_CONFIG` to a file containing
+   `{"version":2,"streams":[]}` instead of leaving it unset. This prevents
+   the compatibility launcher from starting a fallback camera alongside
+   the native path. Check Zenoh camera routing separately for duplicates.
+2. Record the selected transport, not just the configuration. For Tailscale,
+   check whether `tailscale ping` reports direct or DERP. For WebRTC, use
+   selected ICE pair evidence. Cloud signaling alone does not prove relay use.
+3. With motion disabled, exercise all expected cameras, TF and a representative
+   map load for at least 90 seconds before recording a trial. Measure per-camera
+   receive/decode FPS and worst delivery gap across the full window, alongside TF
+   freshness and gaps. Check the same streams in HORUS on the headset. If FPS
+   is low, confirm frames reach the encoder before changing the WAN profile.
+4. Keep route comparisons matched and retain stalls, failed trials and route
+   changes in the results. Restarting a decoder or receiving a late burst is
+   not proof of uninterrupted delivery.
 
 ## Native Packet Relay And Fleet Control
 
@@ -367,6 +436,20 @@ change that exceeds capacity is retained at the current profile with a warning;
 it does not create unlimited encoders. `/horus/remote/media/encoders/status`
 reports the active group/consumer count.
 
+For repeated views of identical cameras, `HORUS_SOURCE_MEDIA_STABLE_GROUPS=true`
+optionally keeps a group per requested camera/codec/bitrate/FPS/priority
+instead of splitting it whenever per-viewer bandwidth estimates diverge.
+Its existing encoder adjusts to the lowest allowance among viewers in
+that specific group, with faster reductions than increases. Operators
+with distinct immersive and overview profiles do not share that limit.
+This trades per-viewer quality independence for fewer encoder restarts.
+It does not remove per-viewer network copies: three operators requesting
+all three cameras still create nine outbound tracks. Use the
+[cloud packet fan-out profile](configuration.md#pinned-experiment-runtime)
+to move those copies off the fleet uplink. Three-camera visibility at
+every site is the primary load arm; one assigned camera per operator is
+only a diagnostic.
+
 For independent fleet-side control, explicitly select
 `HORUS_SOURCE_CONTROL_MODE=authority` at the robot site and
 `HORUS_OPERATOR_CONTROL_MODE=proxy` at every operator relay. Leave these `local`
@@ -378,6 +461,22 @@ Only the fleet authority publishes the final robot command. It checks positive
 lease ownership, sequence and monotonic-clock deadline; expired Twist motion
 receives a zero command. These freshness/watchdog checks are operational
 correctness, not a replacement for robot-local safety controllers.
+
+Control and video have separate ICE peers. For a site without a VPN,
+set `HORUS_CONTROL_ICE_CONFIG` to a private JSON file on both native
+control endpoints. An operator that must use TURN can select
+`{"ice_transport_policy":"relay","ice_servers":["turn://user:credential@hub.example:3478"]}`.
+For a relay-only qualification, use separate TURN credentials at the
+authority too. With relay policy the control link refuses to exchange
+commands and clock probes unless the selected pair contains a TURN
+candidate; an ICE state of connected by itself does not qualify the route.
+Provision actual per-site credentials outside the repository; only the
+configured local process reads them. Leave the setting unset to preserve
+host-only control ICE for existing direct/private deployments. Use an
+authenticated signaling/telemetry path for real control. The current native
+control backend supports UDP TURN; do not assume a UDP-blocked site works
+on TCP/TLS just because video or the signaling port connects. Verify
+`clock_valid` and the selected control candidate types per operator.
 
 Status topics are `/horus/remote/media/native/status` and
 `/horus/remote/control/{proxy,authority}/status`. Inspect actual packet/frame
@@ -403,6 +502,43 @@ acquisition time, and neither is a measured full input latency.
 Video repair is age-limited to 250 ms, byte-budgeted, and passes through the
 negotiated pacer. The repair allowance also follows the current bitrate, so a
 low-capacity stream does not receive a fixed multi-megabit repair burst.
+
+### Local Camera Ingress
+
+Watch `/horus/remote/media/encoders/status` and compare its input/push counters
+with source publication. WebRTC bandwidth adaptation cannot recover raw
+images that did not reach the robot-side DDS subscriber.
+
+`HORUS_SOURCE_MEDIA_CAMERA_DOMAIN_ID` optionally isolates the native sender's
+camera subscriptions, auxiliary images, and camera keyframe requests from
+its normal ROS graph. The main `ROS_DOMAIN_ID` still carries signaling,
+state and control; Zenoh does not enter the camera domain. Empty keeps the
+existing behavior. A sender built without this feature will not pass
+launcher readiness when it is requested.
+
+Publish the raw or encoded camera topics on the selected domain, with fully
+qualified topic names. To use local Cyclone DDS TCP, keep the primary domain
+profile and add a dedicated camera entry to the publisher's and native
+sender's `CYCLONEDDS_URI`. For example, this is the sender-side entry:
+
+```xml
+<Domain id="174">
+  <General>
+    <Interfaces><NetworkInterface name="lo"/></Interfaces>
+    <Transport>tcp</Transport><AllowMulticast>false</AllowMulticast>
+  </General>
+  <Discovery><Peers><Peer Address="127.0.0.1:58200"/></Peers></Discovery>
+  <TCP><Port>58201</Port></TCP>
+</Domain>
+```
+
+Swap 58200 and 58201 in the camera publisher's profile. Place both domain
+entries under `<CycloneDDS>`; scope any existing catch-all profile to the
+normal domain. For these processes use
+`ROS_AUTOMATIC_DISCOVERY_RANGE=SYSTEM_DEFAULT` with the explicit interfaces
+and unset the deprecated `ROS_LOCALHOST_ONLY`. Do not move an existing
+publisher until its intended subscribers can use the same domain and
+transport. This local TCP hop is not the WAN video transport.
 
 ### Shared Link Budget
 
@@ -430,6 +566,11 @@ SDK overrides1-16 in Python/C++/Rust. Impossible session admission is rejected
 explicitly; the native default session ceiling is64. No geometry is removed.
 The file is atomically refreshed5Hz. Invalid/missing/stale files use a bounded
 fallback no greater than the last safe rate, never unlimited bulk.
+`HORUS_LINK_BULK_LIMIT_KBPS` optionally caps bulk even as GCC reduces video
+bitrate. Its default 0 keeps the existing behavior. A positive cap must be at
+least the bulk floor and requires an enabled shared link budget. It preserves
+headroom for video recovery on weak links but can delay bulk delivery. It is
+not an automatic link-capacity measurement or a change to map resolution.
 `/horus/remote/media/bandwidth_budget` reports allocations and actual demand
 priorities. Independent robots sharing an ISP need one common egress governor
 or explicitly partitioned budgets; separate source processes do not magically
@@ -471,6 +612,21 @@ custom capability-derived routes. Inconsistent policies can leave a route
 unmatched; automatic cross-host policy synchronization is not implemented.
 The legacy single-session mode remains the default.
 
+For map-heavy links, use independent sessions when TF delivery pauses during
+full map or point-cloud publications. A higher topic priority cannot overtake
+bytes already queued ahead of it on a shared TCP connection. Keep the same
+map data and put TF on a real-time route (for example, priority `1:express`)
+and point clouds or geometry on a bulk route (priority `6` or `7`). Verify
+that all three connections are present on both endpoints, and compare TF
+gaps under concurrent load, not just average TF rate.
+
+Build an artifact for each endpoint's architecture. A Docker build on ARM64
+needs Python with the `tarfile` extraction filter (for example, Python 3.12),
+Rust, Git, CMake and the Cyclors native build tools. Keep the compiled bridge
+and its checksum-bearing `.source.json` together. An upstream ARM64 release
+binary can run the single-session mode but cannot replace the verified HORUS
+build for independent sessions.
+
 The base port and the next two ports are used (`7447`, `7448`, `7449` by default).
 HORUS does not alter host firewall, router, MTU or Wi-Fi settings. Each session
 has a separate process, DDS participant, Zenoh identifier and reconnection
@@ -496,23 +652,22 @@ Qualification commands, using an installed Jazzy environment:
 
 ```bash
 python3 tests/check_route_lifecycle.py --bridge /absolute/path/zenoh-bridge-ros2dds --output /new/output/lifecycle
-python3 tests/check_zenoh_routes.py --session-lanes --bulk --constrained-mbps 5 --bulk-budget-bps 250000 \
+python3 tests/check_zenoh_routes.py --session-lanes --bulk --constrained-mbps 5 --bulk-budget-bps 500000 \
   --bridge-binary /absolute/path/zenoh-bridge-ros2dds --output /new/output/session-test
 ```
 
 The second test uses an application-only shared-capacity TCP proxy, not host
 traffic shaping. It checks TF, return routes, static transforms, reliable bulk
-hashes and final indexed mesh state. These are controlled local tests, not WAN
+hashes and final indexed mesh state. It also fails on a gap of 250 ms or more
+in any expected dynamic TF stream after warmup, including silence at the end
+of the receiver window. These are controlled local tests, not WAN
 latency guarantees. The real-recording JPEG/WebRTC comparison is documented in
 the SDK's `python/examples/REAL_CAMERA_STREAM_EXPERIMENT.md`; retain bad runs,
 whole-window silences and source-matched quality, not just average FPS.
 
-Current qualification caveat: later runs at the example's250,000 byte/s bulk
-allowance failed final mesh convergence (one page retained an older revision),
-despite all32 arbitrary integrity payloads and low TF latency. Applying monotonic
-HMSH revisions in the checker did not make that failure disappear. The same
-5 Mbit/s fixture passed at500,000 byte/s, with all32 final mesh hashes intact.
-This implicates budget/drain/producer lifetime but is not a completed diagnosis
-or a reason to increase everyone's allowance. The earlier lower-budget pass
-does not qualify this corner case; keep session isolation opt-in and retain
-final-state/retry checks for incremental maps.
+Current qualification caveat: the 250,000 byte/s stress profile has passed
+some runs and failed others, leaving old mesh revisions or missing integrity
+payloads even with low TF latency. The same 5 Mbit/s fixture passed at
+500,000 byte/s with all 32 final mesh hashes intact. This does not establish a
+cause or a universal allocation for deployments. Keep session isolation
+opt-in and retain final-state/retry checks for incremental maps.
