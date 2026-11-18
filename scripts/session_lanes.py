@@ -2,13 +2,13 @@
 
 import argparse
 import copy
-import hashlib
 import json
 from pathlib import Path
 
 import json5
 
 from link_profile import endpoint
+from bridge_dependency import digest
 
 CLASSES = ("realtime", "sensing", "bulk")
 
@@ -23,11 +23,23 @@ def parse_dscp(value):
     return dict(zip(CLASSES, codes))
 
 
-def configure(base, *, target="", bind="0.0.0.0", port=7447, send_buffer=65536, dscp=None):
+def configure(base, *, target="", bind="0.0.0.0", port=7447, send_buffer=65536, dscp=None,
+              mtls=False):
     if not 1 <= port <= 65533:
         raise ValueError("Three independent sessions require base port 1..65533")
     if dscp is not None and set(dscp) != set(CLASSES):
         raise ValueError("DSCP requires all three traffic classes")
+    if mtls:
+        tls = base.get("transport", {}).get("link", {}).get("tls", {})
+        identity = "connect" if target else "listen"
+        paths = ("root_ca_certificate", f"{identity}_private_key", f"{identity}_certificate")
+        if (not isinstance(tls, dict) or tls.get("enable_mtls") is not True
+                or tls.get("verify_name_on_connect", True) is not True
+                or any(not isinstance(tls.get(key), str) or not Path(tls[key]).is_absolute()
+                       or not Path(tls[key]).is_file() for key in paths)):
+            raise ValueError("mTLS sessions require verified names and absolute CA, certificate and key paths")
+        if dscp is not None:
+            raise ValueError("Per-lane DSCP is not supported on TLS sessions")
     result = {}
     for offset, name in enumerate(CLASSES):
         config = copy.deepcopy(base)
@@ -44,16 +56,19 @@ def configure(base, *, target="", bind="0.0.0.0", port=7447, send_buffer=65536, 
         config.setdefault("scouting", {})["multicast"] = dict(enabled=False)
         config["scouting"]["gossip"] = dict(enabled=False)
         code = dscp[name] if dscp is not None else None
-        config["listen"] = dict(endpoints=[] if target else [endpoint(bind, port+offset, send_buffer, dscp=code)])
-        config.setdefault("connect", {})["endpoints"] = [endpoint(target, port+offset, send_buffer, dscp=code)] if target else []
+        address = endpoint(target or bind, port+offset, send_buffer, dscp=code)
+        if mtls:
+            address = "tls/" + address.removeprefix("tcp/")
+            transport["link"]["tls"]["close_link_on_expiration"] = True
+        config["listen"] = dict(endpoints=[] if target else [address])
+        config.setdefault("connect", {})["endpoints"] = [address] if target else []
         result[name] = config
     return result
 
 
 def check_binary(binary):
     receipt = json.loads(Path(str(binary)+".source.json").read_text())
-    with Path(binary).open("rb") as stream:
-        sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    sha = digest(Path(binary))
     if receipt.get("binary_sha256") != sha or "traffic_class_sessions" not in receipt.get("features", []):
         raise ValueError("Session isolation requires the verified HORUS priority bridge build")
 
@@ -68,10 +83,21 @@ def main():
     parser.add_argument("--port", type=int, default=7447)
     parser.add_argument("--send-buffer", type=int, default=65536)
     parser.add_argument("--dscp", type=parse_dscp, help="Optional realtime,sensing,bulk codepoints, e.g. 46,18,8")
+    parser.add_argument("--mtls", action="store_true", help="Require mutually authenticated TLS on every lane")
+    parser.add_argument("--check-existing", action="store_true", help="Do not replace live session configuration")
     args = parser.parse_args()
     check_binary(args.binary)
     profiles = configure(json5.loads(args.base.read_text()), target=args.target, bind=args.bind,
-                         port=args.port, send_buffer=args.send_buffer, dscp=args.dscp)
+                         port=args.port, send_buffer=args.send_buffer, dscp=args.dscp, mtls=args.mtls)
+    if args.check_existing:
+        try:
+            matches = all(json.loads((args.output / (name+".json")).read_text()) == config
+                          for name, config in profiles.items())
+        except (OSError, ValueError):
+            matches = False
+        if not matches:
+            parser.exit(1, "Stop the current Zenoh services before changing active session settings.\n")
+        return
     args.output.mkdir(parents=True, exist_ok=True)
     for name, config in profiles.items():
         (args.output / (name+".json")).write_text(json.dumps(config, indent=2)+"\n")

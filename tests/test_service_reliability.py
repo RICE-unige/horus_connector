@@ -75,6 +75,56 @@ def test_rotating_logs_are_bounded(tmp_path):
     assert all(path.stat().st_size <= 100 for path in tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("retry_startup", [False, True])
+def test_supervisor_failed_clean_exit_is_not_success(tmp_path, retry_startup):
+    state = tmp_path / "service.json"
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/service_runner.py"),
+                             "--state", str(state), "--log", str(tmp_path / "service.log"),
+                             "--max-restarts", "0", "--restart-on-clean-exit",
+                             *(["--retry-startup-errors"] if retry_startup else []),
+                             "--", sys.executable, "-c", "pass"], timeout=5)
+    assert json.loads(state.read_text())["phase"] == "failed"
+    assert result.returncode == 1
+
+
+def test_readiness_probes_configured_listener_address(tmp_path):
+    from service_readiness import check
+    from service_runner import process_start_time
+
+    (tmp_path / "zenoh.service.json").write_text(json.dumps({
+        "phase": "running", "child_pid": os.getpid(),
+        "child_start": process_start_time(os.getpid()),
+    }))
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.2", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        assert not check(tmp_path, "zenoh", port)["ready"]
+        assert check(tmp_path, "zenoh", port, "127.0.0.2") == {
+            "ready": True, "stage": "listening", "data_ready": False,
+        }
+
+
+def test_native_media_readiness_requires_the_requested_features(tmp_path):
+    from service_readiness import check
+    from service_runner import process_start_time
+
+    name = "source-media"
+    (tmp_path / f"{name}.service.json").write_text(json.dumps({
+        "phase": "running", "child_pid": os.getpid(),
+        "child_start": process_start_time(os.getpid()),
+    }))
+    receipt = {"pid": os.getpid(), "updated_wall_sec": time.time(), "tracks": {}}
+    path = tmp_path / f"{name}.media.json"
+    path.write_text(json.dumps(receipt))
+    assert not check(tmp_path, name, camera_domain=176)["ready"]
+    assert not check(tmp_path, name, bulk_limit=1400)["ready"]
+    receipt.update(camera_domain_id=176, bulk_limit_kbps=1400)
+    path.write_text(json.dumps(receipt))
+    assert check(tmp_path, name, camera_domain=176, bulk_limit=1400)["ready"]
+    assert not check(tmp_path, name, camera_domain=175, bulk_limit=1400)["ready"]
+
+
 def test_forced_cleanup_verifies_supervisor_and_child_identity(tmp_path):
     from service_runner import process_start_time, stop_owned_group
     state = tmp_path / "service.json"

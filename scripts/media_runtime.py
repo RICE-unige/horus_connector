@@ -50,7 +50,8 @@ def validate(mode, role, need_ros, root=None):
             from webrtc_streams import load_streams
             if len(load_streams(root or Path(__file__).resolve().parents[1], role)) > 1:
                 raise RuntimeError("Bundled camera identity requires GStreamer 1.22 or newer")
-        for name in ("webrtcbin", "nicesrc", "nicesink", "rtph264depay", "rtph264pay", "videoscale", "videoconvert", "videobox"):
+        for name in ("webrtcbin", "nicesrc", "nicesink", "appsrc", "appsink", "rtph264depay", "rtph264pay",
+                     "videoscale", "videoconvert", "videobox"):
             if Gst.ElementFactory.find(name) is None:
                 raise RuntimeError(f"Missing GStreamer element: {name}")
 

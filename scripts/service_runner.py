@@ -153,13 +153,13 @@ class Supervisor:
                     return 0 if self.stopping else code
                 if code in self.args.terminal_exit_codes or (time.monotonic() - started < self.args.startup_grace and not self.args.retry_startup_errors):
                     self.status("failed", exit_code=code)
-                    return code
+                    return code or 1
                 now = time.monotonic()
                 self.recent_failures = [stamp for stamp in self.recent_failures if now - stamp < self.args.restart_window]
                 self.recent_failures.append(now)
                 if len(self.recent_failures) > self.args.max_restarts:
                     self.status("failed", exit_code=code)
-                    return code
+                    return code or 1
                 self.restarts += 1
                 delay = min(30, 2 ** (len(self.recent_failures) - 1))
                 self.status("recovering", exit_code=code, retry_in_sec=delay)

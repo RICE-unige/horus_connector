@@ -14,6 +14,31 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from session_lanes import check_binary, configure, parse_dscp
 
 
+@pytest.mark.parametrize("base,expected", [("27447", [27447, 27448, 27449]),
+                                           ("07447", [7447, 7448, 7449])])
+def test_doctor_probes_every_configured_tcp_session(base, expected):
+    script = (ROOT / "horus").read_text()
+    functions = "\n".join(re.search(rf"^{name}\(\) \{{.*?^\}}", script, re.M | re.S).group()
+                          for name in ("zenoh_session_ports", "doctor_zenoh_target"))
+    env = dict(os.environ, HORUS_ZENOH_SESSION_ISOLATION="1", ZENOH_PORT=base)
+    result = subprocess.run(["bash", "-eu", "-c", functions +
+        '\ntcp_probe() { printf "%s:%s\\n" "$1" "$2"; return 1; }\ndoctor_zenoh_target 127.0.0.1'],
+        env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert [int(line.rsplit(":", 1)[1]) for line in result.stdout.splitlines()] == expected
+
+
+def test_status_lists_all_isolated_session_ports_and_processes(tmp_path):
+    config = tmp_path / "horus.env"
+    config.write_text("HORUS_ROLE=cloud\nHORUS_TOPOLOGY=hub\nHORUS_ZENOH_SESSION_ISOLATION=1\n"
+                      "HORUS_CLOUD_IP=127.0.0.1\nZENOH_TRANSPORT=tcp\nZENOH_PORT=27447\n")
+    env = dict(os.environ, HORUS_ENV=str(config), HORUS_RUN_DIR=str(tmp_path / "run"))
+    result = subprocess.run([str(ROOT / "horus"), "status"], env=env, cwd=ROOT, timeout=15,
+                            capture_output=True, text=True, check=True)
+    assert all(f":{port}" in result.stdout for port in (27447, 27448, 27449))
+    assert all(name in result.stdout for name in ("zenoh-sensing", "zenoh-bulk"))
+
+
 @pytest.mark.parametrize("topology,target,expected", [
     ("direct", "100.1.2.3", "peer"),
     ("hub", "203.0.113.2", "client"),
@@ -83,6 +108,26 @@ def test_isolation_requires_matching_binary_receipt(tmp_path):
     binary.write_bytes(b"different binary")
     with pytest.raises(ValueError):
         check_binary(binary)
+
+
+def test_public_session_lanes_require_all_mutual_tls_identity_material(tmp_path):
+    files = {key: str(tmp_path / key) for key in ("root_ca_certificate", "connect_certificate",
+                                                  "connect_private_key")}
+    for path in files.values():
+        Path(path).touch()
+    tls = {**files, "enable_mtls": True, "verify_name_on_connect": True}
+    profile = {"transport": {"link": {"tls": tls}}}
+    result = configure(profile, target="hub.example", mtls=True)
+    assert [config["connect"]["endpoints"][0] for config in result.values()] == [
+        f"tls/hub.example:{port}#so_sndbuf=65536" for port in (7447,7448,7449)]
+    assert all(config["transport"]["link"]["tls"]["close_link_on_expiration"]
+               for config in result.values())
+    assert not tls.get("close_link_on_expiration")
+    with pytest.raises(ValueError, match="mTLS"):
+        configure(profile, mtls=True)  # Server must present its own identity.
+    tls["verify_name_on_connect"] = False
+    with pytest.raises(ValueError, match="verified names"):
+        configure(profile, target="hub.example", mtls=True)
 
 
 @pytest.mark.parametrize("target", ["", "203.0.113.2"])
