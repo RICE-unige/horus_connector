@@ -2,21 +2,15 @@
 """Build the pinned independent-bulk DDS bridge without modifying system installs."""
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 
-from bridge_dependency import prepare
+from bridge_dependency import digest, prepare
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def digest(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def run(arguments, cwd=None):

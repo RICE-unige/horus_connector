@@ -2,19 +2,14 @@
 """Build the pinned GCC/pacing plugin in an isolated, removable runtime."""
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+from bridge_dependency import digest
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def digest(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def build(work, output, jobs=3, toolchain="stable"):
@@ -41,8 +36,8 @@ def build(work, output, jobs=3, toolchain="stable"):
     shutil.copy2(work / "target/release" / manifest["library"], temporary)
     os.replace(temporary, artifact)
     shutil.copy2(source / "LICENSE-MPL-2.0", output / "LICENSE-MPL-2.0")
-    env = dict(os.environ, GST_PLUGIN_PATH=str(plugins) + (":" + os.environ["GST_PLUGIN_PATH"]
-                                                        if os.environ.get("GST_PLUGIN_PATH") else ""))
+    host_plugins = os.environ.get("GST_PLUGIN_PATH_1_0", os.environ.get("GST_PLUGIN_PATH", ""))
+    env = dict(os.environ, GST_PLUGIN_PATH_1_0=os.pathsep.join(filter(None, (str(plugins), host_plugins))))
     subprocess.run(["gst-inspect-1.0", "rtpgccbwe"], env=env, check=True)
     manifest["binary_sha256"] = digest(artifact)
     manifest["rustc"] = subprocess.check_output(["rustc", f"+{toolchain}", "--version"], text=True).strip()

@@ -39,7 +39,12 @@ def fixture(tmp_path):
         output.addfile(entry, io.BytesIO(payload))
         entry = tarfile.TarInfo("cyclors-0.4.0/build.rs")
         payload = ('                    println!("cargo:rerun-if-changed=src/lib.rs");\n'
-                   '                    println!("cargo:rerun-if-changed=src/functions.template");\n').encode()
+                   '                    println!("cargo:rerun-if-changed=src/functions.template");\n'
+                   '                    Ok(())\n'
+                   '                }\n'
+                   '                Err(_) => {\n'
+                   '                    Err(String::from("cannot write template"))\n'
+                   '                }\n').encode()
         entry.size = len(payload)
         output.addfile(entry, io.BytesIO(payload))
     patch = ROOT / "patches/cyclors-0.4.0-serialized-slices.patch"

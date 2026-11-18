@@ -11,6 +11,6 @@
     "url": "https://static.crates.io/crates/cyclors/cyclors-0.4.0.crate",
     "crate_sha256": "6beb8dc0574f6e2184a2a67c6833ff7ab5b64a95d2459db9b009797b0bb7374e",
     "patch": "patches/cyclors-0.4.0-serialized-slices.patch",
-    "patch_sha256": "0dbf1580608478abb0702a9852e62f2e3cac75a312bd764cafeeeb09426c3ba2"
+    "patch_sha256": "661f895fd65756ccc804bb12e6eb9dd5adc72be96ca503f2759c72e04fdb2420"
   }
 }

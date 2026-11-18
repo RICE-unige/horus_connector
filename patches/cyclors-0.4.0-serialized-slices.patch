@@ -1,9 +1,12 @@
 --- a/build.rs
 +++ b/build.rs
-@@ -608,2 +608,3 @@
+@@ -608,5 +608,6 @@
                      println!("cargo:rerun-if-changed=src/lib.rs");
                      println!("cargo:rerun-if-changed=src/functions.template");
 +                    println!("cargo:rerun-if-changed=cyclocut");
+                     Ok(())
+                 }
+                 Err(_) => {
 --- a/cyclocut/src/cdds_blob.c
 +++ b/cyclocut/src/cdds_blob.c
 @@ -270,7 +270,12 @@ static void cdds_to_ser(const struct ddsi_serdata *serdata_common, size_t off, size_
