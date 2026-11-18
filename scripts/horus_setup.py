@@ -13,6 +13,7 @@ import socket
 import sys
 from datetime import datetime
 from pathlib import Path
+from platform import freedesktop_os_release
 
 
 ROLE_HELP = {
@@ -557,7 +558,7 @@ class Wizard:
         elif installed:
             ros_distro = installed[-1]
         else:
-            ros_distro = self.existing.get("ROS_DISTRO") or "jazzy"
+            ros_distro = self.existing.get("ROS_DISTRO") or default_ros_distro()
 
         if self.interactive and len(installed) > 1 and not self.args.ros_distro:
             ros_distro = self.prompt_choice(
@@ -569,7 +570,7 @@ class Wizard:
             source = "detected" if ros_distro in installed else "default"
             print(f"ROS 2 distro: {self.color.paint(ros_distro, 'green')} ({source})")
             if not installed:
-                print("  ROS 2 was not found under /opt/ros. Install ROS 2 before bootstrap/launch on robot, machine, or teammate roles.")
+                print("  No ROS 2 install detected under /opt/ros. Use an existing custom setup or install ROS during bootstrap.")
             print()
         return ros_distro
 
@@ -578,8 +579,6 @@ class Wizard:
         shell_domain = read_shell_default("ROS_DOMAIN_ID")
         existing_domain = self.existing.get("ROS_DOMAIN_ID")
         domain = self.args.ros_domain_id or terminal_domain or shell_domain or existing_domain or "0"
-        if not is_uint(str(domain)):
-            domain = "0"
         hint = (
             f"terminal={terminal_domain or '-'}  "
             f"shell={shell_domain or '-'}  "
@@ -589,7 +588,7 @@ class Wizard:
             "ROS_DOMAIN_ID",
             str(domain),
             required=True,
-            validator=is_uint,
+            validator=lambda value: bool(re.fullmatch(r"[0-9]{1,3}", value)) and int(value) <= 232,
             hint=f"Default source: {hint}. Change this if the robot/machine ROS graph uses another domain.",
         )
 
@@ -602,16 +601,16 @@ class Wizard:
         existing_path = self.existing.get("ROS_SETUP_PATH", "")
         if self.args.ros_setup_path:
             default = self.args.ros_setup_path
-        elif existing_path and Path(os.path.expanduser(existing_path)).exists():
+        elif existing_path and is_existing_file(existing_path):
             default = existing_path
         elif candidates:
             default = candidates[0]
         elif existing_path:
             default = existing_path
         else:
-            default = f"/opt/ros/{ros_distro}/setup.bash"
+            default = ""
 
-        if Path(os.path.expanduser(default)).exists():
+        if default and is_existing_file(default):
             default = expand_path(default)
             print(f"ROS setup file: {self.color.paint(default, 'green')}")
             print("  This file will be sourced before HORUS starts ROS-related services.\n")
@@ -620,11 +619,11 @@ class Wizard:
         setup_path = self.prompt_text(
             "ROS setup file path",
             default,
-            required=True,
+            required=bool(default),
             validator=is_existing_file,
-            hint="ROS was not found at the expected path. Enter the setup.bash/local_setup.bash path from the ROS install or workspace.",
+            hint="Enter an existing overlay setup file, or leave blank to use the standard installation after bootstrap.",
         )
-        return expand_path(setup_path)
+        return expand_path(setup_path) if setup_path else ""
 
     def camera_output_default(self, role: str, room: str) -> str:
         if self.args.camera_output_topic:
@@ -863,11 +862,20 @@ def update_env_text(text: str, values: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def default_ros_distro() -> str:
+    try:
+        release = freedesktop_os_release()
+    except OSError:
+        release = {}
+    return "humble" if (release.get("ID"), release.get("VERSION_ID")) == ("ubuntu", "22.04") else "jazzy"
+
+
 def detect_ros_distros() -> list[str]:
     root = Path("/opt/ros")
     if not root.exists():
         return []
-    return sorted(path.name for path in root.iterdir() if (path / "setup.bash").exists())
+    return sorted(path.name for path in root.iterdir()
+                  if any((path / name).is_file() for name in ("setup.bash", "local_setup.bash")))
 
 
 def detect_ros_setup_candidates(ros_distro: str) -> list[str]:
@@ -893,7 +901,7 @@ def add_setup_candidate(candidates: list[str], value: str) -> None:
     if not value:
         return
     expanded = expand_path(value)
-    if expanded not in candidates and Path(expanded).exists():
+    if expanded not in candidates and Path(expanded).is_file():
         candidates.append(expanded)
 
 

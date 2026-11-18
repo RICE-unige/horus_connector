@@ -54,10 +54,17 @@ def registration_routes(registrations, role):
     return result
 
 
-def resolve(base, additions, streams=(), role="machine"):
+def resolve(base, additions, streams=(), role="machine", dds_domain=None):
     result = json5.loads(Path(base).read_text())
     plugin = result.setdefault("plugins", {}).setdefault("ros2dds", {})
-    allowed = plugin.setdefault("allow", {})
+    if dds_domain is not None:
+        if not 0 <= dds_domain <= 232:
+            raise ValueError("DDS domain must be in 0..232")
+        configured = plugin.get("domain", dds_domain)
+        if type(configured) is not int or configured != dds_domain:
+            raise ValueError(f"Zenoh ros2dds.domain={configured!r} conflicts with ROS_DOMAIN_ID={dds_domain}")
+        plugin["domain"] = dds_domain
+    allowed = plugin.setdefault("allow", {}) if additions or streams else plugin.get("allow", {})
     if "registrations" in additions:
         derived = registration_routes(additions["registrations"], role)
         priorities = {topic: "1:express" for topics in derived.values() for topic in topics}
@@ -109,13 +116,17 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--routes", default="")
     parser.add_argument("--streams", default="")
-    parser.add_argument("--role", choices=("robot", "machine"), default="machine")
+    parser.add_argument("--role", choices=("robot", "machine", "teammate"), default="machine")
+    parser.add_argument("--dds-domain", type=int)
     args = parser.parse_args()
     additions = json.loads(Path(args.routes).read_text()) if args.routes else {}
     streams = json.loads(args.streams) if args.streams else []
     if isinstance(streams, dict):
         streams = streams["streams"]
-    payload = resolve(args.base, additions, streams, args.role)
+    try:
+        payload = resolve(args.base, additions, streams, args.role, args.dds_domain)
+    except (ValueError, OSError) as error:
+        parser.exit(1, f"Cannot prepare Zenoh configuration: {error}\n")
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(dir=output.parent, prefix=output.name + ".")

@@ -58,7 +58,7 @@ def env_snapshot() -> dict[str, str]:
     return snapshot
 
 
-def run_command(args: list[str], timeout: float = 5.0) -> tuple[int, str, str]:
+def run_command(args: list[str], timeout: float = 5.0, env=None) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
             args,
@@ -67,6 +67,7 @@ def run_command(args: list[str], timeout: float = 5.0) -> tuple[int, str, str]:
             stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
+            env=env,
         )
         return proc.returncode, proc.stdout, proc.stderr
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -125,19 +126,17 @@ def find_ros_setup(root: Path, env: dict[str, str]) -> str:
     return ""
 
 
-def ros_topic_list(root: Path, role: str, timeout_sec: float = 8.0) -> dict[str, Any]:
+def ros_topic_list(root: Path, role: str, timeout_sec: float = 8.0, env=None, resolved=False) -> dict[str, Any]:
     if role == "cloud":
         return {"available": False, "skipped": True, "topics": [], "reason": "cloud role does not need a local ROS graph"}
-    env = os.environ.copy()
+    env = os.environ.copy() if env is None else env
     setup = find_ros_setup(root, env)
-    if setup:
-        command = f"source {shlex_quote(setup)} && ros2 topic list"
-        args = ["bash", "-lc", command]
-    elif shutil.which("ros2"):
-        args = ["ros2", "topic", "list"]
-    else:
+    args = ["ros2", "topic", "list", "--no-daemon", "--spin-time", "1"]
+    if setup and not resolved:
+        args = ["bash", "-c", 'source "$1" && shift && exec "$@"', "horus-probe", setup, *args]
+    elif not shutil.which("ros2", path=env.get("PATH")):
         return {"available": False, "topics": [], "error": "ros2 command not found and no ROS setup file was detected"}
-    code, out, err = run_command(args, timeout=timeout_sec)
+    code, out, err = run_command(args, timeout=timeout_sec, env=env)
     topics = sorted({line.strip() for line in out.splitlines() if line.strip().startswith("/")})
     return {
         "available": code == 0,
@@ -148,18 +147,15 @@ def ros_topic_list(root: Path, role: str, timeout_sec: float = 8.0) -> dict[str,
     }
 
 
-def shlex_quote(value: str) -> str:
-    return "'" + value.replace("'", "'\"'\"'") + "'"
-
-
-def ros_data_probe(root: Path, role: str, topic: str, timeout_sec=3.0):
+def ros_data_probe(root: Path, role: str, topic: str, timeout_sec=3.0, env=None, resolved=False):
     if role == "cloud" or not topic:
         return {"skipped": True, "received": False, "reason": "no data probe requested"}
     command = [sys.executable, str(root / "scripts/dds_data_probe.py"), "--topic", topic, "--timeout", str(timeout_sec)]
-    setup = find_ros_setup(root, os.environ)
-    if setup:
-        command = ["bash", "-c", f"source {shlex_quote(setup)} && " + " ".join(shlex_quote(part) for part in command)]
-    code, out, err = run_command(command, timeout=timeout_sec + 5)
+    env = os.environ.copy() if env is None else env
+    setup = find_ros_setup(root, env)
+    if setup and not resolved:
+        command = ["bash", "-c", 'source "$1" && shift && exec "$@"', "horus-probe", setup, *command]
+    code, out, err = run_command(command, timeout=timeout_sec + 5, env=env)
     try:
         return {"skipped": False, **json.loads(out.splitlines()[-1])}
     except (ValueError, IndexError):
@@ -305,7 +301,10 @@ def classify_environment(snapshot: dict[str, str], role: str, runtime: str, plan
     findings: list[Finding] = []
     terminal_domain = snapshot.get("HORUS_TERMINAL_ROS_DOMAIN_ID", "")
     active_domain = snapshot.get("ROS_DOMAIN_ID", "")
-    if terminal_domain and active_domain and terminal_domain != active_domain:
+    if terminal_domain and active_domain and (
+        not terminal_domain.isdecimal() or not active_domain.isdecimal()
+        or int(terminal_domain) != int(active_domain)
+    ):
         findings.append(
             Finding(
                 "error",
@@ -582,15 +581,20 @@ def build_verdict(args: argparse.Namespace) -> dict[str, Any]:
         topic_probe = {"available": False, "skipped": True, "topics": [], "reason": "render mode"}
         bridge_log = parse_bridge_log(run_dir)
     else:
-        topic_probe = ros_topic_list(root, args.role, args.topic_timeout)
+        probe_env = dict(os.environ)
+        probe_env["CYCLONEDDS_URI"] = snapshot["CYCLONEDDS_URI"] or Path(cyclonedds).as_uri()
+        snapshot["CYCLONEDDS_URI"] = probe_env["CYCLONEDDS_URI"]
+        topic_probe = ros_topic_list(root, args.role, args.topic_timeout, probe_env, args.resolved_environment)
         requested = os.environ.get("HORUS_DDS_PROBE_TOPIC", "")
-        if requested or args.mode == "doctor":
+        require_sample = args.mode == "doctor" and truthy(os.environ.get("HORUS_DDS_REQUIRE_SAMPLE"))
+        if requested or args.mode == "doctor" or args.role == "robot":
             selected = requested or next((topic for topic in topic_probe.get("topics", [])
-                                         if topic == "/tf" or topic.endswith("/odom")), "")
-            data_probe = ros_data_probe(root, args.role, selected)
-            if selected and not data_probe.get("received"):
-                findings.append(Finding("warning", "DDS_SAMPLE_NOT_RECEIVED",
-                    f"No sample received from {selected} within the bounded local DDS probe.",
+                                         if topic.endswith(("/tf", "/odom"))), "")
+            data_probe = ros_data_probe(root, args.role, selected, env=probe_env, resolved=args.resolved_environment)
+            if (selected or require_sample) and not data_probe.get("received"):
+                severity = "error" if require_sample or (requested and args.role == "robot") else "warning"
+                findings.append(Finding(severity, "DDS_SAMPLE_NOT_RECEIVED",
+                    f"No sample received from {selected or 'a TF/odometry topic'} within the bounded local DDS probe.",
                     "Topic discovery is not data delivery; check publisher activity, QoS, domain and interface."))
         bridge_log = parse_bridge_log(run_dir)
         findings.extend(classify_environment(snapshot, args.role, args.runtime, args.docker_network))
@@ -682,6 +686,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default="")
     parser.add_argument("--pretty", action="store_true")
     parser.add_argument("--warn-only", action="store_true")
+    parser.add_argument("--resolved-environment", action="store_true")
     return parser.parse_args()
 
 

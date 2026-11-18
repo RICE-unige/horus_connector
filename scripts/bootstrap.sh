@@ -78,6 +78,20 @@ is_jetson() {
   grep -qi 'nvidia,tegra\|jetson' /proc/device-tree/compatible 2>/dev/null
 }
 
+has_intel_render_device() {
+  local device
+  for device in /sys/class/drm/renderD*/device/vendor; do
+    [[ ! -r "${device}" || "$(<"${device}")" != "0x8086" ]] || return 0
+  done
+  return 1
+}
+
+native_runtime_requested() {
+  [[ -n "${HORUS_RUNTIME_BUNDLE:-}${HORUS_RUNTIME_SHA256:-}${HORUS_CLOUD_MEDIA_CONFIG:-}" ||
+     "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == 1 ||
+     ( -n "${HORUS_MEDIA_RELAY_CONFIG:-}" && "${HORUS_MEDIA_RELAY_ENGINE:-native}" == native ) ]]
+}
+
 hardware_kind() {
   if is_jetson; then
     echo "jetson"
@@ -91,7 +105,9 @@ hardware_kind() {
 APT_BASE_PACKAGES=(
   curl
   ca-certificates
+  iproute2
   openssl
+  procps
   unzip
   python3
   python3-pip
@@ -135,12 +151,6 @@ APT_INTEL_MEDIA_PACKAGES=(
 APT_INTEL_DRIVER_PACKAGES=(
   intel-media-va-driver
   intel-media-va-driver-non-free
-)
-
-APT_JETSON_MEDIA_PACKAGES=(
-  nvidia-l4t-gstreamer
-  nvidia-l4t-multimedia
-  nvidia-l4t-multimedia-utils
 )
 
 apt_package_available() {
@@ -254,10 +264,25 @@ build_apt_packages() {
   local -n output_ref="$1"
   output_ref=("${APT_BASE_PACKAGES[@]}")
   append_available_packages output_ref "${APT_SIGNALING_PACKAGES[@]}"
+  if [[ "${install_ros:-0}" == 1 ]]; then
+    output_ref+=("ros-${ROS_DISTRO}-ros-base")
+  fi
+  if ros_runtime_needed && [[ "${install_ros:-0}" == 1 || -n "${HORUS_CLOUD_MEDIA_CONFIG:-}" ||
+                             "${RMW_IMPLEMENTATION:-}" == rmw_cyclonedds_cpp ]]; then
+    output_ref+=("ros-${ROS_DISTRO:-jazzy}-rmw-cyclonedds-cpp")
+  fi
+  if native_runtime_requested; then
+    local abi="406t64"
+    [[ "${ROS_DISTRO:-jazzy}" != humble ]] || abi="4.5d"
+    output_ref+=("libopencv-core${abi}" "libopencv-imgproc${abi}" "libopencv-imgcodecs${abi}")
+  fi
 
   if [[ "${ROLE}" == "cloud" ]]; then
     if [[ "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
       append_available_packages output_ref "${APT_CLOUD_TURN_PACKAGES[@]}"
+    fi
+    if native_runtime_requested; then
+      append_available_packages output_ref "${APT_MEDIA_COMMON_PACKAGES[@]}"
     fi
     dedupe_packages output_ref
     return
@@ -273,8 +298,8 @@ build_apt_packages() {
   append_available_packages output_ref "${APT_MEDIA_COMMON_PACKAGES[@]}"
 
   if is_jetson; then
-    append_available_packages output_ref "${APT_JETSON_MEDIA_PACKAGES[@]}"
-  elif [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]]; then
+    log_info "Using JetPack's installed codec stack; bootstrap will not alter L4T packages."
+  elif has_intel_render_device; then
     append_available_packages output_ref "${APT_DRM_MEDIA_PACKAGES[@]}" "${APT_INTEL_MEDIA_PACKAGES[@]}"
     append_intel_media_driver output_ref
   else
@@ -301,6 +326,10 @@ run_apt() {
 
   apt_install() {
     local runner=("$@")
+    if [[ "${install_ros:-0}" == 1 ]] && ! apt_package_available "ros-${ROS_DISTRO}-ros-base"; then
+      log_error "ROS ${ROS_DISTRO} is not available from your apt sources. Configure the official ROS 2 apt repository, then rerun bootstrap."
+      return 1
+    fi
     "${runner[@]}" apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y "${packages[@]}"
   }
 
@@ -325,41 +354,18 @@ run_apt() {
     install_cmd="sudo apt-get -o Acquire::ForceIPv4=true update; sudo apt-get install -y${install_cmd}"
     log_warn "No passwordless sudo. Run this once if packages are missing:"
     echo -e "  ${FG_CYAN}${install_cmd}${RESET}"
+    [[ "${install_ros:-0}" == 0 ]] || return 1
   fi
 }
 
+ros_runtime_needed() {
+  [[ "${ROLE}" != cloud || -n "${HORUS_CLOUD_MEDIA_CONFIG:-}" ]]
+}
+
 check_ros2_runtime() {
-  if [[ "${ROLE}" == "cloud" ]]; then
-    return
+  if ros_runtime_needed; then
+    horus_ros_environment
   fi
-
-  local distro="${ROS_DISTRO:-jazzy}"
-  if [[ -n "${ROS_SETUP_PATH:-}" ]]; then
-    local setup_path="${ROS_SETUP_PATH/#\~/${HOME}}"
-    if [[ -f "${setup_path}" ]]; then
-      set +u
-      source "${setup_path}"
-      set -u
-      return
-    fi
-    log_error "ROS_SETUP_PATH is set but the file does not exist: ${ROS_SETUP_PATH}"
-    log_warn "Run ./horus setup again and provide the correct setup.bash/local_setup.bash path."
-    return 1
-  fi
-
-  local default_setup="/opt/ros/${distro}/setup.bash"
-  [[ -f "${default_setup}" ]] || default_setup="/opt/ros/${distro}/local_setup.bash"
-  if [[ -f "${default_setup}" ]]; then
-    set +u
-    source "${default_setup}"
-    set -u
-    return
-  fi
-
-  log_error "ROS 2 setup file not found for ROS_DISTRO=${distro}."
-  log_warn "Install ROS 2 on this robot/machine, or set ROS_SETUP_PATH to the setup file from the ROS install/workspace."
-  log_warn "Expected: /opt/ros/${distro}/setup.bash"
-  return 1
 }
 
 resolve_zenoh_version() {
@@ -566,6 +572,8 @@ if [[ "${ROLE_ARG}" == "--zenoh-only" ]]; then
   install_zenoh
   exit
 fi
+source "${SCRIPT_DIR}/ros_environment.sh"
+source "${SCRIPT_DIR}/managed_runtime.sh"
 
 cd "${ROOT}"
 config_file="${HORUS_ENV:-${ROOT}/.env}"
@@ -575,9 +583,26 @@ if [[ ! -f "${config_file}" ]]; then
   log_success "Created new config: ${BOLD}.env${RESET} (from .env.example)"
 fi
 
+requested_ros_install="${HORUS_INSTALL_ROS-}"
 load_key_value_file "${config_file}"
 if [[ -f .zenoh_tls_profile.env ]]; then
   load_key_value_file .zenoh_tls_profile.env
+fi
+if [[ -n "${requested_ros_install}" ]]; then
+  HORUS_INSTALL_ROS="${requested_ros_install}"
+fi
+case "${HORUS_INSTALL_ROS:-0}" in
+  0|1) ;;
+  *) log_error "HORUS_INSTALL_ROS must be 0 or 1."; exit 2 ;;
+esac
+runtime_archive="${HORUS_RUNTIME_BUNDLE:-}"
+if [[ -n "${runtime_archive}${HORUS_RUNTIME_SHA256:-}" ]]; then
+  runtime_archive="${runtime_archive/#\~/${HOME}}"
+  if [[ ! -f "${runtime_archive}" || ! -r "${runtime_archive}" ||
+        ! "${HORUS_RUNTIME_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    log_error "Set HORUS_RUNTIME_BUNDLE to a readable archive and HORUS_RUNTIME_SHA256 to its published lowercase SHA-256."
+    exit 1
+  fi
 fi
 
 if [[ -n "${ROLE_ARG}" && "${ROLE_ARG}" != "auto" ]]; then
@@ -604,8 +629,27 @@ echo -e "  role       ${ROLE}"
 echo -e "  machine    $(machine_kind) ($(uname -m), $(hardware_kind))"
 echo ""
 
-check_ros2_runtime
+install_ros=0
+if ros_runtime_needed; then
+  if [[ -z "${ROS_DISTRO:-}" ]]; then
+    ROS_DISTRO="$(horus_default_ros_distro)"
+    export ROS_DISTRO
+  fi
+  if [[ "${HORUS_INSTALL_ROS:-0}" == 1 && -z "${ROS_SETUP_PATH:-}" &&
+        ! -r "$(horus_ros_setup_file)" ]]; then
+    release_id="$(. /etc/os-release; printf '%s/%s' "${ID:-}" "${VERSION_ID:-}")"
+    [[ "${release_id}/${ROS_DISTRO}" =~ ^ubuntu/(22[.]04/humble|24[.]04/jazzy)$ &&
+       "${RUN_APT}" != no && -x /usr/bin/apt-get ]] || {
+      log_error "ROS installation needs apt enabled on Ubuntu 22.04/Humble or 24.04/Jazzy. Otherwise install ROS separately and set ROS_SETUP_PATH."
+      exit 1
+    }
+    install_ros=1
+  else
+    check_ros2_runtime
+  fi
+fi
 run_apt
+check_ros2_runtime
 zenoh_quic_requested() {
   case "${ZENOH_TRANSPORT:-auto}" in
     quic) return 0 ;;
@@ -639,10 +683,53 @@ prepare_zenoh_tls
 if [[ "${ROLE}" == "cloud" && "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
   bash "${SCRIPT_DIR}/setup_turn.sh"
 fi
-install_zenoh
-"${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}"
+if [[ -n "${HORUS_RUNTIME_BUNDLE:-}${HORUS_RUNTIME_SHA256:-}" ]]; then
+  horus_use_runtime_bundle install
+elif [[ "${HORUS_ZENOH_SESSION_ISOLATION:-0}" != 1 && -z "${ZENOH_BRIDGE_BINARY:-}" ]]; then
+  install_zenoh
+elif [[ ! -x "${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}" ]]; then
+  log_error "Selected Zenoh profile requires the pinned native binary. Install a verified HORUS runtime bundle."
+  exit 1
+fi
+"${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}" --ros-prepared
+media_python="${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python"
+if [[ "${HORUS_ZENOH_SESSION_ISOLATION:-0}" == 1 ]]; then
+  "${media_python}" - "${SCRIPT_DIR}" "${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from session_lanes import check_binary
+try:
+    check_binary(Path(sys.argv[2]))
+except (OSError, ValueError) as error:
+    raise SystemExit(f"Invalid independent-lane runtime: {error}")
+PY
+fi
+if native_runtime_requested; then
+  native_checks=()
+  if [[ "${ROLE}" == robot && "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == 1 ||
+        "${ROLE}" == cloud && -n "${HORUS_CLOUD_MEDIA_CONFIG:-}" ]]; then
+    native_checks+=("${HORUS_SOURCE_MEDIA_BINARY:-$(command -v horus_media_node || true)}")
+  fi
+  if [[ "${ROLE}" == machine && -n "${HORUS_MEDIA_RELAY_CONFIG:-}" && "${HORUS_MEDIA_RELAY_ENGINE:-native}" == native ]]; then
+    native_checks+=("${HORUS_MEDIA_RELAY_BINARY:-$(command -v horus_unity_bridge_node || true)}")
+  fi
+  for binary in "${native_checks[@]}"; do
+    libs=""
+    if [[ ! -x "${binary}" ]] || ! libs="$(LC_ALL=C ldd "${binary}" 2>&1)" ||
+       [[ "${libs}" == *"not found"* ]]; then
+      log_error "Native media runtime cannot run on this ROS installation: ${binary:-missing binary}."
+      if [[ -n "${libs:-}" ]]; then printf '%s\n' "${libs}" >&2; fi
+      exit 1
+    fi
+  done
+  if [[ -n "${HORUS_RUNTIME_SHA256:-}" ]]; then
+    GST_PLUGIN_PATH_1_0="$(horus_native_plugin_path)" \
+      gst-inspect-1.0 rtpgccbwe >/dev/null || { log_error "Installed bundle is missing usable GCC pacing."; exit 1; }
+  fi
+fi
 if [[ "${ROLE}" == "cloud" || "${ROLE}" == "teammate" ]]; then
-  log_info "${ROLE} role: no H.264 encoder/decoder is required for its native relay."
+  log_info "${ROLE} role does not require an H.264 encoder or decoder."
 else
   media_python="${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python"
   probe_args=()

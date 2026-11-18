@@ -14,14 +14,9 @@ if ! "${BOOTSTRAP_PYTHON}" -c 'import sys; raise SystemExit(0 if sys.version_inf
   echo "HORUS connector requires Python 3.10 or newer. Select a compatible interpreter before bootstrap." >&2
   exit 1
 fi
-if [[ "${ROLE}" != cloud ]]; then
-  ros_setup="${ROS_SETUP_PATH:-/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash}"
-  ros_setup="${ros_setup/#\~/${HOME}}"
-  if [[ -f "${ros_setup}" ]]; then
-    set +u
-    source "${ros_setup}"
-    set -u
-  fi
+if [[ "${ROLE}" != cloud && "${2:-}" != --ros-prepared ]]; then
+  source "${SCRIPT_DIR}/ros_environment.sh"
+  horus_ros_environment
 fi
 VENV_LOG="${TMPDIR:-/tmp}/horus_connector_${UID}_webrtc_venv_create.log"
 PIP_INDEX_ARGS=()

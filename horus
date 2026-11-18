@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="${HORUS_RUN_DIR:-${ROOT}/.run}"
 ENV_FILE="${HORUS_ENV:-${ROOT}/.env}"
 mkdir -p "${RUN_DIR}"
+source "${ROOT}/scripts/ros_environment.sh"
+source "${ROOT}/scripts/managed_runtime.sh"
 NEW_SERVICES=()
 
 export HORUS_TERMINAL_ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-}"
@@ -122,36 +124,25 @@ load_env() {
 }
 
 source_ros() {
-  local distro="${ROS_DISTRO:-jazzy}"
-  if [[ -n "${ROS_SETUP_PATH:-}" ]]; then
-    local setup_path="${ROS_SETUP_PATH/#\~/${HOME}}"
-    if [[ -f "${setup_path}" ]]; then
-      set +u
-      # shellcheck source=/dev/null
-      source "${setup_path}"
-      set -u
-      return
-    fi
-    echo "ROS_SETUP_PATH is set but the file does not exist: ${ROS_SETUP_PATH}" >&2
-    return 1
-  elif [[ -f "/opt/ros/${distro}/setup.bash" ]]; then
-    set +u
-    # shellcheck source=/dev/null
-    source "/opt/ros/${distro}/setup.bash"
-    set -u
-  elif [[ -f "/opt/ros/${distro}/local_setup.bash" ]]; then
-    set +u
-    # shellcheck source=/dev/null
-    source "/opt/ros/${distro}/local_setup.bash"
-    set -u
-  else
-    echo "ROS setup file not found for ${distro}: /opt/ros/${distro}/setup.bash or local_setup.bash" >&2
-    return 1
-  fi
+  horus_ros_environment
 }
 
 source_ros_required() {
   source_ros || exit 1
+}
+
+check_running_ros_domain() {
+  local file="${RUN_DIR}/ros_launch_domain" pid name
+  for pid in "${RUN_DIR}"/*.pid; do
+    [[ -f "${pid}" ]] || continue
+    name="$(basename "${pid}" .pid)"
+    case "${name}" in signal|metrics|monitor) continue ;; esac
+    service_pid_owned "${name}" || continue
+    if [[ ! -f "${file}" || "$(<"${file}")" != "${ROS_DOMAIN_ID}" ]]; then
+      log_error "Running services use another or unrecorded ROS domain. Run ./horus stop before launching again."
+      return 1
+    fi
+  done
 }
 
 python_bin() {
@@ -286,15 +277,14 @@ zenoh_routing_config() {
   local config
   config="$(zenoh_config_path)"
   [[ -f "${config}" ]] || { echo "Missing Zenoh config: ${config}" >&2; exit 1; }
-  if [[ "${HORUS_ROLE:-}" =~ ^(robot|machine)$ ]] && \
-     [[ -n "${HORUS_ROUTES_CONFIG:-}" || "${HORUS_ZENOH_CAMERA_POLICY:-compatible}" == "configured" ]]; then
+  if [[ "${HORUS_ROLE:-}" =~ ^(robot|machine|teammate)$ ]]; then
     local rendered="${RUN_DIR}/zenoh_routes.json" route_args=() streams="[]"
     [[ -z "${HORUS_ROUTES_CONFIG:-}" ]] || route_args=(--routes "${HORUS_ROUTES_CONFIG}")
     if [[ "${HORUS_ROLE:-}" == "robot" && "${HORUS_ZENOH_CAMERA_POLICY:-compatible}" == "configured" ]]; then
       streams="$("$(python_bin)" "${ROOT}/scripts/webrtc_streams.py" json --root "${ROOT}" --role robot)" || return 1
     fi
     "$(python_bin)" "${ROOT}/scripts/transport_policy.py" --base "${config}" --out "${rendered}" --streams "${streams}" \
-      --role "${HORUS_ROLE:-machine}" "${route_args[@]}" || return 1
+      --role "${HORUS_ROLE}" --dds-domain "${ROS_DOMAIN_ID:-0}" "${route_args[@]}" || return 1
     config="${rendered}"
   fi
   printf '%s\n' "${config}"
@@ -356,7 +346,7 @@ run_dds_preflight() {
   local mode="$2"
   local args=()
   dds_preflight_common_args args "${role}" "${mode}"
-  python3 "${ROOT}/scripts/dds_preflight.py" "${args[@]}" --pretty
+  python3 "${ROOT}/scripts/dds_preflight.py" "${args[@]}" --pretty --resolved-environment
 }
 
 run_dds_launch_gate() {
@@ -382,7 +372,10 @@ dds_connector_uri() {
     printf '%s\n' "${CYCLONEDDS_URI}"
     return
   fi
-  printf 'file://%s\n' "$(dds_connector_config_path "${role}")"
+  local path
+  path="$(dds_connector_config_path "${role}")" || return 1
+  [[ -f "${path}" ]] || return 1
+  printf 'file://%s\n' "${path}"
 }
 
 dds_connector_docker_args() {
@@ -392,7 +385,10 @@ dds_connector_docker_args() {
   local path
 
   if [[ -n "${uri}" ]]; then
-    if [[ "${uri}" == file://* ]]; then
+    if [[ "${uri}" == '<'* ]]; then
+      path="${RUN_DIR}/cyclonedds_inline.xml"
+      printf '%s\n' "${uri}" > "${path}"
+    elif [[ "${uri}" == file://* ]]; then
       path="${uri#file://}"
     else
       path="${uri}"
@@ -855,6 +851,7 @@ status_turn() {
 doctor() {
   local role="$1"
   export HORUS_ROLE="${role}"
+  local dds_result=0
   local target=""
 
   echo -e "\n${BOLD}${FG_CYAN}Connectivity doctor${RESET}"
@@ -863,7 +860,11 @@ doctor() {
   echo -e "  room       ${HORUS_ROOM:-default}"
   warn_runtime_config
   echo ""
-  run_dds_preflight "${role}" doctor || true
+  if [[ "${role}" != cloud ]]; then
+    source_ros || return 1
+  fi
+  horus_use_runtime_bundle resolve || return 1
+  run_dds_preflight "${role}" doctor || dds_result=$?
   echo ""
 
   case "${role}:${HORUS_TOPOLOGY:-hub}" in
@@ -955,6 +956,7 @@ doctor() {
     fi
   fi
   echo ""
+  return "${dds_result}"
 }
 
 start_bg() {
@@ -2051,6 +2053,20 @@ case "${cmd}" in
         ;;
     esac
     export HORUS_ROLE="${role}"
+    if [[ "${role}" != cloud ]]; then
+      source_ros_required
+      check_running_ros_domain || exit 1
+      if zenoh_enabled; then
+        CYCLONEDDS_URI="$(dds_connector_uri "${role}")" || exit 1
+        export CYCLONEDDS_URI
+      fi
+    fi
+    horus_use_runtime_bundle resolve || exit 1
+    if [[ "${HORUS_ZENOH_SESSION_MTLS:-0}" == "1" &&
+          "${HORUS_ZENOH_SESSION_ISOLATION:-0}" != "1" ]]; then
+      log_error "HORUS_ZENOH_SESSION_MTLS requires independent Zenoh sessions."
+      exit 2
+    fi
     print_banner
     echo -e "${BOLD}${FG_CYAN}Launch ${role}${RESET} ${FG_MUTED}$(date '+%Y-%m-%d %H:%M:%S')${RESET}"
     echo -e "  role       ${BOLD}${role}${RESET}"
@@ -2165,6 +2181,9 @@ case "${cmd}" in
         ;;
     esac
     launch_metrics
+    if [[ "${role}" != cloud ]]; then
+      printf '%s\n' "${ROS_DOMAIN_ID}" > "${RUN_DIR}/ros_launch_domain"
+    fi
     trap - EXIT
     exec {INSTANCE_LOCK}>&-
     open_monitor_after_launch "${no_monitor}"
