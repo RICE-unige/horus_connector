@@ -2,6 +2,7 @@
 """Verify HORUS return routes and three static writers across isolated ROS domains."""
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -19,6 +20,23 @@ REPLIES = ["/horus/registration_ack", "/horus/heartbeat", "/horus/teleop/runtime
            "/fleet/horus/registration_ack"]
 
 
+def unused_loopback_port_block(width):
+    for _ in range(64):
+        try:
+            with ExitStack() as stack:
+                probe = stack.enter_context(socket.socket())
+                probe.bind(("127.0.0.1", 0))
+                base = probe.getsockname()[1]
+                if base + width - 1 > 65535:
+                    continue
+                for index in range(1, width):
+                    stack.enter_context(socket.socket()).bind(("127.0.0.1", base + index))
+                return base
+        except OSError:
+            continue
+    raise RuntimeError("No free consecutive loopback test ports")
+
+
 def worker(role, output, bulk=False, duration=0):
     import rclpy
     from rclpy.qos import QoSProfile, DurabilityPolicy
@@ -27,7 +45,7 @@ def worker(role, output, bulk=False, duration=0):
     from geometry_msgs.msg import TransformStamped
     from rclpy.executors import SingleThreadedExecutor
     rclpy.init()
-    node = rclpy.create_node(f"connector_{role}_acceptance")
+    node = rclpy.create_node(f"connector_{role}_acceptance_{os.getpid()}")
     if role == "hmsh":
         qos = QoSProfile(depth=64, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         publisher = node.create_publisher(UInt8MultiArray, "/acceptance/mesh/indexed", qos)
@@ -86,6 +104,7 @@ def worker(role, output, bulk=False, duration=0):
         return
     static_nodes = []
     dynamic_seen, dynamic_latencies = {}, {}
+    dynamic_last_arrival, dynamic_max_gap = {}, {}
     seen = {"topics": {}, "static_frames": [], "route_latency_ms": {}, "steady_route_latency_ms": {},
             "source_warmup_sec": 3, "slow_samples": {}, "bulk_integrity": {}, "hmsh_latest": {},
             "hmsh_revisions": {}, "hmsh_late_revisions": []}
@@ -106,13 +125,18 @@ def worker(role, output, bulk=False, duration=0):
             if transform.child_frame_id not in seen["static_frames"]:
                 seen["static_frames"].append(transform.child_frame_id)
     def dynamic(msg):
+        now = time.monotonic()
+        steady_start = started + seen["source_warmup_sec"]
         for transform in msg.transforms:
             key = transform.child_frame_id
             dynamic_seen[key] = dynamic_seen.get(key, 0) + 1
             latency = (node.get_clock().now().nanoseconds -
                        (transform.header.stamp.sec * 1_000_000_000 + transform.header.stamp.nanosec)) / 1e6
-            if time.monotonic() - started > 3:
+            if now >= steady_start:
                 dynamic_latencies.setdefault(key, []).append(latency)
+                gap_ms = (now - dynamic_last_arrival.get(key, steady_start)) * 1000
+                dynamic_max_gap[key] = max(dynamic_max_gap.get(key, 0), gap_ms)
+                dynamic_last_arrival[key] = now
     publishers = []
     if role == "robot":
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -180,12 +204,18 @@ def worker(role, output, bulk=False, duration=0):
                 pub.publish(TFMessage(transforms=[transform]))
             static_sent = True
         executor.spin_once(timeout_sec=.01)
+    finished = time.monotonic()
     for key, samples in (("route_latency_ms", latencies), ("steady_route_latency_ms", steady_latencies)):
         for topic, values in samples.items():
             ordered = sorted(values)
             seen[key][topic] = {"samples": len(values), "p50": ordered[len(ordered) // 2],
                                "p95": ordered[int((len(ordered) - 1) * .95)], "max": ordered[-1]}
     seen["dynamic_frames"] = dynamic_seen
+    seen["duration_sec"] = finished - started
+    seen["dynamic_delivery_max_gap_ms"] = {
+        key: max(gap, (finished - dynamic_last_arrival[key]) * 1000)
+        for key, gap in dynamic_max_gap.items()
+    }
     seen["dynamic_latency_ms"] = {
         key: {"samples": len(values), "p50": sorted(values)[len(values)//2],
               "p95": sorted(values)[int((len(values)-1)*.95)], "max": max(values)}
@@ -213,13 +243,21 @@ def main():
     parser.add_argument("--custom-routes", action="store_true", help="Also compile and exercise capability-derived command routes")
     parser.add_argument("--priority-links", action="store_true", help="Verify native priority-isolated TCP links and lossless compression")
     parser.add_argument("--session-lanes", action="store_true", help="Verify independent real-time, sensing and bulk sessions")
+    parser.add_argument("--restart-bulk", action="store_true",
+                        help="Restart the isolated test hub's bulk router and check late-join map replay")
+    parser.add_argument("--mtls-dir", type=Path,
+                        help="Use disposable ca.pem, hub.pem/hub.key and client.pem/client.key")
     parser.add_argument("--constrained-mbps", type=float, default=0,
                         help="Test-only shared TCP proxy capacity; no host network changes")
     parser.add_argument("--bulk-budget-bps", type=int, default=0,
                         help="Exercise the native bulk-only governor with an atomic, refreshed budget file")
     args = parser.parse_args()
-    if args.session_lanes and (args.priority_links or args.hub):
-        parser.error("session-lanes is a separate direct-session acceptance mode")
+    if args.session_lanes and args.priority_links:
+        parser.error("Choose independent sessions or priority links, not both")
+    if args.restart_bulk and not (args.hub and args.session_lanes and args.bulk):
+        parser.error("--restart-bulk requires --hub --session-lanes --bulk")
+    if args.mtls_dir and not (args.hub and args.session_lanes and not args.constrained_mbps):
+        parser.error("--mtls-dir requires a three-session hub without the plaintext test proxy")
     if args.custom_routes:
         REPLIES.extend(["/fmu/in/trajectory_setpoint", "/navigation/request_waypoints"])
     if args.worker:
@@ -237,14 +275,12 @@ def main():
             temporary.replace(budget_path)
             budget_stop.wait(.2)
     budget_thread = threading.Thread(target=refresh_budget) if args.bulk_budget_bps else None
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        endpoint = f"tcp/127.0.0.1:{probe.getsockname()[1]}"
+    base_port = unused_loopback_port_block(3 if args.session_lanes else 1)
+    endpoint = f"tcp/127.0.0.1:{base_port}"
     processes, logs = [], []
     proxy = None
     if args.constrained_mbps:
         from constrained_tcp_proxy import ConstrainedProxy
-        base_port = int(endpoint.rsplit(":", 1)[1])
         proxy = ConstrainedProxy(("127.0.0.1", base_port), args.constrained_mbps,
             destinations=[("127.0.0.1", base_port+i) for i in range(3)] if args.session_lanes else None).start()
     connect_endpoint = f"tcp/127.0.0.1:{proxy.port}" if proxy else endpoint
@@ -295,34 +331,61 @@ def main():
         robot_endpoints = [] if args.priority_links else ["-e", connect_endpoint]
         source_mode = "peer" if args.priority_links else "client"
         session_configs = {}
+        bridges = []
+        hub_bulk = None
         if args.session_lanes:
             sys.path.insert(0, str(ROOT / "scripts"))
             import json5
-            from session_lanes import configure as sessions
-            base_port = int(endpoint.rsplit(":", 1)[1])
-            for role in configs:
-                profiles = sessions(json5.loads(Path(configs[role]).read_text()),
-                    target="127.0.0.1" if role == "robot" else "", port=base_port)
+            from session_lanes import CLASSES, check_binary, configure as sessions
+            check_binary(binary)
+            session_bases = {**configs}
+            if args.hub:
+                session_bases["cloud"] = ROOT / "config/zenoh_cloud.json5"
+            for role, base in session_bases.items():
+                connects = role == "robot" or (role == "machine" and args.hub)
+                template = json5.loads(Path(base).read_text())
+                if args.mtls_dir:
+                    directory = args.mtls_dir.resolve()
+                    side, cert = ("connect", "client") if connects else ("listen", "hub")
+                    template.setdefault("transport", {}).setdefault("link", {})["tls"] = {
+                        "enable_mtls": True, "verify_name_on_connect": True,
+                        "root_ca_certificate": str(directory / "ca.pem"),
+                        f"{side}_private_key": str(directory / f"{cert}.key"),
+                        f"{side}_certificate": str(directory / f"{cert}.pem"),
+                    }
+                profiles = sessions(template,
+                    target="127.0.0.1" if connects else "", bind="127.0.0.1", port=base_port,
+                    mtls=bool(args.mtls_dir))
                 for index, (name, config) in enumerate(profiles.items()):
                     if role == "robot" and proxy:
                         config["connect"]["endpoints"] = [f"tcp/127.0.0.1:{proxy.ports[index]}#so_sndbuf=65536"]
                     path = args.output / f"{role}-{name}.json"
                     path.write_text(json.dumps(config))
                     session_configs[role, name] = str(path.resolve())
-            for name in ("realtime", "sensing", "bulk"):
-                start("robot-bridge-"+name, [binary, "-c", session_configs["robot", name],
-                    "--no-multicast-scouting", "peer"], 194)
+            if args.hub:
+                for name in CLASSES:
+                    proc = start("cloud-bridge-"+name, [binary, "-c", session_configs["cloud", name],
+                                 "--no-multicast-scouting", "router"], 193)
+                    bridges.append(proc)
+                    if name == "bulk":
+                        hub_bulk = proc
+            for name in CLASSES:
+                bridges.append(start("robot-bridge-"+name, [binary, "-c", session_configs["robot", name],
+                    "--no-multicast-scouting", "client" if args.hub else "peer"], 194))
         else:
             start("robot-bridge", [binary, "-c", configs["robot"], *robot_endpoints, "--no-multicast-scouting", source_mode], 194)
         time.sleep(1)
         worker_args = ["--bulk"] if args.bulk else []
         if args.custom_routes:
             worker_args.append("--custom-routes")
-        if proxy:
-            worker_args.extend(["--worker-duration", "35"])
-        robot = start("robot", [sys.executable, __file__, "--worker", "robot", "--output", str(args.output / "robot.json"), *worker_args], 194)
+        # The robot starts first and must continue publishing through the
+        # receiver's entire measurement window, including its final gap.
+        robot_duration = ["--worker-duration", "45"] if proxy else []
+        machine_duration = ["--worker-duration", "35"] if proxy else []
+        robot = start("robot", [sys.executable, __file__, "--worker", "robot", "--output",
+                      str(args.output / "robot.json"), *worker_args, *robot_duration], 194)
         time.sleep(4)
-        if args.hub:
+        if args.hub and not args.session_lanes:
             cloud_config = "config/zenoh_cloud.json5"
             if args.priority_links:
                 cloud_path = args.output / "cloud-priority-links.json"
@@ -335,15 +398,23 @@ def main():
                 raise RuntimeError("Native router rejected cloud configuration; inspect cloud-bridge.log")
         endpoint_args = [*robot_endpoints, "--no-multicast-scouting", source_mode] if args.hub else ["-l", endpoint, "--no-multicast-scouting", "router"]
         if args.session_lanes:
-            for name in ("realtime", "sensing", "bulk"):
-                bridge = start("machine-bridge-"+name, [binary, "-c", session_configs["machine", name],
-                    "--no-multicast-scouting", "router"], 195)
+            for name in CLASSES:
+                bridges.append(start("machine-bridge-"+name, [binary, "-c", session_configs["machine", name],
+                    "--no-multicast-scouting", "client" if args.hub else "router"], 195))
         else:
-            bridge = start("machine-bridge", [binary, "-c", configs["machine"], *endpoint_args], 195)
+            bridges.append(start("machine-bridge", [binary, "-c", configs["machine"], *endpoint_args], 195))
         time.sleep(1)
-        if bridge.poll() is not None:
-            raise RuntimeError("Native bridge rejected configuration; inspect machine-bridge.log")
-        machine = start("machine", [sys.executable, __file__, "--worker", "machine", "--output", str(args.output / "machine.json"), *worker_args], 195)
+        if any(bridge.poll() is not None for bridge in bridges):
+            raise RuntimeError("Native bridge rejected configuration; inspect the bridge logs")
+        if args.mtls_dir:
+            for index in range(3):
+                rejected = subprocess.run(["openssl", "s_client", "-quiet",
+                    "-connect", f"127.0.0.1:{base_port+index}", "-CAfile", str(args.mtls_dir / "ca.pem"),
+                    "-verify_ip", "127.0.0.1", "-verify_return_error"], input="", text=True,
+                    capture_output=True, timeout=4)
+                assert rejected.returncode and "certificate required" in rejected.stderr, rejected.stderr
+        machine = start("machine", [sys.executable, __file__, "--worker", "machine", "--output",
+                        str(args.output / "machine.json"), *worker_args, *machine_duration], 195)
         if args.priority_links:
             client_pid = processes[0].pid
             deadline = time.monotonic() + 8
@@ -359,6 +430,21 @@ def main():
             start("bulk", [sys.executable, __file__, "--worker", "bulk", "--output", str(args.output / "bulk.json")], 194)
             start("integrity", [sys.executable, __file__, "--worker", "integrity", "--output", str(args.output / "integrity.json")], 194)
             start("hmsh", [sys.executable, __file__, "--worker", "hmsh", "--output", str(args.output / "hmsh.json")], 194)
+        if args.restart_bulk:
+            # Wait for the replayable source to publish its final state before
+            # starting a new DDS consumer with no cache of its own.
+            deadline = time.monotonic() + 6
+            while not (args.output / "hmsh.json").exists() and time.monotonic() < deadline:
+                time.sleep(.05)
+            assert (args.output / "hmsh.json").exists(), "Mesh source did not finish before hub restart"
+            hub_bulk.terminate()
+            hub_bulk.wait(timeout=5)
+            time.sleep(1)
+            restarted_bulk = start("cloud-bridge-bulk-restarted", [binary, "-c", session_configs["cloud", "bulk"],
+                "--no-multicast-scouting", "router"], 193)
+            late_machine = start("late-machine", [sys.executable, __file__, "--worker", "machine", "--bulk",
+                "--worker-duration", "8", "--output", str(args.output / "late-machine.json")], 195)
+            assert late_machine.wait(timeout=12) == 0 and restarted_bulk.poll() is None
         assert machine.wait(timeout=45 if proxy else 25) == 0
         assert robot.wait(timeout=10) == 0
         robot_data = json.loads((args.output / "robot.json").read_text())
@@ -375,6 +461,13 @@ def main():
             assert all(robot_data["steady_route_latency_ms"].get(topic, {}).get("samples", 0) >= 100 for topic in REPLIES), robot_data
             assert all(stats["p95"] < 100 for stats in robot_data["steady_route_latency_ms"].values()), robot_data
             assert all(stats["p95"] < 100 for stats in machine_data["dynamic_latency_ms"].values()), machine_data
+            gaps = machine_data["dynamic_delivery_max_gap_ms"]
+            assert all(gaps.get(f"dynamic_robot_{index}", float("inf")) < 250
+                       for index in range(3)), f"TF delivery gaps exceeded 250 ms: {gaps}"
+        if args.restart_bulk:
+            late = json.loads((args.output / "late-machine.json").read_text())
+            assert late["hmsh_latest"] == json.loads((args.output / "hmsh.json").read_text()), (
+                "A new subscriber could not reconstruct the latest mesh after the bulk hub restarted")
         print("ZENOH_ROUTE_ACCEPTANCE " + json.dumps({"robot": robot_data, "machine": machine_data}))
     finally:
         budget_stop.set()

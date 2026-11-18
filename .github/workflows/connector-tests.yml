@@ -43,9 +43,11 @@ jobs:
           CYCLONEDDS_URI: '<CycloneDDS><Domain><General><Interfaces><NetworkInterface address="127.0.0.1" multicast="true"/></Interfaces></General></Domain></CycloneDDS>'
         run: |
           source /opt/ros/${{ matrix.ros }}/setup.bash
-          bash -n horus scripts/bootstrap.sh scripts/setup_webrtc.sh
+          for script in horus scripts/{bootstrap,setup_webrtc,ros_environment,managed_runtime}.sh; do bash -n "$script"; done
           .venv-webrtc/bin/python -m pytest tests -q --junitxml=test-results.xml
-          ./horus update-zenoh
+          env -u ROS_DOMAIN_ID ./horus bootstrap machine
+          env -u ROS_DOMAIN_ID ./horus bootstrap machine
+          .venv-webrtc/bin/python tests/check_release_dds_launch.py --output /tmp/horus-check-launch-domains
           .venv-webrtc/bin/python tests/check_zenoh_routes.py --bulk --output /tmp/horus-check-direct
           .venv-webrtc/bin/python tests/check_zenoh_routes.py --bulk --hub --output /tmp/horus-check-hub
           .venv-webrtc/bin/python tests/check_ros_webrtc.py --output /tmp/horus-check-camera
