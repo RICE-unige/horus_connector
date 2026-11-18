@@ -185,6 +185,8 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 class JsonSignaling:
+    registration_timeout_sec = 5
+
     def __init__(self, on_message, on_connected=None, wait_for_registration: bool = False):
         self.on_message = on_message
         self.on_connected = on_connected
@@ -195,10 +197,8 @@ class JsonSignaling:
         self.closed = threading.Event()
         self.send_lock = threading.Lock()
         self.enqueue_lock = threading.Lock()
-        self.ready_lock = threading.Lock()
         self.connection_lock = threading.Lock()
         self.connection_generation = 0
-        self.ready_notified = False
         self._pending_retry = None
         self.thread = None
         self.sender_thread = None
@@ -246,22 +246,24 @@ class JsonSignaling:
         while not self.closed.is_set():
             self.send_wakeup.wait(0.5)
             self.send_wakeup.clear()
-            if not self.connected.is_set():
-                continue
-            socket = self.ws
+            with self.connection_lock:
+                if not self.connected.is_set():
+                    continue
+                socket, generation = self.ws, self.connection_generation
             try:
-                self._flush_pending()
+                self._flush_pending(socket, generation)
             except Exception:
                 logger.warning("WebRTC signaling send failed; reconnecting", exc_info=True)
-                self.reconnect(expected_socket=socket)
+                self.reconnect(expected_socket=socket, generation=generation)
 
-    def reconnect(self, expected_socket=None):
+    def reconnect(self, expected_socket=None, *, generation=None):
         with self.connection_lock:
-            if expected_socket is not None and self.ws is not expected_socket:
+            if ((expected_socket is not None and self.ws is not expected_socket)
+                    or (generation is not None and generation != self.connection_generation)):
                 return
             socket = self.ws
             self.connected.clear()
-        self._clear_ready()
+            self.ready.clear()
         if socket is not None:
             socket.close()
 
@@ -270,14 +272,14 @@ class JsonSignaling:
         self.send_wakeup.set()
 
     def close(self):
-        self.closed.set()
-        self.send_wakeup.set()
         with self.connection_lock:
+            self.closed.set()
             self.connection_generation += 1
             self.connected.clear()
+            self.ready.clear()
             socket = self.ws
             self.ws = None
-        self._clear_ready()
+        self.send_wakeup.set()
         if socket is not None:
             try:
                 socket.close()
@@ -314,44 +316,47 @@ class JsonSignaling:
                     self.pending.put_nowait(entry)
             self.pending.put_nowait((time.monotonic(), text))
 
-    def _flush_pending(self):
+    def _flush_pending(self, socket=None, generation=None):
         with self.send_lock:
-            self._flush_pending_locked()
-
-    def _flush_pending_locked(self):
-        while (self.connected.is_set() and self.ws is not None
-               and (not self.wait_for_registration or self.ready.is_set())):
-            if self._pending_retry is None:
-                try:
-                    self._pending_retry = self.pending.get_nowait()
-                except queue.Empty:
-                    return
-            # Keep the head until the send succeeds, preserving SDP/ICE order.
-            created, text = self._pending_retry
-            if time.monotonic() - created > self.pending_ttl_sec:
+            with self.connection_lock:
+                if generation is None:
+                    socket, generation = self.ws, self.connection_generation
+            if socket is None:
+                return
+            while True:
+                with self.connection_lock:
+                    if (generation != self.connection_generation or socket is not self.ws
+                            or not self.connected.is_set()
+                            or (self.wait_for_registration and not self.ready.is_set())):
+                        return
+                if self._pending_retry is None:
+                    try:
+                        self._pending_retry = self.pending.get_nowait()
+                    except queue.Empty:
+                        return
+                # Keep the head on send failure; never swap sockets mid-flush.
+                created, text = self._pending_retry
+                if time.monotonic() - created <= self.pending_ttl_sec:
+                    try:
+                        message = json.loads(text)
+                    except ValueError:
+                        message = {}
+                    if not message.get("negotiation_id") or message["negotiation_id"] == self.negotiation_id:
+                        socket.send(text)
                 self._pending_retry = None
-                continue
-            try:
-                message = json.loads(text)
-            except ValueError:
-                message = {}
-            if message.get("negotiation_id") and message["negotiation_id"] != self.negotiation_id:
-                self._pending_retry = None
-                continue
-            socket = self.ws
-            socket.send(text)
-            self._pending_retry = None
 
-    def _begin_connection(self, socket=None) -> int:
+    def _begin_connection(self, socket=None) -> int | None:
         previous = None
         with self.connection_lock:
+            if self.closed.is_set():
+                return None
             self.connection_generation += 1
             generation = self.connection_generation
             if socket is not None:
                 previous = self.ws if self.ws is not socket else None
                 self.ws = socket
-            if not self.closed.is_set():
-                self.connected.set()
+            self.ready.clear()
+            self.connected.set()
             if socket is not None and self.sender_thread is None:
                 self.sender_thread = threading.Thread(target=self._send_worker, name="webrtc-signaling-send", daemon=True)
                 self.sender_thread.start()
@@ -368,25 +373,27 @@ class JsonSignaling:
             return generation == self.connection_generation and self.connected.is_set()
 
     def _notify_ready(self, generation: int | None = None):
-        with self.ready_lock:
-            if generation is not None and not self._is_current_connection(generation):
+        with self.connection_lock:
+            if generation is not None and generation != self.connection_generation:
                 return
-            if self.ready_notified or not self.connected.is_set():
+            if self.ready.is_set() or not self.connected.is_set():
                 return
-            self.ready_notified = True
             self.ready.set()
         if self.on_connected is not None:
             self.on_connected()
         self.send_wakeup.set()
 
-    def _clear_ready(self, generation: int | None = None):
-        with self.ready_lock:
-            if generation is not None and not self._is_current_connection(generation):
+    def _finish_connection(self, generation: int):
+        with self.connection_lock:
+            if generation != self.connection_generation:
                 return
-            self.ready_notified = False
+            self.connected.clear()
             self.ready.clear()
+        print("WebRTC signaling disconnected", flush=True)
 
     def _dispatch_text(self, text: str, generation: int | None = None):
+        if generation is not None and not self._is_current_connection(generation):
+            return
         message = json.loads(text)
         if isinstance(self, ServerSignaling) and message.get("type") == "register":
             self.send({"type": "registered", "role": message.get("role"),
@@ -396,27 +403,44 @@ class JsonSignaling:
         if message.get("type") == "registered":
             self._notify_ready(generation)
 
-    def _read_loop(self, socket=None):
+    def _read_loop(self, socket=None, *, legacy=False):
         socket = socket if socket is not None else self.ws
         generation = self._begin_connection(socket)
+        if generation is None:
+            socket.close()
+            return
         try:
-            if not self.wait_for_registration:
+            if self.wait_for_registration:
+                deadline = time.monotonic() + self.registration_timeout_sec
+                while self._is_current_connection(generation) and not self.ready.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("No signaling registration acknowledgement")
+                    if legacy:
+                        socket.settimeout(remaining)
+                        text = socket.recv()
+                    else:
+                        text = socket.recv(timeout=remaining)
+                    if not text:
+                        return
+                    self._handle_text(text, generation)
+                if legacy:
+                    socket.settimeout(None)
+            else:
                 self._notify_ready(generation)
-            for text in socket:
-                if not self._is_current_connection(generation):
+            messages = iter(socket.recv, "") if legacy else iter(socket)
+            for text in messages:
+                if not text or not self._is_current_connection(generation):
                     break
-                try:
-                    self._dispatch_text(text, generation)
-                except Exception as exc:
-                    print(f"ignoring signaling message: {exc}", flush=True)
+                self._handle_text(text, generation)
         finally:
-            with self.connection_lock:
-                is_current = generation == self.connection_generation
-                if is_current:
-                    self.connected.clear()
-            if is_current:
-                print("WebRTC signaling disconnected", flush=True)
-                self._clear_ready()
+            self._finish_connection(generation)
+
+    def _handle_text(self, text, generation):
+        try:
+            self._dispatch_text(text, generation)
+        except Exception as exc:
+            print(f"ignoring signaling message: {exc}", flush=True)
 
 
 class ClientSignaling(JsonSignaling):
@@ -489,13 +513,12 @@ class ClientSignaling(JsonSignaling):
                         socket = websocket.create_connection(self.url, timeout=10)
                         if self.closed.is_set():
                             break
-                        socket.settimeout(None)
                         socket.send(self._registration_text())
                         print(
                             f"WebRTC signaling connected: role={self.role} room={self.room} url={self.url}",
                             flush=True,
                         )
-                        self._legacy_read_loop(socket)
+                        self._read_loop(socket, legacy=True)
                 except Exception as exc:
                     if not self.closed.is_set():
                         print(f"signaling reconnect after error: {exc}", flush=True)
@@ -509,30 +532,6 @@ class ClientSignaling(JsonSignaling):
 
         self.thread = threading.Thread(target=run, daemon=True)
         self.thread.start()
-
-    def _legacy_read_loop(self, socket=None):
-        socket = socket if socket is not None else self.ws
-        generation = self._begin_connection(socket)
-        try:
-            while not self.closed.is_set():
-                text = socket.recv()
-                if not text:
-                    break
-                if not self._is_current_connection(generation):
-                    break
-                try:
-                    self._dispatch_text(text, generation)
-                except Exception as exc:
-                    print(f"ignoring signaling message: {exc}", flush=True)
-        finally:
-            with self.connection_lock:
-                is_current = generation == self.connection_generation
-                if is_current:
-                    self.connected.clear()
-            if is_current:
-                print("WebRTC signaling disconnected", flush=True)
-                self._clear_ready()
-
 
 class ServerSignaling(JsonSignaling):
     def __init__(self, host: str, port: int, on_message, on_connected=None):

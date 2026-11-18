@@ -3,6 +3,8 @@ import hashlib
 import hmac
 import json
 import sys
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -286,6 +288,91 @@ def test_signaling_client_waits_for_registration_ack():
     assert callbacks == []
     signaling._dispatch_text('{"type":"registered"}', generation)
     assert callbacks == ["ready"]
+
+
+def test_replacement_signaling_socket_requires_its_own_registration():
+    from gst_webrtc_common import JsonSignaling
+
+    delivered = []
+    signaling = JsonSignaling(lambda _: None, wait_for_registration=True)
+    signaling.ws = SimpleNamespace(send=delivered.append)
+    previous = signaling._begin_connection()
+    signaling._notify_ready(previous)
+
+    newest = signaling._begin_connection()
+    signaling.send({"type": "offer"})
+    signaling._notify_ready(previous)
+    signaling._flush_pending()
+    assert not signaling.ready.is_set()
+    assert delivered == []
+
+    signaling._notify_ready(newest)
+    signaling._finish_connection(previous)
+    signaling._flush_pending()
+    assert signaling.ready.is_set()
+    assert len(delivered) == 1
+
+
+def test_signaling_writer_does_not_switch_socket_during_flush():
+    from gst_webrtc_common import JsonSignaling
+
+    delivered = []
+    signaling = JsonSignaling(lambda _: None, wait_for_registration=True)
+    replacement = SimpleNamespace(send=delivered.append)
+    new_generation = []
+
+    def replace_during_send(text):
+        delivered.append(("old", json.loads(text)["type"]))
+        signaling.ws = replacement
+        new_generation.append(signaling._begin_connection())
+
+    signaling.ws = SimpleNamespace(send=replace_during_send)
+    generation = signaling._begin_connection()
+    signaling._notify_ready(generation)
+    signaling.send({"type": "offer"})
+    signaling.send({"type": "ice"})
+    signaling._flush_pending()
+    assert delivered == [("old", "offer")]
+
+    signaling._notify_ready(new_generation[0])
+    signaling._flush_pending()
+    assert json.loads(delivered[1])["type"] == "ice"
+
+
+def test_signaling_reconnects_when_open_socket_never_acknowledges_registration(monkeypatch):
+    import gst_webrtc_common as common
+    import pytest
+
+    if common.connect is None or common.serve is None:
+        pytest.skip("requires synchronous websockets test transport")
+    monkeypatch.setattr(common.ClientSignaling, "registration_timeout_sec", 0.5)
+    attempts = []
+    received = []
+    delivered = threading.Event()
+    def handle(socket):
+        attempts.append(json.loads(socket.recv(timeout=3))["type"])
+        if len(attempts) == 1:
+            socket.wait_closed()
+            return
+        socket.send('{"type":"registered"}')
+        received.append(json.loads(socket.recv(timeout=3))["type"])
+        delivered.set()
+
+    with common.serve(handle, "127.0.0.1", 0) as server:
+        port = server.socket.getsockname()[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = common.ClientSignaling(f"ws://127.0.0.1:{port}", "machine", "test", lambda _: None)
+        try:
+            client.send({"type": "offer"})
+            client.start()
+            assert delivered.wait(6), "No offer delivered on replacement socket"
+            assert attempts == ["register", "register"]
+            assert received == ["offer"]
+        finally:
+            client.close()
+            server.shutdown()
+            thread.join(timeout=3)
 
 
 def test_signaling_disconnected_send_never_waits(monkeypatch):
