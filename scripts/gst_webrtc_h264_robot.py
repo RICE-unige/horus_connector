@@ -275,6 +275,13 @@ class H264RobotSender:
 
     def _media_bin_description(self, stream: dict, index: int) -> str:
         encoder_name = f"video_encoder_{index}"
+        payload_type = 96 + index
+        rtp = (f"rtph264pay name=payloader_{index} pt={payload_type} config-interval=1 "
+               "mtu=1200 aggregate-mode=zero-latency")
+        if Gst.version()[:2] < (1, 22):
+            # GStreamer 1.20 can create an offer from template caps before the first frame.
+            rtp += (f' ! capsfilter caps="application/x-rtp,media=video,encoding-name=H264,'
+                    f'clock-rate=90000,payload={payload_type}"')
         return (
             f"{self._video_source(stream, index)} ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
@@ -283,7 +290,7 @@ class H264RobotSender:
             f"{self._encoder(encoder_name)} ! "
             "h264parse config-interval=1 ! "
             "video/x-h264,stream-format=byte-stream,alignment=au ! "
-            f"rtph264pay name=payloader_{index} pt={96 + index} config-interval=1 mtu=1200 aggregate-mode=zero-latency"
+            f"{rtp}"
         )
 
     def _build_pipeline(self):

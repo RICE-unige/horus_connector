@@ -115,6 +115,37 @@ def test_bitrate_budget_cannot_silently_exceed_session_limit(tmp_path, monkeypat
         load_streams(tmp_path, "robot")
 
 
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_camera_advertises_its_rtp_payload_before_first_frame(index, monkeypatch):
+    from gst_webrtc_h264_robot import Gst, H264RobotSender
+
+    Gst.init(None)
+    if Gst.ElementFactory.find("x264enc") is None:
+        pytest.skip("x264enc unavailable")
+    monkeypatch.setattr(Gst, "version", lambda: (1, 20, 3, 0))
+    sender = object.__new__(H264RobotSender)
+    sender.profile = {"GST_H264_ENCODER_NAME": "x264enc"}
+    stream = {"id": "front", "video_source": "ros2", "width": 640, "height": 480, "fps": 15}
+    media = Gst.parse_bin_from_description(sender._media_bin_description(stream, index), True)
+    caps = media.get_static_pad("src").query_caps(None)
+    assert caps.is_fixed()
+    rtp = caps.get_structure(0)
+    assert rtp.get_string("encoding-name") == "H264"
+    assert rtp.get_value("payload") == 96 + index
+
+
+def test_newer_gstreamer_keeps_the_original_bundled_camera_pipeline(monkeypatch):
+    from gst_webrtc_h264_robot import Gst, H264RobotSender
+
+    monkeypatch.setattr(Gst, "version", lambda: (1, 24, 2, 0))
+    sender = object.__new__(H264RobotSender)
+    sender.profile = {"GST_H264_ENCODER_NAME": "x264enc"}
+    stream = {"id": "rear", "video_source": "ros2", "width": 640, "height": 480, "fps": 15}
+    assert sender._media_bin_description(stream, 1).endswith(
+        "rtph264pay name=payloader_1 pt=97 config-interval=1 mtu=1200 aggregate-mode=zero-latency"
+    )
+
+
 def test_partial_encoder_update_restores_and_reports_actual_bitrates():
     from gst_webrtc_h264_robot import H264RobotSender
     class Encoder:
