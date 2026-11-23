@@ -17,6 +17,14 @@ for routing, camera delivery, recovery budgets and qualification instructions.
 - Bootstrap detects Intel render devices for VA-API. On Jetson use the JetPack-provided drivers and codecs. A matching CPU architecture alone does not qualify a host's video stack or guarantee a native bundle is available.
 - `RUN_APT=no` skips apt for hosts with dependencies already installed. It does not skip runtime validation.
 
+On x86-64 with glibc older than 2.38 (including Ubuntu 22.04 containers),
+bootstrap automatically installs the pinned Zenoh 1.10.2 musl build and two
+checksum-verified runtime libraries in the Connector directory. It does not
+require Docker or modify system libraries. The GNU builds are unchanged on
+newer x86-64 and ARM64, and bootstrap reuses an existing working,
+version-matched installation. Docker fallback for unsupported native builds
+requires access to a working Docker daemon.
+
 ## Core Environment
 
 | Variable | Used by | Purpose |

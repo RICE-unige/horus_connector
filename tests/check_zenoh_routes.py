@@ -292,13 +292,14 @@ def main():
             env["HORUS_ZENOH_BULK_BUDGET_FILE"] = str(budget_path)
         env.setdefault("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
         if env["RMW_IMPLEMENTATION"] == "rmw_cyclonedds_cpp":
-            # Keep test discovery on loopback without changing host interfaces.
-            env.setdefault("CYCLONEDDS_URI", '<CycloneDDS><Domain><General><Interfaces>'
-                           '<NetworkInterface address="127.0.0.1" multicast="true"/>'
-                           '</Interfaces></General><Discovery><ParticipantIndex>auto</ParticipantIndex>'
-                           '<MaxAutoParticipantIndex>1000</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>')
-            if name.endswith("bridge") and env.get("ROS_DISTRO") in {"foxy", "galactic", "humble"}:
+            if env.get("ROS_DISTRO") in {"foxy", "galactic", "humble"}:
+                # These RMWs already select lo for ROS_LOCALHOST_ONLY.
                 env.pop("CYCLONEDDS_URI", None)
+            else:
+                env.setdefault("CYCLONEDDS_URI", '<CycloneDDS><Domain><General><Interfaces>'
+                               '<NetworkInterface address="127.0.0.1" multicast="true"/>'
+                               '</Interfaces></General><Discovery><ParticipantIndex>auto</ParticipantIndex>'
+                               '<MaxAutoParticipantIndex>1000</MaxAutoParticipantIndex></Discovery></Domain></CycloneDDS>')
         proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
         processes.append(proc)
         return proc

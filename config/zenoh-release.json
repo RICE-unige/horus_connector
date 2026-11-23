@@ -4,5 +4,21 @@
   "sha256": {
     "x86_64-unknown-linux-gnu": "d6c3ff1c6886b9a284dd2b192a0acbdd5240aea266ad07e8febfcc0b6bce06bc",
     "aarch64-unknown-linux-gnu": "af4ee9ee4b442a88dcff9051c56ff853025efbaf6ffb8405f7bc24a761b7b9da"
+  },
+  "x86_64_compat": {
+    "native_min_glibc": "2.38",
+    "sha256": "fae65ff2acd635d44aaae56a55059d19a9d8988147b7466814d4172d4657d8bb",
+    "runtime": [
+      {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/musl-1.2.5-r13.apk",
+        "sha256": "359890bc7c4dc5fee7a85192de60a471c987e4664767288578beca60a44db2c8",
+        "member": "lib/ld-musl-x86_64.so.1"
+      },
+      {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/libgcc-14.2.0-r6.apk",
+        "sha256": "04f3467bc967e705221a843fe4d3de5850db826e571686e0c0ed453d38cb5c59",
+        "member": "usr/lib/libgcc_s.so.1"
+      }
+    ]
   }
 }

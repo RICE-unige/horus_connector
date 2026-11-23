@@ -29,3 +29,4 @@ libzenoh_plugin_ros2dds.so
 .zenoh-install.*/
 .zenoh-download.*
 .zenoh-profile.*
+.zenoh-compat/

@@ -400,7 +400,7 @@ zenoh_binary_matches() {
 
 install_zenoh() (
   local version target archive zip url expected_sha artifact staging="" backup="" updating=0
-  local temp_zip="" install_lock file
+  local temp_zip="" install_lock file glibc compat_key=""
   exec {install_lock}>"${ROOT}/.zenoh-install.lock"
   flock -w 30 "${install_lock}" || { log_error "Another Zenoh installation is in progress."; return 1; }
   cleanup_zenoh_install() {
@@ -435,7 +435,8 @@ install_zenoh() (
     return 1
   fi
 
-  artifact="$(python3 "${SCRIPT_DIR}/zenoh_release.py" --version "${version}" --target "${target}" \
+  glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  artifact="$(python3 "${SCRIPT_DIR}/zenoh_release.py" --version "${version}" --target "${target}" --glibc "${glibc}" \
     --download-base "${ZENOH_DOWNLOAD_BASE:-}")" || return 1
   IFS=$'\t' read -r archive url expected_sha <<< "${artifact}"
   zip="${ROOT}/${archive}"
@@ -457,11 +458,28 @@ install_zenoh() (
     return 1
   fi
   chmod +x "${staging}/zenoh-bridge-ros2dds"
+  if [[ "${archive}" == *-x86_64-unknown-linux-musl-standalone.zip ]]; then
+    log_info "Using the project-local Zenoh compatibility runtime (${glibc})."
+    compat_key="$(python3 "${SCRIPT_DIR}/zenoh_release.py" --stage-compat-runtime "${staging}")" || return 1
+  fi
   local output
   if output="$(timeout 10 "${staging}/zenoh-bridge-ros2dds" --version 2>&1)"; then
     if ! zenoh_binary_matches "${staging}/zenoh-bridge-ros2dds" "${version}"; then
       log_error "Downloaded binary does not report the requested Zenoh version ${version}: ${output}"
       return 1
+    fi
+    if [[ -n "${compat_key}" ]]; then
+      # An existing wrapper and its rollback copy keep using their exact pinned runtime.
+      local compat_source="${staging}/.zenoh-compat/${compat_key}"
+      local compat_dest="${ROOT}/.zenoh-compat/${compat_key}"
+      mkdir -p "${ROOT}/.zenoh-compat" || return 1
+      if [[ -d "${compat_dest}" ]]; then
+        for file in bridge ld-musl-x86_64.so.1 libgcc_s.so.1; do
+          mv -f -- "${compat_source}/${file}" "${compat_dest}/${file}" || return 1
+        done
+      else
+        mv -T -- "${compat_source}" "${compat_dest}" || return 1
+      fi
     fi
     mkdir -p "${ROOT}/.zenoh-backups"
     backup="$(mktemp -d "${ROOT}/.zenoh-backups/$(date -u '+%Y%m%dT%H%M%SZ').XXXXXX")"
@@ -483,8 +501,12 @@ install_zenoh() (
   fi
 
   log_error "Zenoh bridge binary is not usable on this host:"
-  echo -e "${FG_RED}${output}${RESET}"
-  log_warn "Install Docker or use a newer OS/JetPack with glibc >= 2.28."
+  printf '%s\n' "${output}" >&2
+  if [[ "${output}" =~ (GLIBC_[0-9]+(\.[0-9]+)+) ]]; then
+    local required_glibc="${BASH_REMATCH[1]#GLIBC_}"
+    log_warn "The downloaded Zenoh build requires glibc ${required_glibc}; this environment reports ${glibc:-unknown}." >&2
+  fi
+  log_warn "Use a compatible Zenoh ${version} build for this environment. Docker fallback requires the Docker CLI and access to its daemon." >&2
   return 1
 )
 
@@ -513,7 +535,8 @@ write_zenoh_profile() {
 }
 
 docker_command_mode() {
-  if have docker && timeout 10 docker ps >/dev/null 2>&1; then
+  have docker || return 1
+  if timeout 10 docker ps >/dev/null 2>&1; then
     echo "user"
     return 0
   fi
@@ -521,14 +544,9 @@ docker_command_mode() {
     echo "sudo"
     return 0
   fi
-  if have docker && have sudo && [[ ! -t 0 ]]; then
-    echo "sudo-unverified"
-    return 0
-  fi
   if [[ -t 0 ]] && have sudo; then
-    echo "Zenoh Docker fallback needs sudo Docker access."
-    sudo -v
-    if timeout 30 sudo docker ps >/dev/null 2>&1; then
+    echo "Zenoh Docker fallback needs sudo Docker access." >&2
+    if sudo -v && timeout 10 sudo -n docker ps >/dev/null 2>&1; then
       echo "sudo"
       return 0
     fi
@@ -550,15 +568,10 @@ configure_zenoh_docker_fallback() {
   log_warn "Binary error: ${error//$'\n'/ }"
   if [[ "${mode}" == "sudo" ]]; then
     timeout "${HORUS_DOCKER_PULL_TIMEOUT:-300}" sudo -n docker pull "${image}" || return 1
-    write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using Docker fallback. Add the user to the docker group for passwordless launches."
-  elif [[ "${mode}" == "sudo-unverified" ]]; then
-    write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using sudo Docker fallback. Run sudo -v before launch, or add the user to the docker group."
-    log_info "Docker is installed but needs sudo. Configured sudo Docker fallback."
-    log_info "Before launch, run: sudo -v"
-    log_info "If the image is not cached yet, run: sudo docker pull ${image}"
+    write_zenoh_profile "docker" "1" "${image}" "Host binary incompatible; using Docker fallback with sudo." || return 1
   else
     timeout "${HORUS_DOCKER_PULL_TIMEOUT:-300}" docker pull "${image}" || return 1
-    write_zenoh_profile "docker" "0" "${image}" "Host binary incompatible; using Docker fallback."
+    write_zenoh_profile "docker" "0" "${image}" "Host binary incompatible; using Docker fallback." || return 1
   fi
   log_success "Configured Zenoh Docker fallback: ${image}"
   return 0
