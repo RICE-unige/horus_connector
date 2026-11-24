@@ -14,7 +14,10 @@ for routing, camera delivery, recovery budgets and qualification instructions.
 
 - Bootstrap reuses the ROS setup or overlay selected in the profile. On Ubuntu 24.04/Jazzy or 22.04/Humble with the official ROS 2 apt repository configured, `HORUS_INSTALL_ROS=1 ./horus bootstrap` also installs ROS Base and Cyclone DDS when no default ROS setup is present. For a custom install, set `ROS_SETUP_PATH` instead.
 - The `cloud` role does not require ROS for routing and signaling alone. Native cloud media fan-out needs ROS and a matching [runtime bundle](#pinned-experiment-runtime).
-- Bootstrap detects Intel render devices for VA-API. On Jetson use the JetPack-provided drivers and codecs. A matching CPU architecture alone does not qualify a host's video stack or guarantee a native bundle is available.
+- Bootstrap installs missing runtime packages only. Camera packages follow the enabled streams; an explicit empty H.264 stream list does not pull in the Python WebRTC or GStreamer camera stack. Native media and TURN dependencies are selected only for the roles that enable them.
+- Bootstrap probes existing GPU codecs and does not install or replace GPU drivers. On Jetson, use the JetPack-provided drivers and codecs. A matching CPU architecture alone does not qualify a host's video stack or guarantee a native bundle is available.
+- For a robot using only ROS/Zenoh (including cameras carried as ROS topics), use `./horus bootstrap robot --zenoh-only` and `./horus launch robot --zenoh-only`. Leave off the option for the normal WebRTC camera setup.
+- No robot/relay setup builds the Quest/HoloLens voice plugin. It is ignored by `colcon` and built separately with the headset toolchain.
 - `RUN_APT=no` skips apt for hosts with dependencies already installed. It does not skip runtime validation.
 
 On x86-64 with glibc older than 2.38 (including Ubuntu 22.04 containers),
@@ -58,6 +61,8 @@ requires access to a working Docker daemon.
 ## DDS Preflight
 
 `./horus launch <role>` runs a DDS preflight before starting Zenoh unless `HORUS_SKIP_DDS_PREFLIGHT=1` or `--skip-dds-preflight` is used. It snapshots the launch environment and classifies issues before the bridge starts. If `CYCLONEDDS_URI` is set, HORUS passes that existing profile to the bridge. If it is empty, HORUS renders a connector-owned CycloneDDS profile for the bridge participant.
+
+Run setup from the shell where the robot's camera is already visible. Setup saves its optional ROS middleware and DDS settings; blank legacy profile entries do not erase inherited settings at launch. On a robot H.264 launch, HORUS waits up to four seconds for a valid sample from each configured raw ROS camera and saves the result in `.run/camera_preflight.json`. This check does not require an operator, claim remote delivery, block non-video services on a missing camera, or substitute a different camera. A ROS camera that starts later can begin streaming without a Connector restart.
 
 Artifacts:
 
@@ -432,9 +437,8 @@ Version-1 isolated streams use the stream service name:
 |---|---|
 | `WEBRTC_ENCODER_PREFERENCE` | `stable`, `hardware`, or `software`. |
 | `WEBRTC_DECODER_PREFERENCE` | `stable`, `hardware`, or `software`. |
-| `HORUS_INTEL_MEDIA_DRIVER` | `free` by default. Use `non-free` only when required. |
 
-Bootstrap probes the local machine and writes the selected video path to `.webrtc_profile.env`.
+For enabled H.264 cameras, bootstrap probes installed codecs and writes the selected video path to `.webrtc_profile.env`.
 
 Launch uses a cached, atomic per-instance `.run/webrtc_profile.env`. Interpreter,
 detector, GStreamer version, plugin search paths, devices and video settings

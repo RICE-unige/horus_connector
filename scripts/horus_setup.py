@@ -40,6 +40,11 @@ VIDEO_PRESETS = {
     "high": (1920, 1080, 30, 8000),
 }
 
+DDS_OPTIONAL_KEYS = (
+    "RMW_IMPLEMENTATION", "CYCLONEDDS_URI", "ROS_STATIC_PEERS", "ROS_DISCOVERY_SERVER",
+    "FASTRTPS_DEFAULT_PROFILES_FILE", "FASTDDS_DEFAULT_PROFILES_FILE",
+)
+
 TEAMMATE_VIDEO_PROFILES = {
     "fast60": "640x360@60, low-latency first-person view. Recommended.",
     "balanced": "640x360@30, lower CPU/network load.",
@@ -319,7 +324,10 @@ class Wizard:
             self.existing.get("FIELD_TEAMMATE_RAW_IMAGE", "0").lower() in {"1", "true", "yes", "on"}
         )
         if role in {"robot", "machine"}:
-            camera_default = self.args.camera_topic or self.existing.get("WEBRTC_ROS_IMAGE_INPUT_TOPIC") or "/camera/image_raw"
+            existing_streams = self.existing_streams()
+            stream_input = existing_streams[0].get("input_topic") if existing_streams else ""
+            camera_default = (self.args.camera_topic or (stream_input if role == "robot" else "")
+                              or self.existing.get("WEBRTC_ROS_IMAGE_INPUT_TOPIC") or "/camera/image_raw")
             output_default = self.camera_output_default(role, room)
             camera_topic = self.prompt_text("Robot camera input topic", camera_default, required=True, validator=is_topic)
             output_topic = self.prompt_text("Decoded camera output topic on machine", output_default, required=True, validator=is_topic)
@@ -453,6 +461,8 @@ class Wizard:
         if use_turn and cloud_ip:
             ice_servers = f"{ice_servers},turn://{turn_user}:{turn_password}@{cloud_ip}:{turn_port}"
 
+        discovery = self.ros_setting("ROS_AUTOMATIC_DISCOVERY_RANGE")
+        localhost_only = self.ros_setting("ROS_LOCALHOST_ONLY", "0" if discovery and discovery != "LOCALHOST" else "1")
         self.values = {
             "HORUS_ROLE": role,
             "HORUS_ROOM": room,
@@ -463,8 +473,9 @@ class Wizard:
             "ROS_DISTRO": ros_distro,
             "ROS_DOMAIN_ID": ros_domain,
             "ROS_SETUP_PATH": ros_setup_path,
-            "ROS_LOCALHOST_ONLY": "1",
-            "ROS_AUTOMATIC_DISCOVERY_RANGE": "LOCALHOST",
+            "ROS_LOCALHOST_ONLY": localhost_only,
+            "ROS_AUTOMATIC_DISCOVERY_RANGE": discovery or ("LOCALHOST" if localhost_only == "1" else "SUBNET"),
+            **{key: self.ros_setting(key) for key in DDS_OPTIONAL_KEYS},
             "ROS_CMD_TOPIC": self.existing.get("ROS_CMD_TOPIC", "/cmd_vel"),
             "ZENOH_NAMESPACE": namespace,
             "ZENOH_CONFIG": "auto",
@@ -497,7 +508,7 @@ class Wizard:
             "WEBRTC_ROS_IMAGE_INPUT_TOPIC": camera_topic,
             "WEBRTC_ROS_IMAGE_OUTPUT_TOPIC": output_topic,
             "WEBRTC_ROS_IMAGE_QOS": "auto",
-            "HORUS_STREAMS_CONFIG": "config/webrtc_streams.json",
+            "HORUS_STREAMS_CONFIG": self.existing.get("HORUS_STREAMS_CONFIG") or "config/webrtc_streams.json",
             "HORUS_WEBRTC_SESSION_MODE": "bundled",
             "VIDEO_BITRATE_KBIT": str(bitrate),
             "WEBRTC_MIN_BITRATE_KBIT": "1000",
@@ -592,6 +603,13 @@ class Wizard:
             hint=f"Default source: {hint}. Change this if the robot/machine ROS graph uses another domain.",
         )
 
+    def ros_setting(self, key: str, default: str = "") -> str:
+        value = self.existing.get(key) or os.environ.get(key) or default
+        if "\n" in value or "\r" in value:
+            print(f"Warning: {key} contains multiple lines and was not saved. Use a file path for a persistent profile.")
+            return default
+        return value
+
     def resolve_ros_setup_path(self, ros_distro: str, role: str) -> str:
         if role == "cloud":
             print("ROS setup file: - (cloud does not need local ROS 2 nodes)\n")
@@ -601,17 +619,19 @@ class Wizard:
         existing_path = self.existing.get("ROS_SETUP_PATH", "")
         if self.args.ros_setup_path:
             default = self.args.ros_setup_path
-        elif existing_path and is_existing_file(existing_path):
+        elif existing_path and is_existing_file(existing_path) and setup_matches_distro(existing_path, ros_distro):
             default = existing_path
         elif candidates:
             default = candidates[0]
-        elif existing_path:
+        elif existing_path and setup_matches_distro(existing_path, ros_distro):
             default = existing_path
         else:
             default = ""
 
         if default and is_existing_file(default):
             default = expand_path(default)
+            if not setup_matches_distro(default, ros_distro):
+                raise SystemExit(f"ROS setup {default} does not match the selected ROS_DISTRO={ros_distro}")
             print(f"ROS setup file: {self.color.paint(default, 'green')}")
             print("  This file will be sourced before HORUS starts ROS-related services.\n")
             return default
@@ -623,6 +643,8 @@ class Wizard:
             validator=is_existing_file,
             hint="Enter an existing overlay setup file, or leave blank to use the standard installation after bootstrap.",
         )
+        if setup_path and not setup_matches_distro(setup_path, ros_distro):
+            raise SystemExit(f"ROS setup {setup_path} does not match the selected ROS_DISTRO={ros_distro}")
         return expand_path(setup_path) if setup_path else ""
 
     def camera_output_default(self, role: str, room: str) -> str:
@@ -693,7 +715,9 @@ class Wizard:
             default_room = room
             identifier = default_id
             stream_room = default_room
-            input_default = str(existing_stream.get("input_topic") or (camera_topic if index == 0 else f"/camera/{ros_safe_name(default_id)}/image_raw"))
+            input_default = str(camera_topic if index == 0 and role == "robot" else
+                                existing_stream.get("input_topic") or
+                                (camera_topic if index == 0 else f"/camera/{ros_safe_name(default_id)}/image_raw"))
             output_default = str(existing_stream.get("output_topic") or (output_topic if index == 0 else self.stream_output_default(default_room, default_id)))
             if self.interactive and requested_count > 1:
                 print(self.color.paint(f"Camera stream {index + 1}", "blue"))
@@ -878,6 +902,11 @@ def detect_ros_distros() -> list[str]:
                   if any((path / name).is_file() for name in ("setup.bash", "local_setup.bash")))
 
 
+def setup_matches_distro(value: str, ros_distro: str) -> bool:
+    parts = Path(expand_path(value)).parts
+    return parts[:3] != ("/", "opt", "ros") or (len(parts) > 3 and parts[3] == ros_distro)
+
+
 def detect_ros_setup_candidates(ros_distro: str) -> list[str]:
     candidates: list[str] = []
     for value in (
@@ -888,13 +917,12 @@ def detect_ros_setup_candidates(ros_distro: str) -> list[str]:
     ):
         add_setup_candidate(candidates, value)
 
-    for env_name in ("AMENT_PREFIX_PATH", "COLCON_PREFIX_PATH", "CMAKE_PREFIX_PATH"):
-        for prefix in os.environ.get(env_name, "").split(os.pathsep):
-            if not prefix:
-                continue
-            for file_name in ("setup.bash", "local_setup.bash", "setup.sh", "local_setup.sh"):
-                add_setup_candidate(candidates, str(Path(prefix) / file_name))
-    return candidates
+    if os.environ.get("ROS_DISTRO") == ros_distro:
+        for env_name in ("AMENT_PREFIX_PATH", "COLCON_PREFIX_PATH", "CMAKE_PREFIX_PATH"):
+            for prefix in filter(None, os.environ.get(env_name, "").split(os.pathsep)):
+                for file_name in ("setup.bash", "local_setup.bash", "setup.sh", "local_setup.sh"):
+                    add_setup_candidate(candidates, str(Path(prefix) / file_name))
+    return [path for path in candidates if setup_matches_distro(path, ros_distro)]
 
 
 def add_setup_candidate(candidates: list[str], value: str) -> None:

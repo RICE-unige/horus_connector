@@ -177,6 +177,7 @@ def test_first_encoder_output_watchdog_requires_a_connected_peer(connected, expe
     sender.stopped = False
     sender.webrtc = SimpleNamespace(get_property=lambda _: SimpleNamespace(value_nick="connected" if connected else "new"))
     sender.recovering = False
+    sender.media_start_error = ""
     sender.negotiation_started = time.monotonic() - 20
     sender.negotiation_in_progress = False
     sender.streams = [{"id": "front"}]

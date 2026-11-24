@@ -830,12 +830,14 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
             health = state.get("media_health", {})
             tracks = []
             recovering = False
+            startup_error = ""
             expected = expected_media_tracks(env, Path(str(state["root"])))
             complete = bool(expected)
             for name in running_streams:
                 payload = health.get(name, {})
                 recovering |= payload.get("state") == "recovering"
                 if payload.get("status_age_sec", float("inf")) < 4:
+                    startup_error = startup_error or payload.get("media_start_error", "")
                     tracks.extend(payload.get("tracks", {}).values())
                     complete &= expected.get(name, set()) <= set(payload.get("tracks", {}))
                 else:
@@ -845,7 +847,10 @@ def build_services(state: Dict[str, object]) -> List[ServiceState]:
             if len(running_streams) != len(configured_streams):
                 services.append(ServiceState("WebRTC", "DOWN", "one or more media processes are stopped", "down"))
             elif recovering:
-                services.append(ServiceState("WebRTC", "RECOVER", "renegotiating media", "warn"))
+                detail = f"retrying camera/media startup: {startup_error}" if startup_error else "renegotiating media"
+                services.append(ServiceState("WebRTC", "RECOVER", truncate(detail, 90), "warn"))
+            elif role == "robot" and any(t.get("source_state") in {"no_ros_frames", "no_usable_frames"} for t in tracks):
+                services.append(ServiceState("WebRTC", "WAIT", "no usable ROS camera frames; check the camera preflight", "warn"))
             elif stale:
                 services.append(ServiceState("WebRTC", "STALE", f"{stale} track(s) stopped producing fresh frames", "warn"))
             elif complete and tracks and fresh == len(tracks):

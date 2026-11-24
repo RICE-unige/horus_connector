@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--letterbox", action="store_true")
     parser.add_argument("--latched-info", action="store_true")
+    parser.add_argument("--late-camera", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     config = args.output / "streams.json"
@@ -47,7 +48,7 @@ def main():
         info_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
     calibration = node.create_publisher(CameraInfo, "/acceptance/input_info", info_qos)
     received, infos, sent = [], [], set()
-    running = [True]
+    running = [not args.late_camera]
     count = [0]
     def publish():
         if not running[0]:
@@ -112,6 +113,12 @@ def main():
             evidence["before_reset"] = len(received)
             receiver._recover_pipeline()
             return False
+        if args.late_camera:
+            def start_camera():
+                evidence["before_first_source_frame"] = len(received)
+                running[0] = True
+                return False
+            GLib.timeout_add_seconds(3, start_camera)
         GLib.timeout_add_seconds(7, pause)
         GLib.timeout_add_seconds(14, resume)
         GLib.timeout_add_seconds(19, reset)
@@ -135,6 +142,8 @@ def main():
                     frames_after_reset=len(received) - evidence.get("before_reset", len(received)),
                     calibration_samples=[{"width": info.width, "height": info.height, "k": list(info.k)} for info in infos[:3]])
     (args.output / "evidence.json").write_text(json.dumps(evidence, indent=2))
+    if args.late_camera:
+        assert evidence["before_first_source_frame"] == 0, evidence
     assert evidence["before_pause"] >= 30, evidence
     assert evidence["at_resume"] - evidence["before_pause"] <= 15, evidence
     assert evidence["generation_before_pause"] == evidence["generation_after_silence"], evidence

@@ -56,6 +56,17 @@ def gst_format_for_ros_encoding(encoding: str) -> Tuple[str, int]:
     return gst_format, bytes_per_pixel
 
 
+def validate_raw_image(message):
+    gst_format, bytes_per_pixel = ros_encoding_to_gst(message.encoding)
+    width, height = int(message.width), int(message.height)
+    if width <= 0 or height <= 0 or (gst_format in {"UYVY", "YUY2"} and width % 2):
+        raise ValueError(f"invalid ROS image dimensions: {width}x{height} for {gst_format}")
+    packed = width * bytes_per_pixel
+    step = int(message.step or packed)
+    if step < packed or len(message.data) < step * (height - 1) + packed:
+        raise ValueError("invalid ROS image stride or payload length")
+
+
 def qos_profile(qos_name: str):
     from rclpy.qos import QoSProfile, ReliabilityPolicy
     return QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE if qos_name == "default"
@@ -219,6 +230,12 @@ class RosImageAppSrc:
                 logger.warning("ROS image callback is still stopping; node cleanup is deferred until it returns")
             else:
                 self.thread = None
+        elif self.node is not None:
+            if executor is not None:
+                executor.shutdown()
+                self.executor = None
+            self.node.destroy_node()
+            self.node = None
 
     def _spin_ros(self, executor, node):
         from rclpy.executors import ExternalShutdownException, ShutdownException

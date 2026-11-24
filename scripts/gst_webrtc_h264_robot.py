@@ -165,6 +165,7 @@ class H264RobotSender:
         self.command_gate = CommandGate(args.cmd_max_age_ms, args.cmd_max_future_ms)
         self.estop_latched = False
         self.recovering = False
+        self.media_start_error = ""
         self.negotiation_in_progress = False
         self.offer_pending = False
         self.last_remote_answer_sdp = ""
@@ -595,10 +596,11 @@ class H264RobotSender:
         try:
             self._stop_media_pipeline()
             if not self.relay_mode or self.peer_ready:
-                self._start_pipeline()
-                if self.stopped:
+                if not self._try_start_media_pipeline():
                     return False
+                self._ensure_adaptive_bitrate()
                 self.offer_pending = True
+                self._request_offer()
             self.recovering = False
             print(
                 "Robot GStreamer pipeline recovered"
@@ -652,12 +654,15 @@ class H264RobotSender:
             self.peer_session_id = ""
             self._publish_zero_command("machine peer disconnected")
             self._stop_media_pipeline()
+            self.recovering = False
+            self.media_start_error = ""
             print("Machine peer left; robot media is idle", flush=True)
             return False
         if kind == "restart":
             self.peer_ready = True
             self._stop_media_pipeline()
-            self._start_pipeline()
+            if not self._try_start_media_pipeline():
+                return False
             self.offer_pending = True
             self._request_offer()
             return False
@@ -702,14 +707,26 @@ class H264RobotSender:
         if force_rebuild and self.pipeline is not None:
             self._stop_media_pipeline()
         if self.pipeline is None:
-            self._start_pipeline()
-            if self.stopped:
+            if not self._try_start_media_pipeline():
                 return False
             self._ensure_adaptive_bitrate()
             print("Robot WebRTC media pipeline started for the active machine peer", flush=True)
         self.offer_pending = True
         self._request_offer()
         return False
+
+    def _try_start_media_pipeline(self):
+        try:
+            self._start_pipeline()
+        except Exception as exc:
+            self.media_start_error = str(exc)
+            print(f"Robot media startup failed; will retry: {exc}", flush=True)
+            self._stop_media_pipeline()
+            self._schedule_recovery()
+            return False
+        self.media_start_error = ""
+        self.recovering = False
+        return not self.stopped
 
     def _on_data_channel(self, _webrtc, channel):
         if self.stopped or _webrtc is not self.webrtc:
@@ -873,6 +890,9 @@ class H264RobotSender:
                 tracks[key]["rate_dropped"] = source.rate_dropped
                 tracks[key]["source_received_frames"] = source.total_received
                 tracks[key]["source_pushed_frames"] = source.total_pushed
+                tracks[key]["source_state"] = ("no_ros_frames" if not source.total_received else
+                                               "no_usable_frames" if not source.total_pushed else
+                                               "stale" if now - source.last_push_sec >= 3 else "flowing")
                 # Active ROS input with a stalled encoder is different from a stopped publisher.
                 waiting = now - self.negotiation_started > 15 if last is None else now - last > 5
                 connected = self.webrtc is not None and getattr(self.webrtc.get_property("connection-state"), "value_nick", "") == "connected"
@@ -881,6 +901,7 @@ class H264RobotSender:
         write_status(os.environ.get("HORUS_MEDIA_STATUS_FILE"),
                      {"role": "robot", "signaling_connected": self.signaling.connected.is_set(),
                       "state": "recovering" if self.recovery_timer is not None else "running",
+                      "media_start_error": self.media_start_error,
                       "generation": self.generation, "tracks": tracks,
                       "recovery_attempts": self.recovery_backoff.attempts,
                       "applied_bitrate_kbit": self.current_bitrate_kbit})

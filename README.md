@@ -60,5 +60,6 @@ Before enabling motion, verify the expected robot poses and cameras in HORUS and
 - [Configuration](docs/configuration.md): installation, ROS domains, runtime bundles and networking
 - [Field teammate](docs/field_teammate_voice.md): HoloLens relay and voice
 - [Reliability and performance](docs/performance.md): transport, recovery and validation
+- [HORUS Documentation](https://rice-unige.github.io/horus_sdk/): SDK tutorials, ROS 2 bridge, and MR integration
 
 Developed by RICE Lab at the University of Genoa. [Apache 2.0](LICENSE) | [Report an issue](https://github.com/RICE-unige/horus_connector/issues)

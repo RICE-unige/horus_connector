@@ -6,6 +6,10 @@ ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROLE_ARG="${1:-}"
 ROLE=""
 RUN_APT="${RUN_APT:-auto}"
+ZENOH_ONLY=0
+PREPARE_CAMERA=0
+PREPARE_DECODER=0
+PREPARE_SIGNALING=0
 
 # ANSI color helpers
 RESET="\033[0m"
@@ -37,12 +41,12 @@ if [[ "${ROLE_ARG}" == "-h" || "${ROLE_ARG}" == "--help" ]]; then
   echo -e "\n${BOLD}${FG_CYAN}HORUS Bootstrap${RESET}"
   echo -e "${FG_MUTED}Prepare dependencies for robot, machine, teammate, or cloud roles${RESET}\n"
   echo -e "${BOLD}Usage${RESET}"
-  echo -e "  ./scripts/bootstrap.sh ${FG_GREEN}[robot|machine|teammate|cloud|auto]${RESET}\n"
+  echo -e "  ./horus bootstrap ${FG_GREEN}[robot|machine|teammate|cloud|auto]${RESET} [--zenoh-only]\n"
   echo "  ./scripts/bootstrap.sh --zenoh-only   Update only the project-local Zenoh bridge"
   echo -e "${BOLD}What it prepares${RESET}"
   echo -e "  - Zenoh ROS 2 DDS bridge binary or Docker fallback"
-  echo -e "  - Python WebRTC and GLib dependencies"
-  echo -e "  - GStreamer video path with hardware detection where available\n"
+  echo -e "  - Python and video runtime dependencies for enabled features"
+  echo -e "  - Existing hardware codec detection, without installing GPU drivers\n"
   echo -e "${FG_MUTED}If passwordless sudo is unavailable, bootstrap prints the apt command and continues with user-local setup.${RESET}\n"
   exit 0
 fi
@@ -78,18 +82,70 @@ is_jetson() {
   grep -qi 'nvidia,tegra\|jetson' /proc/device-tree/compatible 2>/dev/null
 }
 
-has_intel_render_device() {
-  local device
-  for device in /sys/class/drm/renderD*/device/vendor; do
-    [[ ! -r "${device}" || "$(<"${device}")" != "0x8086" ]] || return 0
-  done
-  return 1
+native_media_needed() {
+  [[ "${ZENOH_ONLY}" == 0 ]] || return 1
+  case "${ROLE}" in
+    robot) [[ "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == 1 ]] ;;
+    machine) [[ -n "${HORUS_MEDIA_RELAY_CONFIG:-}" && "${HORUS_MEDIA_RELAY_ENGINE:-native}" == native ]] ;;
+    cloud) [[ -n "${HORUS_CLOUD_MEDIA_CONFIG:-}" ]] ;;
+    *) return 1 ;;
+  esac
 }
 
-native_runtime_requested() {
-  [[ -n "${HORUS_RUNTIME_BUNDLE:-}${HORUS_RUNTIME_SHA256:-}${HORUS_CLOUD_MEDIA_CONFIG:-}" ||
-     "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == 1 ||
-     ( -n "${HORUS_MEDIA_RELAY_CONFIG:-}" && "${HORUS_MEDIA_RELAY_ENGINE:-native}" == native ) ]]
+select_bootstrap_features() {
+  PREPARE_CAMERA=0 PREPARE_DECODER=0 PREPARE_SIGNALING=0
+  [[ "${ZENOH_ONLY}" == 0 ]] || return 0
+  case "${ROLE}" in
+    cloud)
+      if [[ "${HORUS_CLOUD_RUN_SIGNALING:-1}" == 1 ]]; then PREPARE_SIGNALING=1; fi
+      ;;
+    teammate)
+      PREPARE_SIGNALING=1
+      ;;
+    robot|machine)
+      case "${WEBRTC_MEDIA_MODE:-h264}" in
+        h264)
+          local features
+          features="$(python3 - "${SCRIPT_DIR}" "${ROOT}" "${ROLE}" <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from webrtc_streams import load_streams
+
+try:
+    streams = load_streams(Path(sys.argv[2]), sys.argv[3])
+except (OSError, ValueError) as exc:
+    raise SystemExit(f"Invalid WebRTC streams config: {exc}")
+print(int(bool(streams)), int(any(stream["video_source"] != "ros2" and stream["source_pipeline"] for stream in streams)))
+PY
+)" || return 1
+          read -r PREPARE_CAMERA PREPARE_DECODER <<< "${features}"
+          if [[ "${PREPARE_CAMERA}" == 1 && "${ROLE}" == machine ]]; then PREPARE_DECODER=1; fi
+          ;;
+        jpeg)
+          if [[ "${HORUS_ALLOW_LEGACY_JPEG:-0}" != 1 ]]; then
+            log_error "WEBRTC_MEDIA_MODE=jpeg is legacy-only. Use h264 or set HORUS_ALLOW_LEGACY_JPEG=1."
+            return 1
+          fi
+          PREPARE_CAMERA=1
+          ;;
+        *)
+          log_error "WEBRTC_MEDIA_MODE must be h264 or jpeg."
+          return 1
+          ;;
+      esac
+      PREPARE_SIGNALING="${PREPARE_CAMERA}"
+      ;;
+  esac
+}
+
+zenoh_quic_requested() {
+  case "${ZENOH_TRANSPORT:-auto}" in
+    quic) return 0 ;;
+    auto) [[ "${ZENOH_AUTO_ENABLE_QUIC:-0}" == 1 ]] ;;
+    *) return 1 ;;
+  esac
 }
 
 hardware_kind() {
@@ -106,51 +162,27 @@ APT_BASE_PACKAGES=(
   curl
   ca-certificates
   iproute2
-  openssl
   procps
   unzip
   python3
-  python3-pip
   python3-venv
 )
 
-APT_SIGNALING_PACKAGES=(
-  python3-websocket
-  python3-websockets
-)
-
-APT_CLOUD_TURN_PACKAGES=(
-  coturn
-)
-
-APT_MEDIA_COMMON_PACKAGES=(
+APT_H264_PACKAGES=(
   gstreamer1.0-tools
   gstreamer1.0-plugins-base
   gstreamer1.0-plugins-good
   gstreamer1.0-plugins-bad
-  gstreamer1.0-nice
   gstreamer1.0-plugins-ugly
-  gstreamer1.0-libav
+)
+
+APT_PYTHON_VIDEO_PACKAGES=(
+  gstreamer1.0-nice
   python3-gi
   python3-gst-1.0
   gir1.2-gstreamer-1.0
   gir1.2-gst-plugins-base-1.0
   gir1.2-gst-plugins-bad-1.0
-  v4l-utils
-)
-
-APT_DRM_MEDIA_PACKAGES=(
-  vainfo
-  mesa-va-drivers
-)
-
-APT_INTEL_MEDIA_PACKAGES=(
-  gstreamer1.0-vaapi
-)
-
-APT_INTEL_DRIVER_PACKAGES=(
-  intel-media-va-driver
-  intel-media-va-driver-non-free
 )
 
 apt_package_available() {
@@ -161,152 +193,39 @@ apt_package_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
 }
 
-append_available_packages() {
-  local -n packages_ref="$1"
-  shift
-  local package
-  for package in "$@"; do
-    if apt_package_available "${package}"; then
-      packages_ref+=("${package}")
-    fi
-  done
-}
-
-append_intel_media_driver() {
-  local -n packages_ref="$1"
-  local package
-
-  if apt_package_installed intel-media-va-driver && [[ "${HORUS_INTEL_MEDIA_DRIVER:-free}" == "non-free" ]]; then
-    log_warn "intel-media-va-driver is already installed; keeping it to avoid a non-free driver conflict."
-    packages_ref+=(intel-media-va-driver)
-    return
-  fi
-
-  for package in "${APT_INTEL_DRIVER_PACKAGES[@]}"; do
-    if apt_package_installed "${package}"; then
-      packages_ref+=("${package}")
-      return
-    fi
-  done
-
-  case "${HORUS_INTEL_MEDIA_DRIVER:-free}" in
-    free)
-      if apt_package_available intel-media-va-driver; then
-        packages_ref+=(intel-media-va-driver)
-      elif apt_package_available intel-media-va-driver-non-free; then
-        packages_ref+=(intel-media-va-driver-non-free)
-      fi
-      ;;
-    non-free)
-      if apt_package_available intel-media-va-driver-non-free; then
-        packages_ref+=(intel-media-va-driver-non-free)
-      elif apt_package_available intel-media-va-driver; then
-        packages_ref+=(intel-media-va-driver)
-      fi
-      ;;
-    *)
-      echo "Unknown HORUS_INTEL_MEDIA_DRIVER=${HORUS_INTEL_MEDIA_DRIVER}. Use free or non-free." >&2
-      exit 2
-      ;;
-  esac
-}
-
-dedupe_packages() {
-  local -n packages_ref="$1"
-  local deduped=()
-  local package seen exists
-  for package in "${packages_ref[@]}"; do
-    exists=0
-    for seen in "${deduped[@]}"; do
-      if [[ "${seen}" == "${package}" ]]; then
-        exists=1
-        break
-      fi
-    done
-    [[ "${exists}" == "0" ]] && deduped+=("${package}")
-  done
-  packages_ref=("${deduped[@]}")
-}
-
-filter_conflicting_packages() {
-  local -n packages_ref="$1"
-  local filtered=()
-  local package
-  local free_requested=0
-  local nonfree_requested=0
-  for package in "${packages_ref[@]}"; do
-    [[ "${package}" == "intel-media-va-driver" ]] && free_requested=1
-    [[ "${package}" == "intel-media-va-driver-non-free" ]] && nonfree_requested=1
-  done
-  if [[ "${free_requested}" == "1" && "${nonfree_requested}" == "1" ]]; then
-    local keep="intel-media-va-driver"
-    if apt_package_installed intel-media-va-driver-non-free; then
-      keep="intel-media-va-driver-non-free"
-    elif [[ "${HORUS_INTEL_MEDIA_DRIVER:-free}" == "non-free" ]] && ! apt_package_installed intel-media-va-driver; then
-      keep="intel-media-va-driver-non-free"
-    fi
-    log_warn "Both Intel VA drivers are available; selecting ${keep} to avoid apt conflicts."
-    for package in "${packages_ref[@]}"; do
-      case "${package}" in
-        intel-media-va-driver|intel-media-va-driver-non-free)
-          [[ "${package}" == "${keep}" ]] && filtered+=("${package}")
-          ;;
-        *)
-          filtered+=("${package}")
-          ;;
-      esac
-    done
-    packages_ref=("${filtered[@]}")
-  fi
-}
-
 build_apt_packages() {
   local -n output_ref="$1"
   output_ref=("${APT_BASE_PACKAGES[@]}")
-  append_available_packages output_ref "${APT_SIGNALING_PACKAGES[@]}"
   if [[ "${install_ros:-0}" == 1 ]]; then
     output_ref+=("ros-${ROS_DISTRO}-ros-base")
   fi
-  if ros_runtime_needed && [[ "${install_ros:-0}" == 1 || -n "${HORUS_CLOUD_MEDIA_CONFIG:-}" ||
+  if ros_runtime_needed && [[ "${install_ros:-0}" == 1 || "${ROLE}" == cloud ||
                              "${RMW_IMPLEMENTATION:-}" == rmw_cyclonedds_cpp ]]; then
     output_ref+=("ros-${ROS_DISTRO:-jazzy}-rmw-cyclonedds-cpp")
   fi
-  if native_runtime_requested; then
+  if [[ "${HORUS_ZENOH_ENABLED:-1}" != 0 ]] && zenoh_quic_requested &&
+     [[ "${ROLE}" == cloud || ( "${ROLE}" == machine && "${HORUS_TOPOLOGY:-hub}" == direct ) ]]; then
+    output_ref+=(openssl)
+  fi
+  if [[ "${ZENOH_ONLY}" == 0 && "${ROLE}" == cloud && "${HORUS_CLOUD_RUN_TURN:-0}" == 1 ]]; then
+    output_ref+=(coturn)
+  fi
+  if [[ "${ZENOH_ONLY}" == 0 && "${ROLE}" == teammate && "${FIELD_TEAMMATE_RAW_IMAGE:-0}" == 1 ]]; then
+    output_ref+=(python3-opencv python3-numpy)
+  fi
+
+  local native=0 python_video=0
+  if native_media_needed; then
+    native=1
     local abi="406t64"
     [[ "${ROS_DISTRO:-jazzy}" != humble ]] || abi="4.5d"
     output_ref+=("libopencv-core${abi}" "libopencv-imgproc${abi}" "libopencv-imgcodecs${abi}")
   fi
-
-  if [[ "${ROLE}" == "cloud" ]]; then
-    if [[ "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
-      append_available_packages output_ref "${APT_CLOUD_TURN_PACKAGES[@]}"
-    fi
-    if native_runtime_requested; then
-      append_available_packages output_ref "${APT_MEDIA_COMMON_PACKAGES[@]}"
-    fi
-    dedupe_packages output_ref
-    return
-  fi
-  if [[ "${ROLE}" == "teammate" ]]; then
-    if [[ "${FIELD_TEAMMATE_RAW_IMAGE:-0}" == "1" ]]; then
-      append_available_packages output_ref python3-opencv python3-numpy
-    fi
-    dedupe_packages output_ref
-    return
-  fi
-
-  append_available_packages output_ref "${APT_MEDIA_COMMON_PACKAGES[@]}"
-
-  if is_jetson; then
-    log_info "Using JetPack's installed codec stack; bootstrap will not alter L4T packages."
-  elif has_intel_render_device; then
-    append_available_packages output_ref "${APT_DRM_MEDIA_PACKAGES[@]}" "${APT_INTEL_MEDIA_PACKAGES[@]}"
-    append_intel_media_driver output_ref
-  else
-    append_available_packages output_ref "${APT_DRM_MEDIA_PACKAGES[@]}"
-  fi
-  filter_conflicting_packages output_ref
-  dedupe_packages output_ref
+  if [[ "${PREPARE_CAMERA}" == 1 && "${WEBRTC_MEDIA_MODE:-h264}" == h264 ]]; then python_video=1; fi
+  if [[ "${native}" == 1 || "${python_video}" == 1 ]]; then output_ref+=("${APT_H264_PACKAGES[@]}"); fi
+  if [[ "${python_video}" == 1 ]]; then output_ref+=("${APT_PYTHON_VIDEO_PACKAGES[@]}"); fi
+  # A machine's decoder probe uses x264, which is provided by the base H.264 selection.
+  if [[ "${native}" == 1 || "${PREPARE_DECODER}" == 1 ]]; then output_ref+=(gstreamer1.0-libav); fi
 }
 
 run_apt() {
@@ -314,7 +233,15 @@ run_apt() {
     return
   fi
 
-  local packages=()
+  local packages=() missing=() package
+  build_apt_packages packages
+  for package in "${packages[@]}"; do
+    apt_package_installed "${package}" || missing+=("${package}")
+  done
+  if [[ "${#missing[@]}" == 0 ]]; then
+    log_info "Runtime packages are already installed; skipping APT."
+    return 0
+  fi
   apt_update() {
     local runner=("$@")
     if ! "${runner[@]}" apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update; then
@@ -330,28 +257,24 @@ run_apt() {
       log_error "ROS ${ROS_DISTRO} is not available from your apt sources. Configure the official ROS 2 apt repository, then rerun bootstrap."
       return 1
     fi
-    "${runner[@]}" apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y "${packages[@]}"
+    "${runner[@]}" apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${missing[@]}"
   }
 
   if [[ "$(id -u)" -eq 0 ]]; then
     apt_update
-    build_apt_packages packages
     apt_install
   elif sudo -n true >/dev/null 2>&1; then
     apt_update sudo
-    build_apt_packages packages
     apt_install sudo
   elif [[ -t 0 ]] && have sudo; then
     log_warn "Bootstrap needs sudo to install system packages."
     sudo -v
     apt_update sudo
-    build_apt_packages packages
     apt_install sudo
   else
     local install_cmd
-    build_apt_packages packages
-    printf -v install_cmd ' %q' "${packages[@]}"
-    install_cmd="sudo apt-get -o Acquire::ForceIPv4=true update; sudo apt-get install -y${install_cmd}"
+    printf -v install_cmd ' %q' "${missing[@]}"
+    install_cmd="sudo apt-get -o Acquire::ForceIPv4=true update && sudo apt-get install -y --no-install-recommends${install_cmd}"
     log_warn "No passwordless sudo. Run this once if packages are missing:"
     echo -e "  ${FG_CYAN}${install_cmd}${RESET}"
     [[ "${install_ros:-0}" == 0 ]] || return 1
@@ -359,7 +282,7 @@ run_apt() {
 }
 
 ros_runtime_needed() {
-  [[ "${ROLE}" != cloud || -n "${HORUS_CLOUD_MEDIA_CONFIG:-}" ]]
+  [[ "${ROLE}" != cloud ]] || native_media_needed
 }
 
 check_ros2_runtime() {
@@ -582,9 +505,16 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
 fi
 
 if [[ "${ROLE_ARG}" == "--zenoh-only" ]]; then
+  [[ "$#" == 1 ]] || { log_error "Unexpected options for the Zenoh update."; exit 2; }
   install_zenoh
   exit
 fi
+for option in "${@:2}"; do
+  case "${option}" in
+    --zenoh-only) ZENOH_ONLY=1 ;;
+    *) log_error "Unknown bootstrap option: ${option}"; exit 2 ;;
+  esac
+done
 source "${SCRIPT_DIR}/ros_environment.sh"
 source "${SCRIPT_DIR}/managed_runtime.sh"
 
@@ -637,9 +567,18 @@ case "${ROLE}" in
     ;;
 esac
 
+if [[ "${ZENOH_ONLY}" == 1 && "${HORUS_ZENOH_ENABLED:-1}" == 0 ]]; then
+  log_error "--zenoh-only requires Zenoh to be enabled in the selected profile."
+  exit 2
+fi
+select_bootstrap_features
+
 echo -e "\n${BOLD}${FG_CYAN}HORUS Bootstrap${RESET}"
 echo -e "  role       ${ROLE}"
 echo -e "  machine    $(machine_kind) ($(uname -m), $(hardware_kind))"
+if [[ "${ZENOH_ONLY}" == 1 ]]; then
+  echo "  services   Zenoh only"
+fi
 echo ""
 
 install_ros=0
@@ -663,15 +602,9 @@ if ros_runtime_needed; then
 fi
 run_apt
 check_ros2_runtime
-zenoh_quic_requested() {
-  case "${ZENOH_TRANSPORT:-auto}" in
-    quic) return 0 ;;
-    auto) [[ "${ZENOH_AUTO_ENABLE_QUIC:-0}" == "1" ]] && return 0 ;;
-  esac
-  return 1
-}
 
 prepare_zenoh_tls() {
+  [[ "${HORUS_ZENOH_ENABLED:-1}" != 0 ]] || return 0
   zenoh_quic_requested || return 0
   case "${ROLE}:${HORUS_TOPOLOGY:-hub}" in
     cloud:*|machine:direct)
@@ -693,20 +626,28 @@ prepare_zenoh_tls() {
 }
 
 prepare_zenoh_tls
-if [[ "${ROLE}" == "cloud" && "${HORUS_CLOUD_RUN_TURN:-0}" == "1" ]]; then
+if [[ "${ZENOH_ONLY}" == 0 && "${ROLE}" == cloud && "${HORUS_CLOUD_RUN_TURN:-0}" == 1 ]]; then
   bash "${SCRIPT_DIR}/setup_turn.sh"
 fi
 if [[ -n "${HORUS_RUNTIME_BUNDLE:-}${HORUS_RUNTIME_SHA256:-}" ]]; then
   horus_use_runtime_bundle install
+elif [[ "${HORUS_ZENOH_ENABLED:-1}" == 0 ]]; then
+  log_info "Zenoh is disabled; skipping bridge installation."
 elif [[ "${HORUS_ZENOH_SESSION_ISOLATION:-0}" != 1 && -z "${ZENOH_BRIDGE_BINARY:-}" ]]; then
   install_zenoh
 elif [[ ! -x "${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}" ]]; then
   log_error "Selected Zenoh profile requires the pinned native binary. Install a verified HORUS runtime bundle."
   exit 1
 fi
-"${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}" --ros-prepared
+setup_args=(--ros-prepared)
+if [[ "${PREPARE_CAMERA}" == 1 && "${WEBRTC_MEDIA_MODE:-h264}" == h264 ]]; then
+  setup_args+=(--probe-camera)
+elif [[ "${PREPARE_SIGNALING}" == 0 ]]; then
+  setup_args+=(--routing-only)
+fi
+"${SCRIPT_DIR}/setup_webrtc.sh" "${ROLE}" "${setup_args[@]}"
 media_python="${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python"
-if [[ "${HORUS_ZENOH_SESSION_ISOLATION:-0}" == 1 ]]; then
+if [[ "${HORUS_ZENOH_ENABLED:-1}" != 0 && "${HORUS_ZENOH_SESSION_ISOLATION:-0}" == 1 ]]; then
   "${media_python}" - "${SCRIPT_DIR}" "${ZENOH_BRIDGE_BINARY:-${ROOT}/zenoh-bridge-ros2dds}" <<'PY'
 from pathlib import Path
 import sys
@@ -718,15 +659,12 @@ except (OSError, ValueError) as error:
     raise SystemExit(f"Invalid independent-lane runtime: {error}")
 PY
 fi
-if native_runtime_requested; then
+if native_media_needed; then
   native_checks=()
-  if [[ "${ROLE}" == robot && "${HORUS_SOURCE_MEDIA_ENABLED:-0}" == 1 ||
-        "${ROLE}" == cloud && -n "${HORUS_CLOUD_MEDIA_CONFIG:-}" ]]; then
-    native_checks+=("${HORUS_SOURCE_MEDIA_BINARY:-$(command -v horus_media_node || true)}")
-  fi
-  if [[ "${ROLE}" == machine && -n "${HORUS_MEDIA_RELAY_CONFIG:-}" && "${HORUS_MEDIA_RELAY_ENGINE:-native}" == native ]]; then
-    native_checks+=("${HORUS_MEDIA_RELAY_BINARY:-$(command -v horus_unity_bridge_node || true)}")
-  fi
+  case "${ROLE}" in
+    robot|cloud) native_checks+=("${HORUS_SOURCE_MEDIA_BINARY:-$(command -v horus_media_node || true)}") ;;
+    machine) native_checks+=("${HORUS_MEDIA_RELAY_BINARY:-$(command -v horus_unity_bridge_node || true)}") ;;
+  esac
   for binary in "${native_checks[@]}"; do
     libs=""
     if [[ ! -x "${binary}" ]] || ! libs="$(LC_ALL=C ldd "${binary}" 2>&1)" ||
@@ -741,29 +679,11 @@ if native_runtime_requested; then
       gst-inspect-1.0 rtpgccbwe >/dev/null || { log_error "Installed bundle is missing usable GCC pacing."; exit 1; }
   fi
 fi
-if [[ "${ROLE}" == "cloud" || "${ROLE}" == "teammate" ]]; then
-  log_info "${ROLE} role does not require an H.264 encoder or decoder."
-else
-  media_python="${WEBRTC_VENV:-${ROOT}/.venv-webrtc}/bin/python"
-  probe_args=()
-  if [[ "${WEBRTC_MEDIA_MODE:-h264}" == h264 ]]; then
-    probe_args=(--root "${ROOT}" --profile "${ROOT}/.webrtc_profile.env")
-  fi
-  "${media_python}" "${SCRIPT_DIR}/media_runtime.py" --role "${ROLE}" --need-ros \
-    --mode "${WEBRTC_MEDIA_MODE:-h264}" "${probe_args[@]}"
-  if [[ ( "${ROLE}" == "robot" || "${ROLE}" == "machine" ) && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]]; then
-    if ! command -v gst-inspect-1.0 >/dev/null 2>&1 || \
-       ! gst-inspect-1.0 webrtcbin >/dev/null 2>&1 || \
-       ! gst-inspect-1.0 nice >/dev/null 2>&1; then
-      log_error "H.264 WebRTC media is incomplete: GStreamer webrtcbin and nice are required."
-      log_warn "Install gstreamer1.0-plugins-bad and gstreamer1.0-nice, then rerun bootstrap."
-      exit 1
-    fi
-  fi
-fi
 
 echo ""
 log_success "Bootstrap complete."
 echo -e "${BOLD}Next commands${RESET}"
 echo -e "  ${FG_CYAN}./horus setup${RESET}        ${FG_MUTED}optional, to review configuration${RESET}"
-echo -e "  ${FG_CYAN}./horus launch ${ROLE}${RESET}\n"
+launch_suffix=""
+if [[ "${ZENOH_ONLY}" == 1 ]]; then launch_suffix=" --zenoh-only"; fi
+echo -e "  ${FG_CYAN}./horus launch ${ROLE}${launch_suffix}${RESET}\n"

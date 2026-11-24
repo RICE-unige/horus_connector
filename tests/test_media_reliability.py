@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -265,13 +266,18 @@ def test_recovery_backoff_caps_and_resets():
     assert backoff.next_delay() == 2
 
 
-def test_status_write_error_does_not_kill_media(tmp_path, caplog):
+def test_status_write_error_does_not_kill_media(tmp_path, monkeypatch):
     from media_health import write_status
+
+    warnings = []
+    monkeypatch.setattr(logging.getLogger("media_health"), "warning",
+                        lambda fmt, *args: warnings.append(fmt % args))
     parent = tmp_path / "not_a_directory"
     parent.touch()
     for _ in range(5):
         write_status(parent / "health.json", {"state": "running"})
-    assert sum("Could not save media health" in record.message for record in caplog.records) == 1
+    assert len(warnings) == 1
+    assert "Could not save media health" in warnings[0]
 
 
 @pytest.mark.parametrize("name", ["signaling", "launcher.lock", ".", ".."])

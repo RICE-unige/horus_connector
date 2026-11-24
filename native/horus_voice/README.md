@@ -2,6 +2,8 @@
 
 `horus_voice_native` is the open media plugin shared by HORUS MR and HORUS Field. It wraps libdatachannel WebRTC media transport and libopus behind a small stable C ABI suitable for Unity IL2CPP `DllImport`.
 
+Build this plugin explicitly for the headset. `COLCON_IGNORE` keeps it out of a robot's ROS workspace build. The Connector can relay voice signaling without compiling or loading this plugin.
+
 The plugin:
 
 - negotiates one send/receive Opus track;

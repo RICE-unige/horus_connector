@@ -66,7 +66,7 @@ usage() {
   echo -e "${BOLD}Commands${RESET}"
   echo -e "  ${FG_GREEN}setup${RESET}                             Guided setup wizard"
   echo -e "  ${FG_GREEN}init${RESET}                              Create .env from the template"
-  echo -e "  ${FG_GREEN}bootstrap${RESET} ${FG_CYAN}[role]${RESET}                  Install dependencies for a connector role"
+  echo -e "  ${FG_GREEN}bootstrap${RESET} ${FG_CYAN}[role] [--zenoh-only]${RESET}    Install dependencies for enabled services"
   echo -e "  ${FG_GREEN}update-zenoh${RESET} ${FG_CYAN}[version]${RESET}           Update only the project-local bridge"
   echo -e "  ${FG_GREEN}environment${RESET}                       Print non-secret software/version report"
   echo -e "  ${FG_GREEN}reprobe${RESET} ${FG_CYAN}[robot|machine]${RESET}         Refresh the selected codec profile"
@@ -1145,6 +1145,12 @@ preflight_media() {
   "${chosen}" "${ROOT}/scripts/media_runtime.py" --role "${role}" \
     --mode "${WEBRTC_MEDIA_MODE:-h264}" "${need_ros[@]}" "${profile[@]}" || return 1
   export HORUS_WEBRTC_PYTHON="${chosen}"
+  if [[ "${role}" == robot && "${WEBRTC_MEDIA_MODE:-h264}" == h264 ]]; then
+    timeout --kill-after=2s 20s "${chosen}" "${ROOT}/scripts/camera_preflight.py" \
+      --root "${ROOT}" --status "${RUN_DIR}/camera_preflight.json" \
+      --timeout "${HORUS_CAMERA_PREFLIGHT_TIMEOUT:-4}" ||
+      log_warn "Camera check did not finish; video readiness is unverified."
+  fi
 }
 
 process_start_time() {
@@ -2131,7 +2137,7 @@ case "${cmd}" in
     echo ""
     ;;
   bootstrap)
-    "${ROOT}/scripts/bootstrap.sh" "${2:-}"
+    "${ROOT}/scripts/bootstrap.sh" "${@:2}"
     ;;
   update-zenoh)
     [[ "$#" -le 2 ]] || { log_error "Usage: ./horus update-zenoh [version]"; exit 2; }
@@ -2153,7 +2159,7 @@ case "${cmd}" in
     ;;
   boostrap|bootsrap)
     log_warn "Interpreting '${cmd}' as 'bootstrap'."
-    "${ROOT}/scripts/bootstrap.sh" "${2:-}"
+    "${ROOT}/scripts/bootstrap.sh" "${@:2}"
     ;;
   launch)
     load_env
@@ -2173,8 +2179,10 @@ case "${cmd}" in
     done
     case "${role}" in
       robot|machine)
-        ensure_webrtc_media_supported
-        warn_runtime_config
+        if [[ "${zenoh_only}" == 0 ]]; then
+          ensure_webrtc_media_supported
+          warn_runtime_config
+        fi
         ;;
       teammate|cloud)
         ;;
@@ -2217,35 +2225,40 @@ case "${cmd}" in
       echo -e "  zenoh      ${ZENOH_BRIDGE_RUNTIME:-binary}, listening ${FG_CYAN}$(zenoh_listen_summary)${RESET}, namespace ${FG_CYAN}${ZENOH_NAMESPACE:-/}${RESET}"
     fi
     echo -e "  transport  ${FG_CYAN}$(zenoh_transport_label)${RESET}"
-    if [[ "${role}" == "teammate" ]]; then
+    if [[ "${zenoh_only}" == 1 ]]; then
+      echo "  media      disabled for Zenoh-only launch"
+    elif [[ "${role}" == "teammate" ]]; then
       echo -e "  relay      HoloLens TCP -> local ROS 2 -> Zenoh"
     else
       echo -e "  signal     ws://$(webrtc_signal_target):${WEBRTC_SIGNAL_PORT:-8765}"
     fi
-    if [[ "${role}" == "cloud" ]]; then
+    if [[ "${zenoh_only}" == 0 && "${role}" == "cloud" ]]; then
       if turn_enabled; then
         echo -e "  turn       ${FG_CYAN}enabled${RESET}, udp/tcp ${TURN_PORT:-3478}, relay ${TURN_MIN_PORT:-49152}-${TURN_MAX_PORT:-65535}"
       else
         echo -e "  turn       ${FG_MUTED}disabled${RESET}"
       fi
-    elif [[ "${role}" != "teammate" && ( "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ) ]]; then
+    elif [[ "${zenoh_only}" == 0 && "${role}" != "teammate" &&
+            ( "${WEBRTC_ICE_SERVERS:-}" == *"turn:"* || "${WEBRTC_ICE_SERVERS:-}" == *"turns:"* ) ]]; then
       echo -e "  turn       ${FG_CYAN}fallback configured${RESET}"
     fi
-    if [[ "${role}" == "teammate" ]]; then
-      echo -e "  teammate  ${FG_CYAN}${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}${RESET}"
-      echo -e "  hololens  ${FG_CYAN}${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-unset}}${RESET}"
-      echo -e "  fpv        ${FG_CYAN}${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}${RESET}, ROS compressed image"
-    elif native_media_configured; then
-      print_native_media_summary
-    else
-      if [[ "$(webrtc_control_enabled)" == "1" ]]; then
-        echo -e "  control    ${FG_YELLOW}WebRTC DataChannel enabled${RESET}, ROS topic ${ROS_CMD_TOPIC:-/cmd_vel}"
+    if [[ "${zenoh_only}" == 0 ]]; then
+      if [[ "${role}" == "teammate" ]]; then
+        echo -e "  teammate  ${FG_CYAN}${FIELD_TEAMMATE_NAME:-${HORUS_ROOM:-field_teammate_1}}${RESET}"
+        echo -e "  hololens  ${FG_CYAN}${FIELD_TEAMMATE_HOLOLENS_HOST:-${HOLOLENS_HOST:-unset}}${RESET}"
+        echo -e "  fpv        ${FG_CYAN}${FIELD_TEAMMATE_VIDEO_PROFILE:-fast60}${RESET}, ROS compressed image"
+      elif native_media_configured; then
+        print_native_media_summary
       else
-        echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}, WebRTC video only"
+        if [[ "$(webrtc_control_enabled)" == "1" ]]; then
+          echo -e "  control    ${FG_YELLOW}WebRTC DataChannel enabled${RESET}, ROS topic ${ROS_CMD_TOPIC:-/cmd_vel}"
+        else
+          echo -e "  control    ${FG_GREEN}ROS/Zenoh cmd_vel${RESET}, WebRTC video only"
+        fi
+        echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
       fi
-      echo -e "  media      ${FG_CYAN}${WEBRTC_MEDIA_MODE:-h264}${RESET}"
     fi
-    if [[ "${role}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]] && ! native_media_configured; then
+    if [[ "${zenoh_only}" == 0 && "${role}" != "teammate" && "${WEBRTC_MEDIA_MODE:-h264}" == "h264" ]] && ! native_media_configured; then
       echo -e "  stream     ${FG_CYAN}${WEBRTC_VIDEO_WIDTH:-1280}x${WEBRTC_VIDEO_HEIGHT:-720}${RESET} @ ${FG_CYAN}${WEBRTC_VIDEO_FPS:-30} fps${RESET}, source ${WEBRTC_VIDEO_SOURCE:-ros2}"
       echo -e "  ros image  ${WEBRTC_ROS_IMAGE_INPUT_TOPIC:-/camera/image_raw}"
       if [[ "${role}" == "robot" || "${role}" == "machine" ]]; then
